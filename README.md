@@ -1,4 +1,4 @@
-# inbox_concierge
+# inbox_enhanced
 
 LLM-classified Gmail inbox with custom buckets. FastAPI + Celery + Postgres + Redis on the back, Vite + React on the front.
 
