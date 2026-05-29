@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# inbox_enhanced pre-commit hook.
+# Version-controlled entrypoint — activated via scripts/install-hooks.sh.
+#
+# Runs the LLM-powered reference-doc staleness check (warning-only: it never
+# blocks a commit, it just flags docs and drops tasks/ files to refresh them).
+# Add further pre-commit steps below as the repo grows.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+if [ -x "$REPO_ROOT/cicd-scripts/reference-check.sh" ]; then
+  "$REPO_ROOT/cicd-scripts/reference-check.sh" || true
+fi
+
+exit 0
