@@ -1,4 +1,4 @@
-<!-- stamp: cf67b4d (main) | 2026-05-29 -->
+<!-- stamp: 695e2f3 (main) | 2026-05-29 -->
 
 # CI/CD Index
 
