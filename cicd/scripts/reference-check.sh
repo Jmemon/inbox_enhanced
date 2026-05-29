@@ -5,7 +5,7 @@
 # Runs from the pre-commit hook. Compares the staged (non-reference)
 # changes against reference/MANIFEST.md and flags any reference doc
 # whose documented scope the changes might have invalidated. For each
-# flagged doc it writes a task file under tasks/ so an agent or
+# flagged doc it writes a task file under cicd/tasks/ so an agent or
 # developer can refresh + re-stamp the doc later.
 #
 # This is the inbox_enhanced port of the aiod-agents check, adapted to:
@@ -174,7 +174,7 @@ echo "$STALE_LIST" | while read -r doc; do
 done
 
 # --- Create one task file per flagged doc ---
-TASKS_DIR="$REPO_ROOT/tasks"
+TASKS_DIR="$REPO_ROOT/cicd/tasks"
 mkdir -p "$TASKS_DIR"
 SHORT_SHA=$(git rev-parse --short HEAD)
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
@@ -187,7 +187,7 @@ while read -r doc; do
   TASK_FILE="$TASKS_DIR/update-reference-${SLUG}.md"
 
   if [ -f "$TASK_FILE" ]; then
-    echo "   ↳ task already exists: tasks/update-reference-${SLUG}.md"
+    echo "   ↳ task already exists: cicd/tasks/update-reference-${SLUG}.md"
     continue
   fi
 
@@ -224,12 +224,12 @@ cites first, then stamp.
 EOF
 
   TASK_COUNT=$((TASK_COUNT + 1))
-  echo "   ↳ created task: tasks/update-reference-${SLUG}.md"
+  echo "   ↳ created task: cicd/tasks/update-reference-${SLUG}.md"
 done <<< "$STALE_LIST"
 
 if [ "$TASK_COUNT" -gt 0 ]; then
   echo ""
-  echo "  📋 ${TASK_COUNT} task(s) created in tasks/. Run them to refresh stale docs."
+  echo "  📋 ${TASK_COUNT} task(s) created in cicd/tasks/. Run them to refresh stale docs."
 fi
 echo ""
 

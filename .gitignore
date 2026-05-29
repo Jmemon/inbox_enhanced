@@ -28,3 +28,6 @@ server/app/static/
 
 # local-only scripts
 scripts/seed_demo.py
+
+# generated CI/CD task files (reference-check.sh output)
+cicd/tasks/
