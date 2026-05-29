@@ -1,4 +1,4 @@
-<!-- stamp: 13a07e5 (main) | 2026-05-29 -->
+<!-- stamp: cebb1a6 (main) | 2026-05-29 -->
 
 # Workers Index
 
@@ -7,7 +7,7 @@
 ## Files
 | Path | Role / key exports |
 |------|--------------------|
-| server/app/workers/celery_app.py | `_build_app()` → `celery_app` (Celery singleton). broker=backend=`settings.redis_url`; `include=["app.workers.tasks"]`; json serializer, UTC, `task_acks_late=False`, `broker_connection_retry_on_startup=True`. Enables `task_always_eager`+`task_eager_propagates` when env `CELERY_TASK_ALWAYS_EAGER=="1"`. Imports + wires `beat_schedule`. Own `logging.basicConfig` (separate process from API). **WORKING-TREE MOD: app name `inbox_concierge`→`inbox_enhanced` (uncommitted).** |
+| server/app/workers/celery_app.py | `_build_app()` → `celery_app` (Celery singleton). broker=backend=`settings.redis_url`; `include=["app.workers.tasks"]`; json serializer, UTC, `task_acks_late=False`, `broker_connection_retry_on_startup=True`. Enables `task_always_eager`+`task_eager_propagates` when env `CELERY_TASK_ALWAYS_EAGER=="1"`. Imports + wires `beat_schedule`. Own `logging.basicConfig` (separate process from API). App name `inbox_enhanced`. |
 | server/app/workers/beat_schedule.py | `beat_schedule` dict. One entry `enqueue-polls-every-30s` → task `app.workers.tasks.enqueue_polls`, `schedule(run_every=30.0)`. No polling logic in beat. |
 | server/app/workers/tasks.py | 6 `@celery_app.task`s (below) + helpers `_publish`, `_publish_thread_ids`, `_read_candidates`, `_extend_inline`, `_score_all`, `_inline_reload`, `_reclassify_all`. Module-level `SessionLocal` (rebindable for tests). Constants: `CANDIDATE_LIMIT=100`, `EXTEND_THRESHOLD=100`, `TOP_POSITIVES=3`, `TOP_NEAR_MISSES=3`, `POSITIVE_THRESHOLD=7`, `NEAR_MISS_LOW=4`, `NEAR_MISS_HIGH=6`. |
 | server/app/workers/gmail_sync.py | Worker-internal sync orchestration (Celery-task entrypoint role only; deep history-cursor/parser internals → future GMAIL_SYNC_INDEX.md). Exports `HistoryGoneError`, `fetch_history_records`, `partial_sync_inbox`, `full_sync_inbox`, `extend_inbox_history` + privates `_upsert_thread_with_messages`, `_classify_batch`. All public fns commit internally + return internal `InboxThread.id` lists (not gmail ids). |
@@ -57,10 +57,10 @@
 
 ### External services
 - Gmail v1 (`get_gmail_client`; Fernet-decrypt refresh token per call) — §2.9: `users.history.list / threads.list / threads.get(format=full)`.
-- Anthropic Messages API — §2.10: via `llm_client.call_messages` under shared `Semaphore(ANTHROPIC_CONCURRENCY)` on the worker's LLM loop thread; `classify` (sync paths) + `score_thread` (preview).
+- OpenRouter (OpenAI-compatible `chat.completions`) — §2.10: via `llm_client.call_messages` (AsyncOpenAI, `base_url=OPENROUTER_BASE_URL`) under shared `Semaphore(LLM_CONCURRENCY)` on the worker's LLM loop thread; `classify` (sync paths) + `score_thread` (preview). Model is the provider-prefixed `LLM_CLASSIFY_MODEL`.
 
 ### Env-var names (from app/config.py — do not read .env)
-`REDIS_URL`, `DATABASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_CLASSIFY_MODEL` (default `claude-haiku-4-5`), `ANTHROPIC_CONCURRENCY` (default 16). Process env (not config): `CELERY_TASK_ALWAYS_EAGER`.
+`REDIS_URL`, `DATABASE_URL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`), `LLM_CLASSIFY_MODEL` (default `anthropic/claude-haiku-4-5`), `LLM_CONCURRENCY` (default 16). Process env (not config): `CELERY_TASK_ALWAYS_EAGER`.
 
 ## Data flows / cross-subsystem touchpoints
 ```
@@ -77,7 +77,7 @@ API.POST /buckets   ──[apply_async]──> reclassify_user_inbox(uid)       
 
 Worker.* ──[SET sync_lock:{uid} NX EX 600]──> Redis
 Worker (sync) ──[history.list/threads.list/threads.get + token refresh]──> Gmail v1    (§2.9)
-Worker (LLM thread) ──[POST messages, semaphore-bounded]──> api.anthropic.com          (§2.10)
+Worker (LLM thread) ──[POST chat/completions, semaphore-bounded]──> openrouter.ai/api/v1  (§2.10)
 draft_preview_bucket ──[SET preview:{draft_id} EX 600]──> Redis  (BEFORE next line)
 Worker ──[PUBLISH user:{uid} {event,...}]──> Redis ──> API PubSubDispatcher ──[SSE]──> Browser  (§2.7)
 ```
