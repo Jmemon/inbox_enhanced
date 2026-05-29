@@ -307,7 +307,7 @@ def _score_all(gmail, *, candidates: list[dict], name: str, description: str) ->
 
     Sequential Gmail fetches (~200ms each) are unavoidable because the DB only
     stores a 150-char body_preview; we need the full body for accurate scoring.
-    LLM scoring runs concurrently under the shared AsyncAnthropic semaphore.
+    LLM scoring runs concurrently under the shared LLM-client semaphore.
     """
     parsed_threads = []
     for c in candidates:
@@ -327,7 +327,7 @@ def _score_all(gmail, *, candidates: list[dict], name: str, description: str) ->
 
     async def _score_one(parsed):
         text = await llm_client.call_messages(
-            model=s.anthropic_classify_model,
+            model=s.llm_classify_model,
             system=score_thread.SYSTEM_PROMPT,
             user=score_thread.build_user_message(
                 thread_str=thread_to_string(parsed), name=name, description=description),

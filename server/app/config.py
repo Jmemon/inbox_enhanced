@@ -24,16 +24,21 @@ class Settings(BaseSettings):
     google_client_secret: str = Field(alias="GOOGLE_CLIENT_SECRET")
     google_redirect_uri: str = Field(alias="GOOGLE_REDIRECT_URI")
     cookie_domain: str | None = Field(default=None, alias="COOKIE_DOMAIN")
-    # --- Anthropic (LLM classifier + draft preview) ---
-    # Set ANTHROPIC_API_KEY in Railway dashboard before the deploy that ships
-    # bucket changes — workers boot fine without it but every classify/preview
-    # call returns 401 and falls through to "no fit".
-    anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
-    anthropic_classify_model: str = Field(default="claude-haiku-4-5", alias="ANTHROPIC_CLASSIFY_MODEL")
-    # Process-wide cap on concurrent in-flight Anthropic calls. One semaphore is
+    # --- OpenRouter (LLM classifier + draft preview) ---
+    # We call LLMs through OpenRouter's OpenAI-compatible API so the model is a
+    # swappable config string (any OpenRouter-hosted provider). Set
+    # OPENROUTER_API_KEY in the Railway worker service before the deploy that
+    # ships bucket changes — workers boot fine without it but every
+    # classify/preview call returns 401 and falls through to "no fit".
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL")
+    # OpenRouter model ids are provider-prefixed (e.g. "anthropic/claude-haiku-4-5",
+    # "openai/gpt-4o-mini", "google/gemini-flash-1.5"). Omitting the prefix 404s.
+    llm_classify_model: str = Field(default="anthropic/claude-haiku-4-5", alias="LLM_CLASSIFY_MODEL")
+    # Process-wide cap on concurrent in-flight LLM calls. One semaphore is
     # shared by classification + draft-preview, so a 200-thread full sync and a
     # user-triggered preview can't both push 16 concurrently.
-    anthropic_concurrency: int = Field(default=16, alias="ANTHROPIC_CONCURRENCY")
+    llm_concurrency: int = Field(default=16, alias="LLM_CONCURRENCY")
     # On Railway, ENV is "production"; locally unset → development.
     env: str = Field(default="development", alias="ENV")
 

@@ -1,16 +1,17 @@
-"""Anthropic client wrapper.
+"""OpenRouter (OpenAI-compatible) client wrapper.
 
-Owns one AsyncAnthropic per worker process + one asyncio.Semaphore(N) bound
-to a long-lived background event loop, plus a run_in_loop sync bridge for
-Celery callers. Lazy-init per fork. call_messages returns "" on any error
-so per-thread classify failures degrade to no-fit instead of crashing a batch.
+Owns one AsyncOpenAI per worker process pointed at OpenRouter + one
+asyncio.Semaphore(N) bound to a long-lived background event loop, plus a
+run_in_loop sync bridge for Celery callers. Lazy-init per fork. call_messages
+returns "" on any error so per-thread classify failures degrade to no-fit
+instead of crashing a batch.
 """
 
 import asyncio
 import logging
 import threading
 from typing import Any
-from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from app.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -39,11 +40,17 @@ def _ensure_initialized() -> None:
 
         s = get_settings()
         sem = asyncio.run_coroutine_threadsafe(
-            _build_semaphore(s.anthropic_concurrency), loop
+            _build_semaphore(s.llm_concurrency), loop
         ).result()
-        client = AsyncAnthropic(api_key=s.anthropic_api_key)
+        # OpenRouter speaks the OpenAI API; X-Title surfaces this app in the
+        # OpenRouter dashboard rankings.
+        client = AsyncOpenAI(
+            api_key=s.openrouter_api_key,
+            base_url=s.openrouter_base_url,
+            default_headers={"X-Title": "inbox_enhanced"},
+        )
         _state.update(loop=loop, thread=thread, sem=sem, client=client)
-        log.info("llm.client: initialized loop + semaphore(n=%d)", s.anthropic_concurrency)
+        log.info("llm.client: initialized loop + semaphore(n=%d)", s.llm_concurrency)
 
 
 async def _build_semaphore(n: int) -> asyncio.Semaphore:
@@ -58,16 +65,21 @@ def run_in_loop(coro):
 async def call_messages(*, model: str, system: str, user: str, max_tokens: int = 1024) -> str:
     _ensure_initialized()
     sem: asyncio.Semaphore = _state["sem"]
-    client: AsyncAnthropic = _state["client"]
+    client: AsyncOpenAI = _state["client"]
     async with sem:
         try:
-            resp = await client.messages.create(
-                model=model, max_tokens=max_tokens, system=system,
-                messages=[{"role": "user", "content": user}],
+            # OpenAI-format: the Anthropic top-level `system` becomes a
+            # system-role message; response is a single string, not blocks.
+            resp = await client.chat.completions.create(
+                model=model, max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
             )
-            return "".join(b.text for b in resp.content if hasattr(b, "text"))
+            return resp.choices[0].message.content or ""
         except Exception:
-            log.exception("anthropic messages.create failed")
+            log.exception("openrouter chat.completions.create failed")
             return ""
 
 

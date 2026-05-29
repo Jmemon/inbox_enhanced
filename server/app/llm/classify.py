@@ -19,7 +19,7 @@ async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_
     # at a deleted bucket — the LLM can't pick a deleted bucket anyway.
     current_name = next((b.name for b in buckets if b.id == current_bucket_id), None)
     text = await client.call_messages(
-        model=s.anthropic_classify_model,
+        model=s.llm_classify_model,
         system=classify_thread.SYSTEM_PROMPT,
         user=classify_thread.build_user_message(
             thread_str=thread_to_string(thread), buckets=buckets,
