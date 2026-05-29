@@ -20,7 +20,8 @@
 #   - Warning-only by default (prints which docs may need updating)
 #   - Pass --strict to exit non-zero when stale docs are detected
 #   - Fails open: silently passes on missing key / API error / timeout
-#   - Uses claude-haiku-4-5 for speed and cost
+#   - Calls OpenRouter's OpenAI-compatible API (anthropic/claude-haiku-4-5)
+#     for speed and cost
 # -------------------------------------------------------------------
 
 set -euo pipefail
@@ -35,7 +36,7 @@ done
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 MANIFEST="$REPO_ROOT/reference/MANIFEST.md"
 
-# --- Load env (provides ANTHROPIC_API_KEY from root .env if not already set) ---
+# --- Load env (provides OPENROUTER_API_KEY from root .env if not already set) ---
 # shellcheck source=load-env.sh
 source "$(dirname "$0")/load-env.sh"
 
@@ -45,8 +46,8 @@ if [ ! -f "$MANIFEST" ]; then
   exit 0
 fi
 
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-  echo "  Reference docs check: skipped — ANTHROPIC_API_KEY is not set."
+if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+  echo "  Reference docs check: skipped — OPENROUTER_API_KEY is not set."
   exit 0
 fi
 
@@ -109,24 +110,24 @@ $STAGED_NON_REF
 REFERENCE DOCS:
 $MANIFEST_ENTRIES"
 
-# --- Call the Anthropic API (10s timeout — never block commits on a slow API) ---
+# --- Call OpenRouter (OpenAI-compatible; 10s timeout — never block commits) ---
 RESPONSE=$(curl -s --max-time 10 \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+  -H "X-Title: inbox_enhanced reference-check" \
   -H "content-type: application/json" \
   -d "$(jq -n \
     --arg prompt "$PROMPT" \
     '{
-      model: "claude-haiku-4-5-20251001",
+      model: "anthropic/claude-haiku-4-5",
       max_tokens: 256,
       messages: [{ role: "user", content: $prompt }]
     }')" \
-  https://api.anthropic.com/v1/messages 2>/dev/null) || {
+  https://openrouter.ai/api/v1/chat/completions 2>/dev/null) || {
   echo "  Reference docs check: skipped — API call failed."
   exit 0
 }
 
-RAW_TEXT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty' 2>/dev/null) || {
+RAW_TEXT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null) || {
   echo "  Reference docs check: skipped — could not parse API response."
   exit 0
 }
