@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
         await pubsub.stop()
 
 
-app = FastAPI(title="inbox_concierge", lifespan=lifespan)
+app = FastAPI(title="inbox_enhanced", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(buckets_router)
 app.include_router(gmail_router)

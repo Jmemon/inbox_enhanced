@@ -24,7 +24,7 @@ from app.config import get_settings
 def _build_app() -> Celery:
     settings = get_settings()
     app = Celery(
-        "inbox_concierge",
+        "inbox_enhanced",
         broker=settings.redis_url,
         backend=settings.redis_url,
         include=["app.workers.tasks"],

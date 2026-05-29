@@ -1,6 +1,8 @@
 # Architecture
 
-A first-principles map of `inbox_concierge`: what code is running on what compute, when it runs, and what made it run. The five sections separate the compute/runtime layer from the code layer so the system can be re-architected without re-reading the codebase.
+> Stamped at commit `2cff277` on branch `main`.
+
+A first-principles map of `inbox_enhanced`: what code is running on what compute, when it runs, and what made it run. The five sections separate the compute/runtime layer from the code layer so the system can be re-architected without re-reading the codebase.
 
 ---
 
@@ -387,7 +389,7 @@ There is one repo with two language toolchains. Dependencies and runtime environ
 - **Runtime libs**: `fastapi`, `uvicorn[standard]`, `celery[redis]`, `redis`, `sqlalchemy`, `psycopg[binary]`, `alembic`, `google-api-python-client`, `google-auth`, `google-auth-oauthlib`, `httpx`, `cryptography`, `itsdangerous`, `pydantic-settings`, `anthropic`.
 - **Dev libs**: `pytest`, `pytest-asyncio`, `fakeredis`.
 - **Python image**: `python:3.13-slim` (Dockerfile stage 2).
-- **Env vars consumed** (`app/config.py`): `DATABASE_URL`, `REDIS_URL`, `SESSION_SECRET`, `ENCRYPTION_KEY`, `SESSION_TTL_SECONDS`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `COOKIE_DOMAIN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_CLASSIFY_MODEL`, `ANTHROPIC_CONCURRENCY`, `ENV`, `PORT`. Worker honours `CELERY_TASK_ALWAYS_EAGER` for tests.
+- **Env vars consumed** (`app/config.py`): `DATABASE_URL`, `REDIS_URL`, `SESSION_SECRET`, `ENCRYPTION_KEY`, `SESSION_TTL_SECONDS`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `COOKIE_DOMAIN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_CLASSIFY_MODEL`, `ANTHROPIC_CONCURRENCY`, `ENV`. (`PORT` is read by the Dockerfile CMD / uvicorn, not by `config.py`.) Worker honours `CELERY_TASK_ALWAYS_EAGER` for tests.
 - **All three Python services share the same image**. The CMD differs (uvicorn vs `celery worker` vs `celery beat`); only the API container runs `alembic upgrade head` at boot.
 
 ### 4.2 Frontend / build-time environment
