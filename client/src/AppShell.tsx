@@ -1,6 +1,21 @@
+import { useEffect, useRef } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from './auth/useAuth'
 import { InboxProvider } from './state/InboxProvider'
+import { subscribeSse } from './lib/sse'
+
+// Auth-death escape (see lib/sse.ts backoff): an expired session cookie
+// makes every SSE reconnect fail with a fresh 401 forever, since nothing
+// about the stream itself tells the app the *session* — not just the
+// connection — is dead. Count consecutive '_error' events (reset by any
+// '_open'); once 3 land in a row, re-validate via useAuth().refresh(). If
+// the cookie really is dead, refresh() flips auth state to 'anon', which
+// unmounts <AppShell> (and with it InboxProvider's SSE subscription),
+// ending the error loop and landing the user back on the login screen.
+// Throttled to at most once per 30s so a merely-flaky connection can't
+// hammer /auth/me either.
+const AUTH_RECHECK_THRESHOLD = 3
+const AUTH_RECHECK_THROTTLE_MS = 30_000
 
 const navStyle = ({ isActive }: { isActive: boolean }) => ({
   fontSize: 13, padding: '4px 10px', borderRadius: 6, textDecoration: 'none',
@@ -9,7 +24,24 @@ const navStyle = ({ isActive }: { isActive: boolean }) => ({
 })
 
 export function AppShell() {
-  const { state, signOut } = useAuth()
+  const { state, signOut, refresh } = useAuth()
+
+  const consecutiveErrorsRef = useRef(0)
+  const lastRecheckAtRef = useRef(0)
+
+  useEffect(() => subscribeSse((e) => {
+    if (e.event === '_open') {
+      consecutiveErrorsRef.current = 0
+      return
+    }
+    if (e.event !== '_error') return
+    consecutiveErrorsRef.current += 1
+    if (consecutiveErrorsRef.current < AUTH_RECHECK_THRESHOLD) return
+    const now = Date.now()
+    if (now - lastRecheckAtRef.current < AUTH_RECHECK_THROTTLE_MS) return
+    lastRecheckAtRef.current = now
+    void refresh()
+  }), [refresh])
 
   if (state.status !== 'authed') return null
   return (
