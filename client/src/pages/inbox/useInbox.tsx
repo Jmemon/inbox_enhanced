@@ -18,6 +18,7 @@ type DisplayLayer = Record<string, InboxThread>
 export function useInbox(opts: {
   buckets: Bucket[]
   filterSelection: Set<string> | null
+  autoExtendEnabled?: boolean
 }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -227,13 +228,14 @@ export function useInbox(opts: {
   // The lastExtendAtLength ref blocks re-firing at the same idLayer size, so a
   // 0-result extend doesn't loop.
   useEffect(() => {
+    if (opts.autoExtendEnabled === false) return
     if (more === false || extendInFlight) return
     if (opts.filterSelection) return
     if (page < pageCount - 1) return
     if (lastExtendAtLength.current === idLayer.length) return
     lastExtendAtLength.current = idLayer.length
     void requestExtend()
-  }, [page, pageCount, more, extendInFlight, opts.filterSelection, idLayer.length, requestExtend])
+  }, [page, pageCount, more, extendInFlight, opts.filterSelection, idLayer.length, requestExtend, opts.autoExtendEnabled])
 
   // Page clamp: after a resync collapses idLayer back to the latest 200, a user
   // who had paginated into extended history (page 5+) would otherwise see an
