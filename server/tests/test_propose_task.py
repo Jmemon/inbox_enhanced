@@ -403,6 +403,136 @@ def test_propose_task_draft_falls_back_to_default_schema_after_second_invalid_at
 
 
 # ---------------------------------------------------------------------------
+# Unparseable first response -> retry once (symmetry with the schema-invalid
+# retry above). propose_task_draft spends exactly one retry total per draft,
+# regardless of which of the two failure shapes (unparseable vs.
+# schema-invalid) fires first.
+# ---------------------------------------------------------------------------
+
+
+def test_propose_task_draft_retries_once_on_unparseable_first_response_then_succeeds(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    _seed_thread(session_factory, gmail_thread_id="g1", subject="Interview scheduled",
+                body="Your onsite interview is confirmed", from_addr="recruiter@acme.co")
+    monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+
+    # "" mirrors call_messages' own degrade-on-error behavior (client.py:
+    # "call_messages returns \"\" on any error") -- a transient API failure,
+    # not a schema problem, so parse_response("") returns None outright.
+    good = _proposal_json(keyword_probes=["interview"])
+    fake = _fake_call_messages(["", good])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "draft-5", "help me land a new job"])
+
+    propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
+    assert len(propose_calls) == 2
+    # the retry's user message carries the generic re-ask nudge, not a
+    # validator error -- there was nothing to validate, the first response
+    # never parsed at all.
+    assert "valid JSON" in propose_calls[1]["user"]
+
+    cached = draft_cache.load("draft-5")
+    proposal = cached["proposal"]
+    assert proposal["name"] == "Job hunt"
+    assert proposal["keyword_probes"] == ["interview"]
+    assert proposal["state_schema"] == {
+        "version": 1, "entity": None,
+        "pipeline": {"stages": ["applied", "interview"], "terminal": ["offer", "rejected"]},
+    }
+    # full-quality draft: the fallback schema was never needed, and scoring
+    # ran against the real (retry) proposal's name/description.
+    assert len(cached["positives"]) == 1
+
+
+def test_propose_task_draft_falls_back_when_both_attempts_unparseable(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+
+    fake = _fake_call_messages(["", ""])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    task_engine_tasks.propose_task_draft.apply(
+        args=[USER_ID, "draft-6", "help me plan a wedding"],
+    )
+
+    propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
+    assert len(propose_calls) == 2  # no third attempt
+
+    cached = draft_cache.load("draft-6")
+    proposal = cached["proposal"]
+    # synthetic draft carved from the goal itself
+    assert proposal["name"] == "help me plan a wedding"[:40]
+    assert proposal["description"] == "help me plan a wedding"
+    assert proposal["keyword_probes"] == []
+    assert proposal["state_schema"] == {
+        "version": 1, "entity": None,
+        "pipeline": {"stages": ["in_progress"], "terminal": ["done"]},
+    }
+
+
+def test_propose_task_draft_falls_back_when_unparseable_then_schema_invalid(
+    session_factory, fake_redis, monkeypatch,
+):
+    """Mixed failure shapes: first attempt unparseable (spends the draft's
+    one retry), retry attempt parses but has an invalid schema. Must NOT
+    spend a third LLM call -- the retry budget was already used on the
+    first attempt's unparseable response, so a schema-invalid retry
+    response goes straight to the fallback schema instead of triggering its
+    own second retry."""
+    _seed_user(session_factory)
+    monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+
+    invalid_schema = {"version": 1, "entity": None,
+                      "pipeline": {"stages": [], "terminal": ["done"]}}
+    bad = _proposal_json(name="Recovered name", state_schema=invalid_schema,
+                         keyword_probes=["interview"])
+    fake = _fake_call_messages(["", bad])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    task_engine_tasks.propose_task_draft.apply(
+        args=[USER_ID, "draft-7", "help me land a new job"],
+    )
+
+    propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
+    assert len(propose_calls) == 2  # no third attempt
+
+    cached = draft_cache.load("draft-7")
+    proposal = cached["proposal"]
+    # name/description/probes still come from the retry's parseable (if
+    # schema-invalid) response -- only the schema itself falls back.
+    assert proposal["name"] == "Recovered name"
+    assert proposal["keyword_probes"] == ["interview"]
+    assert proposal["state_schema"] == {
+        "version": 1, "entity": None,
+        "pipeline": {"stages": ["in_progress"], "terminal": ["done"]},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Unknown user -> skip entirely, no LLM spend (parity with draft_preview_bucket)
+# ---------------------------------------------------------------------------
+
+
+def test_propose_task_draft_skips_for_unknown_user(session_factory, fake_redis, monkeypatch):
+    # deliberately never seed a User row
+    fake = _fake_call_messages([_proposal_json()])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    published: list[bool] = []
+    monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: published.append(True))
+
+    task_engine_tasks.propose_task_draft.apply(args=["no-such-user", "draft-8", "some goal"])
+
+    assert fake.calls == []  # no LLM spend for a bogus user
+    assert published == []
+    assert draft_cache.load("draft-8") is None
+
+
+# ---------------------------------------------------------------------------
 # Probes miss everything -> falls back to tasks._read_candidates
 # ---------------------------------------------------------------------------
 

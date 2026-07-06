@@ -29,6 +29,7 @@ it against the same draft_id just overwrites the cache entry with a fresh
 import logging
 
 from app.config import get_settings
+from app.db.models import User
 from app.db.session import SessionLocal as _AppSessionLocal
 from app.inbox import inbox_repo, search_repo
 from app.llm import client as llm_client
@@ -64,6 +65,18 @@ _FALLBACK_SCHEMA_DICT = {
     "entity": None,
     "pipeline": {"stages": ["in_progress"], "terminal": ["done"]},
 }
+
+# Generic nudge appended to the retry when the FIRST propose attempt's
+# response was not parseable JSON in the required shape at all (as opposed
+# to parseable-but-schema-invalid, which gets the more specific
+# validator-error nudge built inline where it's used). `parse_response`
+# returning None is also what a transient LLM/API error degrades to --
+# `llm_client.call_messages` returns "" on any error -- so this is the retry
+# path a bare transient failure takes.
+_UNPARSEABLE_RETRY_NUDGE = (
+    "Your previous response was not a single line of valid JSON in the "
+    "required shape. Respond again with exactly the JSON object described above."
+)
 
 
 def _publish_task_updated(db, *, user_id: str, task) -> None:
@@ -239,25 +252,42 @@ def _candidate_from_thread(db, *, user_id: str, thread) -> dict:
 @celery_app.task(name="app.workers.task_engine_tasks.propose_task_draft")
 def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
     """Goal -> proposed task draft: one Sonnet-class propose call, EPS
-    validation (with one retry then a fallback schema), FTS-prefiltered
-    candidate scoring, and a cache-then-publish so the modal's poll fallback
-    always has somewhere to land.
+    validation, FTS-prefiltered candidate scoring, and a cache-then-publish
+    so the modal's poll fallback always has somewhere to land.
 
-    1. LLM propose (`propose_task.build_user_message`/`parse_response`). The
-       proposed `state_schema` is only a shape-checked dict at this point --
-       `schema_mod.validate_schema` is the actual EPS gate. A ValueError
-       there retries ONCE with the validator's error message appended to the
-       user message, so the model gets one shot at fixing exactly what it
-       got wrong instead of guessing blind. A second failure gives up on the
-       LLM's schema and substitutes a minimal singleton fallback -- the rest
-       of the proposal (name/description/keyword_probes) still comes from
-       whichever attempt actually returned a parseable response, so the user
-       still gets a nameable, describable draft to edit rather than a total
-       failure. If BOTH attempts are entirely unparseable (not just a bad
-       schema), we degrade further to a bare name/description carved out of
-       the goal itself and an empty probe list -- which naturally trips the
-       probes-miss fallback in step 2 below rather than needing its own
-       special case.
+    1. LLM propose (`propose_task.build_user_message`/`parse_response`).
+       Exactly ONE retry total is ever spent per draft, no matter which of
+       the two ways the first attempt can fail:
+         - Unparseable (`parse_response` returned None -- no valid JSON in
+           the required shape at all; this is also what a transient
+           API/network error degrades to, since `llm_client.call_messages`
+           returns "" on any error): retried once with a generic
+           `_UNPARSEABLE_RETRY_NUDGE` appended to the user message.
+         - Parseable but schema-invalid (shape-checked fine, but
+           `schema_mod.validate_schema` raised ValueError on the
+           `state_schema`): retried once with the validator's exact error
+           message appended, so the model gets one shot at fixing precisely
+           what it got wrong.
+       Whichever branch fires first consumes the draft's one retry; the
+       retry's response is checked once more and then we stop -- there is
+       no second retry, so at most 2 LLM propose calls ever happen for one
+       draft. In particular, if the first attempt was unparseable and the
+       retry comes back parseable-but-schema-invalid, that schema failure
+       does NOT get its own retry -- it falls straight through to the
+       fallback schema below (this is the mixed case the naive
+       "only the ValueError branch retries" version of this code used to
+       miss: an unparseable first response used to fall straight to the
+       fallback draft with zero retries at all).
+       If the final (post-retry, if any) response's schema is invalid or
+       never obtained, we give up on the LLM's schema and substitute the
+       minimal singleton fallback -- the rest of the proposal (name/
+       description/keyword_probes) still comes from whichever attempt
+       actually returned a parseable response, so the user still gets a
+       nameable, describable draft to edit rather than a total failure. Only
+       if NEITHER attempt ever produced a parseable response do we degrade
+       further to a bare name/description carved out of the goal itself and
+       an empty probe list -- which naturally trips the probes-miss
+       fallback in step 2 below rather than needing its own special case.
     2. Candidate examples: union of `search_repo.search_threads()` over the
        proposal's `keyword_probes` (cap PROPOSE_CANDIDATE_CAP unique threads
        across all probes, PROPOSE_SEARCH_LIMIT_PER_PROBE per probe) -- the
@@ -287,49 +317,84 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
     log.info("propose_task_draft: user=%s draft=%s", user_id, draft_id)
     settings = get_settings()
 
-    raw = _llm_propose(goal=goal, user_id=user_id, model=settings.llm_extract_model)
-
-    schema = None
-    if raw is not None:
-        try:
-            schema = schema_mod.validate_schema(raw["state_schema"])
-        except ValueError as exc:
-            log.info(
-                "propose_task_draft: draft=%s schema invalid on first attempt (%s); retrying once",
-                draft_id, exc,
-            )
-            retry_context = (
-                f"Your previous state_schema was invalid: {exc}\n"
-                "Fix it and return the full JSON object again."
-            )
-            raw2 = _llm_propose(
-                goal=goal, user_id=user_id, model=settings.llm_extract_model, extra=retry_context,
-            )
-            if raw2 is not None:
-                raw = raw2
-                try:
-                    schema = schema_mod.validate_schema(raw["state_schema"])
-                except ValueError as exc2:
-                    log.info(
-                        "propose_task_draft: draft=%s schema invalid on retry too (%s); "
-                        "using fallback schema",
-                        draft_id, exc2,
-                    )
-                    schema = None
-
-    if raw is None:
-        # Both attempts came back entirely unparseable -- degrade to a bare
-        # proposal. keyword_probes=[] naturally trips the probes-miss
-        # fallback in step 2, so no extra branching is needed there.
-        raw = {"name": goal[:40], "description": goal, "keyword_probes": []}
-
-    if schema is None:
-        schema = schema_mod.validate_schema(_FALLBACK_SCHEMA_DICT)
-
-    probes = raw.get("keyword_probes") or []
-
     db = SessionLocal()
     try:
+        # Parity with draft_preview_bucket: a draft request for a user who
+        # no longer exists (or never did) must not spend an LLM call at all.
+        user = db.get(User, user_id)
+        if user is None:
+            log.info(
+                "propose_task_draft: draft=%s user=%s not found, skipping",
+                draft_id, user_id,
+            )
+            return
+
+        raw = _llm_propose(goal=goal, user_id=user_id, model=settings.llm_extract_model)
+        retried = False
+
+        if raw is None:
+            log.info(
+                "propose_task_draft: draft=%s first attempt unparseable; retrying once",
+                draft_id,
+            )
+            raw = _llm_propose(
+                goal=goal, user_id=user_id, model=settings.llm_extract_model,
+                extra=_UNPARSEABLE_RETRY_NUDGE,
+            )
+            retried = True
+
+        schema = None
+        if raw is not None:
+            try:
+                schema = schema_mod.validate_schema(raw["state_schema"])
+            except ValueError as exc:
+                if retried:
+                    # Already spent this draft's one retry on an unparseable
+                    # first attempt -- do not spend a second one here; fall
+                    # through to the fallback schema below instead.
+                    log.info(
+                        "propose_task_draft: draft=%s schema invalid on the "
+                        "post-retry response (%s); retry budget spent, using "
+                        "fallback schema",
+                        draft_id, exc,
+                    )
+                else:
+                    log.info(
+                        "propose_task_draft: draft=%s schema invalid on first "
+                        "attempt (%s); retrying once",
+                        draft_id, exc,
+                    )
+                    retry_context = (
+                        f"Your previous state_schema was invalid: {exc}\n"
+                        "Fix it and return the full JSON object again."
+                    )
+                    raw2 = _llm_propose(
+                        goal=goal, user_id=user_id, model=settings.llm_extract_model,
+                        extra=retry_context,
+                    )
+                    if raw2 is not None:
+                        raw = raw2
+                        try:
+                            schema = schema_mod.validate_schema(raw["state_schema"])
+                        except ValueError as exc2:
+                            log.info(
+                                "propose_task_draft: draft=%s schema invalid on "
+                                "retry too (%s); using fallback schema",
+                                draft_id, exc2,
+                            )
+
+        if raw is None:
+            # Neither attempt ever produced a parseable response -- degrade
+            # to a bare proposal. keyword_probes=[] naturally trips the
+            # probes-miss fallback in step 2 below, so no extra branching is
+            # needed there.
+            raw = {"name": goal[:40], "description": goal, "keyword_probes": []}
+
+        if schema is None:
+            schema = schema_mod.validate_schema(_FALLBACK_SCHEMA_DICT)
+
+        probes = raw.get("keyword_probes") or []
+
         seen: set[str] = set()
         candidate_threads = []
         for probe in probes:
