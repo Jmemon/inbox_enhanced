@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from googleapiclient.errors import HttpError
 from sqlalchemy import select, func
-from app.db.models import Base, InboxThread, User
+from app.db.models import Base, InboxMessage, InboxThread, User
 from app.inbox import inbox_repo
 from app.workers import gmail_sync
 
@@ -23,6 +23,30 @@ def _seed_user(db, *, history_id="100"):
     db.add(u)
     db.commit()
     return u
+
+
+@pytest.fixture
+def user(db):
+    return _seed_user(db)
+
+
+@pytest.fixture
+def seeded_thread(db, user):
+    """Thread g-t1 with two messages: g-m1 (date 100), g-m2 (date 200)."""
+    inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id="g-t1", subject="hi", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="g-t1", gmail_message_id="g-m1",
+        gmail_internal_date=100, gmail_history_id="50",
+        to_addr=None, from_addr=None, body_preview="m1",
+    )
+    inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="g-t1", gmail_message_id="g-m2",
+        gmail_internal_date=200, gmail_history_id="60",
+        to_addr=None, from_addr=None, body_preview="m2",
+    )
+    db.commit()
+    return db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
 
 
 def _fake_thread_payload(*, tid="gT1", mid="gM1", history_id="200", subject="hi", body=""):
@@ -398,3 +422,49 @@ def test_full_sync_unarchives_reappearing_thread(db):
         InboxThread.user_id == "u1", InboxThread.gmail_id == "g-reappear")).scalar_one()
     assert row.is_archived is False
     assert row.id in ids
+
+
+def test_partial_sync_soft_deletes_message_and_recomputes(db, user, seeded_thread):
+    records = [{"messagesDeleted": [{"message": {"id": "g-m2", "threadId": "g-t1"}}]}]
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=MagicMock()):
+        ids = gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                            new_history_id="99")
+    m2 = db.execute(select(InboxMessage).where(
+        InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m2")).scalar_one()
+    assert m2.is_deleted is True            # soft, row survives
+    t = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
+    assert t.last_activity_at == 100        # pointer recomputed past the deletion
+    assert t.id in ids
+
+
+def test_partial_sync_mirrors_archive_and_unread(db, user, seeded_thread):
+    records = [
+        {"labelsRemoved": [{"message": {"id": "g-m1", "threadId": "g-t1"},
+                            "labelIds": ["INBOX"]}]},
+        {"labelsAdded":   [{"message": {"id": "g-m1", "threadId": "g-t1"},
+                            "labelIds": ["UNREAD"]}]},
+    ]
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=MagicMock()):
+        ids = gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                            new_history_id="100")
+    t = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
+    assert t.is_archived is True            # INBOX label removed → archived
+    m1 = db.execute(select(InboxMessage).where(
+        InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m1")).scalar_one()
+    assert m1.is_unread is True
+    assert t.id in ids
+
+
+def test_partial_sync_unarchives_on_inbox_label_added(db, user, seeded_thread):
+    # pre-archive the thread, then deliver labelsAdded INBOX
+    t = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
+    t.is_archived = True
+    records = [{"labelsAdded": [{"message": {"id": "g-m1", "threadId": "g-t1"},
+                                 "labelIds": ["INBOX"]}]}]
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=MagicMock()):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="101")
+    assert t.is_archived is False

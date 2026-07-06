@@ -22,7 +22,7 @@ import logging
 from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-from app.db.models import Bucket, InboxThread, User
+from app.db.models import Bucket, InboxMessage, InboxThread, User
 from app.inbox import inbox_repo, bucket_repo
 from app.llm.classify import classify
 from app.gmail.client import get_gmail_client
@@ -105,7 +105,7 @@ def fetch_history_records(
         resp = gmail_client.users().history().list(
             userId="me",
             startHistoryId=start_history_id,
-            historyTypes=["messageAdded"],
+            historyTypes=["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
             # Without this, sending a message fires a messageAdded event for the SENT
             # label and gets ingested as if it were inbox mail, which then surfaces in
             # the UI as a thread "from a different address". Singular labelId per the
@@ -137,8 +137,13 @@ def partial_sync_inbox(
     avoid a redundant API call.
 
     Writes touched threads + their messages to postgres in one transaction.
-    Returns the list of internal InboxThread.id values (UUID hex) that were
-    upserted — NOT gmail_thread_ids. The SSE publish path forwards these to
+    Handles four history record shapes: messagesAdded (fetch + classify +
+    upsert), messagesDeleted (soft-delete + recompute pointers + archive-when-
+    empty), labelsAdded/labelsRemoved for INBOX (un-archive/archive, or ingest
+    a previously-unseen thread when INBOX is added), and labelsAdded/Removed
+    for UNREAD (flip InboxMessage.is_unread). Returns the list of internal
+    InboxThread.id values (UUID hex) touched by ANY of the above — NOT
+    gmail_thread_ids. The SSE publish path forwards these to
     /api/threads/batch, which filters by InboxThread.id.
     """
     records_provided = history_records is not None
@@ -157,13 +162,56 @@ def partial_sync_inbox(
         log.info("partial_sync_inbox: user=%s no history records → returning empty", user.id)
         return []
 
-    touched_gmail_ids: set[str] = set()
+    touched_gmail_ids: set[str] = set()      # need a threads.get + full upsert
+    flag_touched_internal_ids: set[str] = set()  # in-place flag updates only
+
+    def _local_thread(gmail_thread_id: str) -> InboxThread | None:
+        return db.execute(select(InboxThread).where(
+            InboxThread.user_id == user.id,
+            InboxThread.gmail_id == gmail_thread_id)).scalar_one_or_none()
+
+    def _local_message(gmail_message_id: str) -> InboxMessage | None:
+        return db.execute(select(InboxMessage).where(
+            InboxMessage.user_id == user.id,
+            InboxMessage.gmail_id == gmail_message_id)).scalar_one_or_none()
+
     for record in history_records:
-        # v1 only handles messagesAdded; messagesDeleted is out of scope (users can't delete).
         for added in record.get("messagesAdded", []) or []:
             tid = (added.get("message") or {}).get("threadId")
             if tid:
                 touched_gmail_ids.add(tid)
+
+        for deleted in record.get("messagesDeleted", []) or []:
+            gm_id = (deleted.get("message") or {}).get("id")
+            row = _local_message(gm_id) if gm_id else None
+            if row is None:
+                continue
+            # Soft delete: task evidence (Phase 2) must survive Gmail deletions.
+            row.is_deleted = True
+            thread = db.get(InboxThread, row.thread_id)
+            if thread is not None:
+                inbox_repo.recompute_thread_pointers(db, thread=thread)
+                if thread.recent_message_id is None:
+                    thread.is_archived = True  # every message gone → leave the inbox view
+                flag_touched_internal_ids.add(thread.id)
+
+        for key, label_present in (("labelsAdded", True), ("labelsRemoved", False)):
+            for change in record.get(key, []) or []:
+                labels = set(change.get("labelIds", []) or [])
+                msg = change.get("message") or {}
+                if "INBOX" in labels and msg.get("threadId"):
+                    thread = _local_thread(msg["threadId"])
+                    if thread is not None:
+                        thread.is_archived = not label_present
+                        flag_touched_internal_ids.add(thread.id)
+                    elif label_present:
+                        # INBOX added to a thread we don't hold → ingest it.
+                        touched_gmail_ids.add(msg["threadId"])
+                if "UNREAD" in labels and msg.get("id"):
+                    row = _local_message(msg["id"])
+                    if row is not None:
+                        row.is_unread = label_present
+                        flag_touched_internal_ids.add(row.thread_id)
 
     log.info(
         "partial_sync_inbox: user=%s touched %d thread ids, fetching each",
@@ -192,6 +240,11 @@ def partial_sync_inbox(
         _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         for p, b in zip(parsed_list, bucket_ids)
     ]
+
+    # Merge in threads touched only by an in-place flag flip (soft-delete,
+    # archive/unarchive, unread) — they never went through the upsert loop
+    # above but still need to be reported so SSE consumers see the change.
+    internal_ids = list({*internal_ids, *flag_touched_internal_ids})
 
     if new_history_id:
         inbox_repo.update_user_history_id(db, user_id=user.id, history_id=str(new_history_id))
