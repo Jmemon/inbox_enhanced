@@ -1,17 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useAuth } from '../auth/useAuth'
-import { useInbox } from './inbox/useInbox'
-import { useInboxSse } from './inbox/useInboxSse'
-import { InboxList } from './inbox/InboxList'
-import { useBuckets } from './buckets/useBuckets'
-import { SecondaryHeader } from './buckets/SecondaryHeader'
-import { ViewBucketsModal } from './buckets/ViewBucketsModal'
-import { NewBucketModal } from './buckets/NewBucketModal'
-import { searchInbox, type InboxThread } from '../lib/api'
+import { useInbox } from './useInbox'
+import { useInboxSse } from './useInboxSse'
+import { InboxList } from './InboxList'
+import { useBuckets } from '../buckets/useBuckets'
+import { SecondaryHeader } from '../buckets/SecondaryHeader'
+import { ViewBucketsModal } from '../buckets/ViewBucketsModal'
+import { NewBucketModal } from '../buckets/NewBucketModal'
+import { searchInbox, type InboxThread } from '../../lib/api'
 
 
-export default function Home() {
-  const { state, signOut } = useAuth()
+export default function InboxPage() {
   const { buckets, byId: bucketsById, create, rename, softDelete } = useBuckets()
   const [filterSelection, setFilterSelection] = useState<Set<string> | null>(null)
   const [showView, setShowView] = useState(false)
@@ -73,21 +71,8 @@ export default function Home() {
   // not yet in the display layer.
   useEffect(() => { void inbox.hydrateCurrentPage() /* eslint-disable-next-line */ }, [inbox.page])
 
-  if (state.status !== 'authed') return null
-
   return (
-    <div style={{ fontFamily: 'system-ui, sans-serif', minHeight: '100vh' }}>
-      <header style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '12px 24px', borderBottom: '1px solid #eee',
-      }}>
-        <div style={{ fontWeight: 600 }}>inbox concierge</div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ fontSize: 14, color: '#444' }}>{state.user.name ?? state.user.email}</span>
-          <button onClick={signOut} style={{ fontSize: 13, padding: '6px 10px' }}>sign out</button>
-        </div>
-      </header>
-
+    <>
       {/* SecondaryHeader owns the reload button, filter dropdown, bucket controls,
           and (right-aligned) the pagination row for the inbox list. */}
       <SecondaryHeader
@@ -139,6 +124,6 @@ export default function Home() {
       {showView && <ViewBucketsModal buckets={buckets} onClose={() => setShowView(false)}
                                        onRename={rename} onDelete={softDelete} />}
       {showNew && <NewBucketModal onClose={() => setShowNew(false)} onSave={createWithWatchdog} />}
-    </div>
+    </>
   )
 }
