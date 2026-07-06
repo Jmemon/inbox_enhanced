@@ -29,7 +29,7 @@ enforces them for you:
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.db.models import Task, TaskEvent, TaskStateEntity, TaskThreadLink
@@ -127,6 +127,24 @@ def bump_version(db: Session, *, task: Task) -> int:
     """Increment task.version (SSE gap-detection counter, D4) and return it."""
     task.version += 1
     return task.version
+
+
+def get_owned_task_any_status(db: Session, *, user_id: str, task_id: str) -> Task | None:
+    """Fetch a task scoped to its owner WITHOUT the is_deleted filter
+    get_owned_task applies. Added for Task 10's idempotent DELETE endpoint:
+    get_owned_task alone can't distinguish "already soft-deleted by you"
+    (should 204 no-op) from "not yours / never existed" (should 404) since
+    both return None from that query. This variant still scopes to
+    (task_id, user_id) — a wrong-user id returns None here too, so it never
+    leaks existence across users."""
+    return db.execute(
+        select(Task).where(Task.id == task_id, Task.user_id == user_id)
+    ).scalar_one_or_none()
+
+
+def soft_delete_task(db: Session, *, task: Task) -> None:
+    """Mark a task deleted in place — mirrors bucket_repo.soft_delete."""
+    task.is_deleted = True
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +268,18 @@ def list_entities(db: Session, *, task_id: str) -> list[TaskStateEntity]:
     return list(db.execute(stmt).scalars().all())
 
 
+def get_entity(db: Session, *, task_id: str, entity_id: str) -> TaskStateEntity | None:
+    """Bare (task_id, entity_id) lookup, scoped to the task — for a caller
+    (Task 10's API router) that has already confirmed task ownership via
+    get_owned_task, this is the same one-level-down scoping trick: a
+    mismatched task_id returns None rather than another task's entity."""
+    return db.execute(
+        select(TaskStateEntity).where(
+            TaskStateEntity.id == entity_id, TaskStateEntity.task_id == task_id,
+        )
+    ).scalar_one_or_none()
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -335,6 +365,30 @@ def list_events(
     return list(db.execute(stmt).scalars().all())
 
 
+def get_event(db: Session, *, task_id: str, event_id: str) -> TaskEvent | None:
+    """Bare (task_id, event_id) lookup — same task-scoping rationale as
+    get_entity, used by the approve/reject/revert correction endpoints."""
+    return db.execute(
+        select(TaskEvent).where(
+            TaskEvent.id == event_id, TaskEvent.task_id == task_id,
+        )
+    ).scalar_one_or_none()
+
+
+def list_applied_events_for_thread(db: Session, *, task_id: str, thread_id: str) -> list[TaskEvent]:
+    """Every currently-'applied' event this task recorded with provenance
+    pointing at one thread — the substrate for the user-detach correction
+    (Task 10): DELETE /api/tasks/{id}/threads/{thread_id} flips each of these
+    to 'reverted', then refolds every entity_id they touched so the board
+    catches up in the same request."""
+    stmt = select(TaskEvent).where(
+        TaskEvent.task_id == task_id,
+        TaskEvent.thread_id == thread_id,
+        TaskEvent.status == "applied",
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
 def pending_count(db: Session, *, task_id: str) -> int:
     """Count of this task's events awaiting human review (status =
     'pending_review') — drives the review-queue badge."""
@@ -374,6 +428,29 @@ def refold_entity(db: Session, *, task: Task, entity: TaskStateEntity) -> None:
     entity.state = new_state
     entity.updated_at = datetime.now(timezone.utc)
     bump_version(db, task=task)
+
+
+def repoint_entity_events(db: Session, *, task_id: str, from_entity_id: str, to_entity_id: str) -> None:
+    """Merge substrate (Task 10): reassign every event on the losing entity
+    to the winner's id, regardless of status — applied/pending_review/
+    rejected/reverted all carry provenance that must survive a merge; only
+    the entity_id pointer moves. Caller is responsible for refolding
+    `to_entity_id` afterward (so its `state` catches up with the
+    newly-adopted applied events) and then deleting the now-orphaned loser
+    row via delete_entity()."""
+    db.execute(
+        update(TaskEvent)
+        .where(TaskEvent.task_id == task_id, TaskEvent.entity_id == from_entity_id)
+        .values(entity_id=to_entity_id)
+    )
+
+
+def delete_entity(db: Session, *, entity: TaskStateEntity) -> None:
+    """Hard-delete a TaskStateEntity row. Only ever called on a merge's loser
+    AFTER repoint_entity_events has already moved its events off of it —
+    TaskEvent.entity_id is a soft pointer with no FK (see db/models.py), so
+    this never orphans a foreign-key reference."""
+    db.delete(entity)
 
 
 # ---------------------------------------------------------------------------

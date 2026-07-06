@@ -19,6 +19,7 @@ from app.api.inbox import router as inbox_router
 from app.api.search import router as search_router
 from app.api.sse import router as sse_router
 from app.api.sync import router as sync_router
+from app.api.tasks import router as tasks_router
 from app.config import get_settings
 from app.realtime import pubsub
 
@@ -48,6 +49,7 @@ app.include_router(inbox_router)
 app.include_router(search_router)
 app.include_router(sse_router)
 app.include_router(sync_router)
+app.include_router(tasks_router)
 
 
 @app.get("/api/health")
