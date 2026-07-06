@@ -1,5 +1,7 @@
 from datetime import datetime
-from sqlalchemy import Boolean, String, Text, DateTime, ForeignKey, BigInteger, UniqueConstraint
+from sqlalchemy import (Boolean, String, Text, DateTime, ForeignKey, BigInteger,
+                        Integer, Float, JSON, UniqueConstraint)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -64,6 +66,14 @@ class InboxThread(Base):
     bucket_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("buckets.id"))
     # recent_message_id can't FK at row-create time (chicken/egg); it's a soft pointer.
     recent_message_id: Mapped[str | None] = mapped_column(String(36))
+    # Mirrors Gmail INBOX-label removal (archive). Archived threads stay
+    # queryable (task evidence) but default inbox views filter them.
+    is_archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                              server_default="false")
+    # Denormalized max(gmail_internal_date) of non-deleted messages. Maintained
+    # by inbox_repo.recompute_thread_pointers; kills the recent-message
+    # outerjoin sort in list_threads.
+    last_activity_at: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class InboxMessage(Base):
@@ -84,3 +94,36 @@ class InboxMessage(Base):
     to_addr: Mapped[str | None] = mapped_column(Text)
     from_addr: Mapped[str | None] = mapped_column(Text)
     body_preview: Mapped[str | None] = mapped_column(String(200))
+    # Full decoded plain-text body (parser already extracts it; was discarded
+    # after the preview cut). Nullable: pre-migration rows forward-fill on the
+    # next sync touch.
+    body_text: Mapped[str | None] = mapped_column(Text)
+    # Gmail labelIds snapshot (stored, not interpreted beyond INBOX/UNREAD).
+    labels: Mapped[list] = mapped_column(JSON().with_variant(JSONB(), "postgresql"),
+                                         nullable=False, default=list, server_default="[]")
+    is_unread: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                            server_default="false")
+    # Soft delete — task evidence must survive Gmail deletions.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                             server_default="false")
+
+
+class LlmCall(Base):
+    """One row per LLM API call (VISION: metrics persisted, not just logged).
+    Written by app/llm/metrics.record_call from the llm client choke point."""
+    __tablename__ = "llm_calls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    task_id: Mapped[str | None] = mapped_column(String(36))  # tasks land in Phase 2
+    stage: Mapped[str] = mapped_column(String(16), nullable=False)  # classify|score|extract|propose
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer)
+    cost_usd: Mapped[float | None] = mapped_column(Float)
+    ttft_ms: Mapped[int | None] = mapped_column(Integer)  # null for non-streamed calls
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)  # success|error
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
