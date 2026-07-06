@@ -2,7 +2,8 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 import pytest
 from googleapiclient.errors import HttpError
-from app.db.models import Base, User
+from sqlalchemy import select, func
+from app.db.models import Base, InboxThread, User
 from app.inbox import inbox_repo
 from app.workers import gmail_sync
 
@@ -154,12 +155,18 @@ def test_full_sync_inbox_pulls_latest_200_threads_and_writes(db):
     assert db.get(User, "u1").gmail_last_history_id == "999"
 
 
-def test_full_sync_clears_existing_user_inbox_before_repopulating(db):
-    """Per spec: 'easy option: throw out what was in there'. Stale rows must
-    be deleted; the post-sync state should be exactly what gmail returned."""
+def test_full_sync_never_deletes_stale_threads(db):
+    """Full sync is a reconciling upsert, not a wipe: pre-existing rows whose
+    activity is outside (or incomparable to) the newly listed window must
+    survive untouched — never deleted — even though gmail's new listing
+    doesn't mention them. (The "vanished from inside the window → archived"
+    case is covered by test_full_sync_reconciles_instead_of_wiping.)"""
     u = _seed_user(db, history_id=None)
 
-    # Seed two stale threads that gmail's listing won't include.
+    # Seed two stale threads that gmail's listing won't include. STALE_A's
+    # activity (1) predates the listed window (~1.7e12); STALE_B has no
+    # messages at all (last_activity_at is NULL) — neither is comparable to
+    # the window, so reconciliation must leave both alone.
     inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="STALE_A", subject="old", bucket_id=None)
     inbox_repo.upsert_message(
         db, user_id="u1", gmail_thread_id="STALE_A", gmail_message_id="m_stale_a",
@@ -191,8 +198,100 @@ def test_full_sync_clears_existing_user_inbox_before_repopulating(db):
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
         ids = gmail_sync.full_sync_inbox(db, user=u)
 
-    [thread] = inbox_repo.list_threads(db, user_id="u1", limit=10, offset=0)
-    assert thread.gmail_id == "gT_NEW"
-    assert ids == [thread.id]  # internal InboxThread.id, not gmail_thread_id
+    new_row = db.execute(select(InboxThread).where(
+        InboxThread.user_id == "u1", InboxThread.gmail_id == "gT_NEW")).scalar_one()
+    assert ids == [new_row.id]  # internal InboxThread.id, not gmail_thread_id
+
     surviving = {t.gmail_id for t in inbox_repo.list_threads(db, user_id="u1", limit=10, offset=0)}
-    assert surviving == {"gT_NEW"}, f"stale rows leaked into post-sync state: {surviving}"
+    assert surviving == {"STALE_A", "STALE_B", "gT_NEW"}, \
+        f"reconciling upsert must never delete rows: {surviving}"
+
+    # No rows deleted at the storage level either (not just hidden by the
+    # is_archived filter in list_threads).
+    assert db.execute(select(func.count(InboxThread.id)).where(
+        InboxThread.user_id == "u1")).scalar_one() == 3
+
+
+def test_full_sync_reconciles_instead_of_wiping(db):
+    """Pre-existing thread NOT in the new listing but older than the listed
+    window must survive untouched; one inside the window but absent from the
+    listing must be marked archived (it left the inbox while the cursor was
+    dead); listed threads upsert idempotently (no duplicate rows)."""
+    u = _seed_user(db, history_id=None)
+
+    # g-ancient: activity (100) predates the window the new listing covers
+    # (4000..6000 below). Outside the window is out of scope — must survive
+    # completely untouched.
+    inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="g-ancient", subject="ancient", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="g-ancient", gmail_message_id="m-ancient",
+        gmail_internal_date=100, gmail_history_id="100",
+        to_addr=None, from_addr=None, body_preview="ancient",
+    )
+
+    # g-gone: activity (5000) falls inside the window [4000, 6000] the new
+    # listing covers, but the new listing does not include it — it left the
+    # inbox (archived/deleted remotely) while our cursor was dead. Must be
+    # marked archived and reported back so SSE consumers evict it.
+    inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="g-gone", subject="gone", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="g-gone", gmail_message_id="m-gone",
+        gmail_internal_date=5000, gmail_history_id="200",
+        to_addr=None, from_addr=None, body_preview="gone",
+    )
+
+    # gT1: already exists (stale subject) AND is present in the new listing —
+    # proves the upsert is idempotent (updates in place, no duplicate row).
+    inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="gT1", subject="stale subject", bucket_id=None)
+    db.commit()
+
+    def _fake_thread(tid: str, internal_date: int, subject: str) -> dict:
+        return {
+            "id": tid,
+            "messages": [{
+                "id": f"m_{tid}", "threadId": tid,
+                "internalDate": str(internal_date), "historyId": "999",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [{"name": "Subject", "value": subject}],
+                    "body": {"data": ""},
+                },
+            }],
+        }
+
+    listing = {"threads": [{"id": "gT1"}, {"id": "gT2"}]}
+    fixtures = {
+        "gT1": _fake_thread("gT1", 4000, "fresh gT1"),
+        "gT2": _fake_thread("gT2", 6000, "fresh gT2"),
+    }
+
+    gmail = MagicMock()
+    gmail.users().threads().list().execute.return_value = listing
+
+    # Capture id from the .get() call args (matches the fixture pattern used
+    # by test_full_sync_inbox_pulls_latest_200_threads_and_writes above).
+    def _fake_threads_get(*, userId, id, format):
+        inner = MagicMock()
+        inner.execute.return_value = fixtures[id]
+        return inner
+    gmail.users().threads().get.side_effect = _fake_threads_get
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        ids = gmail_sync.full_sync_inbox(db, user=u)
+
+    old = db.execute(select(InboxThread).where(
+        InboxThread.user_id == u.id, InboxThread.gmail_id == "g-ancient")).scalar_one()
+    assert old.is_archived is False  # outside window: untouched
+
+    gone = db.execute(select(InboxThread).where(
+        InboxThread.user_id == u.id, InboxThread.gmail_id == "g-gone")).scalar_one()
+    assert gone.is_archived is True  # inside window, absent from listing
+    assert gone.id in ids            # published so clients evict it
+
+    listed = db.execute(select(InboxThread).where(
+        InboxThread.user_id == u.id, InboxThread.gmail_id == "gT1")).scalar_one()
+    assert listed.subject == "fresh gT1"  # idempotent upsert updates in place
+
+    # no rows were deleted
+    assert db.execute(select(func.count(InboxThread.id)).where(
+        InboxThread.user_id == u.id)).scalar_one() >= 4

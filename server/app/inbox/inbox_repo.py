@@ -210,9 +210,9 @@ def update_user_history_id(db: Session, *, user_id: str, history_id: str) -> Non
 def clear_user_inbox(db: Session, *, user_id: str) -> None:
     """Wipe all inbox_threads + inbox_messages for one user.
 
-    Used by full_sync_inbox to skip reconciliation: after a long offline gap
-    or a 404 on history.list, just delete and repopulate from scratch.
-    Order matters — messages have a FK to threads.
+    Used only for account deletion. Sync paths must never call this — task
+    evidence FKs onto these rows. Order matters — messages have a FK to
+    threads.
     """
     db.execute(delete(InboxMessage).where(InboxMessage.user_id == user_id))
     db.execute(delete(InboxThread).where(InboxThread.user_id == user_id))

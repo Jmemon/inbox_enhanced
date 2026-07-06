@@ -8,8 +8,9 @@ Three entry points:
    history_records so poll_new_messages can call history.list once and pass
    the result through (per spec: "called by poll_new_messages. also reusable
    for full sync. if history_records is null, fetch via users.history.list").
- - full_sync_inbox: bootstrap / 404-recovery. Clears existing inbox rows for
-   the user and repopulates from the latest 200 threads.
+ - full_sync_inbox: bootstrap / 404-recovery. Reconciling upsert against the
+   latest 200 threads — never deletes rows; stored non-archived threads that
+   vanished from the listed window are marked is_archived=True instead.
 
 All three commit internally and return the list of gmail_thread_ids that were
 touched. Returning ids only (not full thread payloads) keeps callers — the SSE
@@ -205,21 +206,25 @@ def partial_sync_inbox(
 def full_sync_inbox(db: Session, *, user: User) -> list[str]:
     """Bootstrap / 404-recovery sync.
 
-    Per the workers spec ("easy option: throw out what was in there"), this
-    deletes the user's existing inbox_threads + inbox_messages and repopulates
-    from the 200 most-recently-active gmail threads. Avoids reconciliation
-    complexity for long offline gaps or expired history cursors.
+    Reconciling upsert, NOT a wipe: repopulates from the 200 most-recently-
+    active gmail threads, upserting each (never deleting). Stored,
+    non-archived threads whose last activity falls inside the window we just
+    listed but which gmail no longer returns are marked is_archived=True —
+    they left the inbox while our cursor was dead. Threads outside that
+    window are untouched; they're simply out of scope for this listing.
+
+    The wipe-then-repopulate approach this replaced was removed because
+    Phase 2 task tables FK onto inbox_threads.id — deleting rows here would
+    orphan task evidence, and HistoryGoneError recovery (which calls this
+    function) must not be destructive.
 
     Returns the list of internal InboxThread.id values (UUID hex) that were
-    upserted — NOT gmail_thread_ids. The SSE publish path forwards these to
-    /api/threads/batch, which filters by InboxThread.id. Commits internally.
+    upserted or archived — NOT gmail_thread_ids. The SSE publish path forwards
+    these to /api/threads/batch, which filters by InboxThread.id. Commits
+    internally.
     """
     log.info("full_sync_inbox: start user=%s", user.id)
     gmail = get_gmail_client(db, user)
-
-    # Nuke first. Order: messages → threads (FK constraint).
-    inbox_repo.clear_user_inbox(db, user_id=user.id)
-    db.flush()
 
     # labelIds=["INBOX"] scopes to threads with at least one inbox-labeled message,
     # matching Gmail's own "Inbox" view. Without it threads.list returns the All Mail
@@ -244,6 +249,29 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
         _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         for p, b in zip(parsed_list, bucket_ids)
     ]
+
+    # Reconcile: a stored, non-archived thread whose activity falls inside the
+    # window we just listed but which Gmail no longer returns has left the
+    # inbox while our cursor was dead (archived/deleted remotely). Mark it
+    # archived — never delete; task evidence may reference it. Threads older
+    # than the listed window are out of scope for this listing and untouched.
+    if parsed_list:
+        listed_gmail_ids = {p.gmail_thread_id for p in parsed_list}
+        window_min = min(p.recent_internal_date for p in parsed_list)
+        stale = db.execute(
+            select(InboxThread).where(
+                InboxThread.user_id == user.id,
+                InboxThread.is_archived == False,  # noqa: E712
+                InboxThread.gmail_id.not_in(listed_gmail_ids),
+                InboxThread.last_activity_at >= window_min,
+            )
+        ).scalars().all()
+        for t in stale:
+            t.is_archived = True
+            internal_ids.append(t.id)
+        if stale:
+            log.info("full_sync_inbox: user=%s archived %d threads absent from listing",
+                     user.id, len(stale))
 
     # Walk parsed_list once after upserting to find the max history_id across all
     # ingested messages — used to advance the user's gmail cursor.
