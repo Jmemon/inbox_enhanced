@@ -80,12 +80,16 @@ def test_backfill_computes_max_gmail_internal_date_per_thread(tmp_path):
     eng = create_engine(db_url, future=True)
     with eng.begin() as conn:
         # users: id, email, created_at are the NOT NULL columns (0001_initial).
+        # Bind an ISO string, not a raw datetime: Python 3.12+'s sqlite3 adapter
+        # deprecated its implicit datetime->str conversion (this file's only
+        # recurring test-suite warning), and the column value is never read
+        # back or asserted on here, so the string form loses nothing.
         conn.execute(
             text(
                 "INSERT INTO users (id, email, created_at) "
                 "VALUES (:id, :email, :created_at)"
             ),
-            {"id": "user-1", "email": "user1@example.com", "created_at": now},
+            {"id": "user-1", "email": "user1@example.com", "created_at": now.isoformat()},
         )
         # inbox_threads: id, user_id, gmail_id are the NOT NULL columns (0002_inbox).
         conn.execute(
