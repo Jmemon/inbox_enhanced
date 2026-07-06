@@ -14,6 +14,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.db.models import Bucket
+from app.task_engine.criteria import formulate_criteria  # noqa: F401
 
 
 def list_active(db: Session, *, user_id: str) -> list[Bucket]:
@@ -57,50 +58,3 @@ def rename(db: Session, bucket: Bucket, name: str) -> Bucket:
 def soft_delete(db: Session, bucket: Bucket) -> Bucket:
     bucket.is_deleted = True
     return bucket
-
-
-def formulate_criteria(
-    *,
-    description: str,
-    confirmed_positives: list[dict],
-    confirmed_negatives: list[dict],
-) -> str:
-    """Build the final criteria text mirroring default-bucket structure.
-
-    Each example in confirmed_* is a dict with keys:
-       sender    — e.g. "alice@example.com"
-       subject   — string
-       snippet   — verbatim quotation from the thread that the LLM surfaced
-                   and the user agreed with
-       rationale — one-line LLM rationale the user approved
-
-    The output is a description paragraph + "Example cases:" + tagged
-    <positive>/<nearmiss> blocks in the same shape as default-bucket criteria
-    (see app/llm/default_criteria.py).
-    """
-    lines: list[str] = [description.strip(), "", "Example cases:"]
-    for ex in confirmed_positives:
-        lines.append("<positive>")
-        lines.append(f"From: {ex.get('sender', '')}")
-        lines.append(f"To: me")
-        lines.append(f"Subject: {ex.get('subject', '')}")
-        lines.append("")
-        lines.append(ex.get("snippet", ""))
-        rationale = ex.get("rationale", "")
-        if rationale:
-            lines.append("")
-            lines.append(f"Why: {rationale}")
-        lines.append("</positive>")
-    for ex in confirmed_negatives:
-        lines.append("<nearmiss>")
-        lines.append(f"From: {ex.get('sender', '')}")
-        lines.append(f"To: me")
-        lines.append(f"Subject: {ex.get('subject', '')}")
-        lines.append("")
-        lines.append(ex.get("snippet", ""))
-        rationale = ex.get("rationale", "")
-        if rationale:
-            lines.append("")
-            lines.append(f"Why: {rationale}")
-        lines.append("</nearmiss>")
-    return "\n".join(lines) + "\n"

@@ -143,7 +143,12 @@ class Task(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     goal: Mapped[str] = mapped_column(Text, nullable=False, default="")
     criteria: Mapped[str] = mapped_column(Text, nullable=False, default="")  # formulate_criteria grammar
-    state_schema: Mapped[dict | None] = mapped_column(JSON().with_variant(JSONB(), "postgresql"))  # EPS; null = classify-only
+    # none_as_null=True: a Python None must persist as SQL NULL (not the JSON
+    # scalar 'null') so repo.list_active_trackers's `state_schema IS NOT NULL`
+    # filter actually distinguishes "no schema yet" from a real schema dict.
+    state_schema: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )  # EPS; null = classify-only
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active | paused
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)  # SSE gap detection (D4)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
