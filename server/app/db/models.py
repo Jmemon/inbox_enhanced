@@ -127,3 +127,85 @@ class LlmCall(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     outcome: Mapped[str] = mapped_column(String(16), nullable=False)  # success|error
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class Task(Base):
+    """Phase 2A task engine: a user-defined tracker (or, in Phase 4, an
+    LLM-managed classify-bucket) that threads get linked to and scored
+    against. See reference/ for the classify -> link -> extract -> fold
+    pipeline this anchors."""
+    __tablename__ = "tasks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # null user_id reserved for Phase-4 default classify-tasks; always set in 2A.
+    user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="tracker")  # 'tracker' | 'bucket' (Phase 4)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    goal: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    criteria: Mapped[str] = mapped_column(Text, nullable=False, default="")  # formulate_criteria grammar
+    state_schema: Mapped[dict | None] = mapped_column(JSON().with_variant(JSONB(), "postgresql"))  # EPS; null = classify-only
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")  # active | paused
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)  # SSE gap detection (D4)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TaskThreadLink(Base):
+    """Attaches an inbox thread to a task. LLM-origin links can be detached
+    by a later reclassify; user-origin links are sticky (never auto-detached)."""
+    __tablename__ = "task_thread_links"
+    __table_args__ = (UniqueConstraint("task_id", "thread_id", name="uq_task_thread"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), nullable=False, index=True)
+    thread_id: Mapped[str] = mapped_column(String(36), ForeignKey("inbox_threads.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    origin: Mapped[str] = mapped_column(String(8), nullable=False)   # 'llm' | 'user' — user rows are sticky
+    state: Mapped[str] = mapped_column(String(12), nullable=False, default="attached")  # attached | detached
+    confidence: Mapped[int | None] = mapped_column(Integer)          # 0-100 at link time (llm origin)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TaskStateEntity(Base):
+    """One tracked entity within a task's state (e.g. 'stripe' inside a
+    'vendor renewals' tracker); '_self' is the singleton entity key for
+    single-entity tasks. state is always re-derivable as a fold over this
+    entity's applied task_events — refold_entity() rebuilds it after a
+    revert/reject."""
+    __tablename__ = "task_state_entities"
+    __table_args__ = (UniqueConstraint("task_id", "entity_key", name="uq_task_entity"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    entity_key: Mapped[str] = mapped_column(String(255), nullable=False)  # normalized ('stripe'); '_self' for singleton
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # {"stage": str|None, "<attr key>": value, ...} — ALWAYS derivable as a fold
+    # over applied task_events; refold_entity() rebuilds after revert/reject.
+    state: Mapped[dict] = mapped_column(JSON().with_variant(JSONB(), "postgresql"), nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TaskEvent(Base):
+    """Append-only audit log of every state change to a task's entities —
+    the source of truth that TaskStateEntity.state is folded from. Soft
+    pointers (entity_id/thread_id/message_id) let events outlive entity
+    merges and Gmail-side deletions without losing provenance."""
+    __tablename__ = "task_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    entity_id: Mapped[str | None] = mapped_column(String(36), index=True)  # soft ptr — events outlive merges
+    thread_id: Mapped[str | None] = mapped_column(String(36))              # soft ptr (provenance)
+    message_id: Mapped[str | None] = mapped_column(String(36))             # soft ptr; null for user edits
+    gmail_message_id: Mapped[str | None] = mapped_column(String(64))       # denormalized — audit survives churn
+    field: Mapped[str | None] = mapped_column(String(64))                  # 'stage' or attribute key
+    old_value: Mapped[str | None] = mapped_column(Text)
+    new_value: Mapped[str | None] = mapped_column(Text)
+    evidence_quote: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[int | None] = mapped_column(Integer)                # 0-100
+    origin: Mapped[str] = mapped_column(String(8), nullable=False)         # 'llm' | 'user'
+    status: Mapped[str] = mapped_column(String(16), nullable=False)        # applied|pending_review|rejected|reverted
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
