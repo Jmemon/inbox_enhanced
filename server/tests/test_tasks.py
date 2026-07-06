@@ -10,6 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db.models import Base, User
 from app.inbox import inbox_repo
+from app.realtime import last_sync
 from app.workers import tasks, gmail_sync
 
 
@@ -78,6 +79,9 @@ def test_poll_new_messages_publishes_when_history_returns_records(
     assert body["event"] == "threads_updated"
     assert body["thread_ids"] == ["gT1"]
 
+    # last_sync.mark(user_id) must fire on the partial-sync-complete exit path.
+    assert last_sync.get("u1") is not None
+
 
 def test_poll_new_messages_silent_when_history_returns_no_records(
     fake_redis, session_factory, monkeypatch,
@@ -96,6 +100,9 @@ def test_poll_new_messages_silent_when_history_returns_no_records(
 
     mock_partial.assert_not_called()
     assert ps.get_message(timeout=0.2) is None  # nothing published
+
+    # a successful check IS a sync, even with nothing new — mark() must still fire.
+    assert last_sync.get("u1") is not None
 
 
 def test_poll_new_messages_falls_back_to_full_sync_on_404(
@@ -124,6 +131,9 @@ def test_poll_new_messages_falls_back_to_full_sync_on_404(
     assert body["event"] == "threads_updated"
     assert body["thread_ids"] == ["gT_new"]
 
+    # 404-recovery full-sync exit path must also mark last_sync.
+    assert last_sync.get("u1") is not None
+
 
 def test_poll_new_messages_does_full_sync_when_user_has_no_history_id(
     fake_redis, session_factory, monkeypatch,
@@ -144,6 +154,54 @@ def test_poll_new_messages_does_full_sync_when_user_has_no_history_id(
     body = json.loads(msg["data"])
     assert body["event"] == "threads_updated"
     assert body["thread_ids"] == ["gT_a"]
+
+    # no-cursor full-sync exit path must also mark last_sync.
+    assert last_sync.get("u1") is not None
+
+
+def test_full_sync_inbox_task_marks_last_sync(
+    fake_redis, session_factory, monkeypatch,
+):
+    """full_sync_inbox_task's success exit is one of the 6 last_sync.mark
+    call sites — pin that it fires after publishing."""
+    monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
+    _seed_user(session_factory)
+    ps = _drained_pubsub(fake_redis, "user:u1")
+
+    with patch("app.workers.tasks.gmail_sync.full_sync_inbox",
+               return_value=["gT_full"]) as mock_full:
+        tasks.full_sync_inbox_task.apply(args=["u1"])
+
+    mock_full.assert_called_once()
+    msg = ps.get_message(timeout=1.0)
+    body = json.loads(msg["data"])
+    assert body["event"] == "threads_updated"
+    assert body["thread_ids"] == ["gT_full"]
+    assert last_sync.get("u1") is not None
+
+
+def test_reclassify_user_inbox_marks_last_sync(
+    fake_redis, session_factory, monkeypatch,
+):
+    """reclassify_user_inbox's success exit is one of the 6 last_sync.mark
+    call sites. Uses a cursor-less user with an empty inbox so
+    _inline_reload takes the full-sync branch and _reclassify_all
+    short-circuits on zero threads, without needing to stub the LLM
+    classify path."""
+    monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
+    _seed_user(session_factory, history_id=None)
+    ps = _drained_pubsub(fake_redis, "user:u1")
+
+    with patch("app.workers.tasks.gmail_sync.full_sync_inbox",
+               return_value=["gT_reload"]) as mock_full:
+        tasks.reclassify_user_inbox.apply(args=["u1"])
+
+    mock_full.assert_called_once()
+    msg = ps.get_message(timeout=1.0)
+    body = json.loads(msg["data"])
+    assert body["event"] == "threads_updated"
+    assert body["thread_ids"] == ["gT_reload"]
+    assert last_sync.get("u1") is not None
 
 
 def test_enqueue_polls_purges_and_fans_out(fake_redis, monkeypatch):
