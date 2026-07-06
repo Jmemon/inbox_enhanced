@@ -43,7 +43,12 @@ export default function Home() {
         setSearchResults(r.threads); setSearchError(null)
       } catch (e: any) {
         if (seq !== searchSeq.current) return
-        setSearchError(String(e?.message ?? e))
+        // Also engage search mode on failure (not just setSearchError): if
+        // this is the FIRST search attempt, searchResults is still null, and
+        // the render branch below gates on `searchResults !== null` — without
+        // this, a first-search failure would set searchError but never show
+        // it, silently leaving the normal inbox list on screen.
+        setSearchResults([]); setSearchError(String(e?.message ?? e))
       }
     }, 300)
     return () => clearTimeout(t)

@@ -28,6 +28,12 @@ export function useInbox(opts: {
   const [extendInFlight, setExtendInFlight] = useState(false)
 
   const lastInternalDate = useRef<Record<string, number>>({})
+  // Mirrors the recent_message.id of whatever is currently in displayLayer,
+  // kept in lockstep with lastInternalDate (both updated together on accept).
+  // Lets applyThreadUpdates detect a moved recent_message pointer even when
+  // the LWW date gate alone can't order the update (see widened accept
+  // condition below).
+  const lastRecentMessageId = useRef<Record<string, string | undefined>>({})
   // No-progress guard: remembers the idLayer.length at which we last fired an
   // auto-extend. Blocks a tight retry loop if the server replies with 0 new
   // ids (length unchanged → guard locked). Re-arms naturally when new ids land
@@ -58,13 +64,16 @@ export function useInbox(opts: {
     const order: string[] = []
     const display: DisplayLayer = {}
     const nextDates: Record<string, number> = {}
+    const nextRecentIds: Record<string, string | undefined> = {}
     for (const t of r.threads) {
       order.push(t.id); display[t.id] = t
       if (t.recent_message) nextDates[t.id] = t.recent_message.internal_date
+      nextRecentIds[t.id] = t.recent_message?.id
     }
     // Reset, don't merge: an out-of-band thread we no longer surface (e.g. moved
     // out of the latest 200 window) should not keep a stale LWW gate value.
     lastInternalDate.current = nextDates
+    lastRecentMessageId.current = nextRecentIds
     setIdLayer(order); setDisplayLayer(display)
   }, [])
 
@@ -88,31 +97,61 @@ export function useInbox(opts: {
     if (ids.length === 0) return
     let fetched: InboxThread[] = []
     try { fetched = await getThreadsBatch(ids) } catch { return }
-    const accepted: InboxThread[] = []
-    for (const t of fetched) {
-      const incoming = t.recent_message?.internal_date ?? 0
-      const have = lastInternalDate.current[t.id] ?? 0
-      if (incoming >= have) {
-        accepted.push(t)
-        if (t.recent_message) lastInternalDate.current[t.id] = incoming
-      }
-    }
-    if (accepted.length === 0) return
-    // Archived threads (mirrored from Gmail) leave the list instead of merging.
-    const archived = accepted.filter(t => t.is_archived)
-    const live = accepted.filter(t => !t.is_archived)
+
+    // Partition `fetched` (not an LWW-gated `accepted` set) by is_archived
+    // FIRST. is_archived is authoritative server state — evict unconditionally,
+    // with no date gating. This ordering matters: a full delete (all messages
+    // removed) sets is_archived=True with recent_message=null (incoming=0),
+    // and a soft-delete of just the newest message also drops
+    // recent_message.internal_date. Gating on date before checking
+    // is_archived (the old bug) meant both cases could fail the `incoming >=
+    // have` check and never reach eviction, leaving deleted content stuck on
+    // screen.
+    const archived = fetched.filter(t => t.is_archived)
+    const live = fetched.filter(t => !t.is_archived)
     if (archived.length > 0) {
       const drop = new Set(archived.map(t => t.id))
-      for (const t of archived) delete lastInternalDate.current[t.id]
+      for (const t of archived) {
+        delete lastInternalDate.current[t.id]
+        delete lastRecentMessageId.current[t.id]
+      }
       setDisplayLayer(prev => {
         const n = { ...prev }; for (const t of archived) delete n[t.id]; return n
       })
       setIdLayer(prev => prev.filter(id => !drop.has(id)))
     }
-    if (live.length === 0) return
-    setDisplayLayer(prev => { const n = { ...prev }; for (const t of live) n[t.id] = t; return n })
+
+    // Live partition: keep the LWW gate (rejects stale/out-of-order batch
+    // responses) but widen the accept condition. Accept when the incoming
+    // date is newer-or-equal, OR when the recent_message pointer itself moved
+    // (its id differs from what's currently displayed for this thread). The
+    // id-difference bypass exists because a date-only comparison can't order
+    // "pointer demotions": soft-deleting a thread's newest message lowers
+    // recent_message.internal_date below what we already have, so a plain
+    // `incoming >= have` gate would reject the update and leave the deleted
+    // message's preview stuck on screen even though the thread is still live.
+    // On accept we update lastInternalDate.current to the incoming date even
+    // when it's LOWER than before — that's the point of the demotion.
+    // Residual risk (unchanged from before this fix): two in-flight batch
+    // responses for the same thread can still interleave/race with each
+    // other; this only fixes ordering against the last *displayed* state, not
+    // concurrent fetches racing one another.
+    const accepted: InboxThread[] = []
+    for (const t of live) {
+      const incoming = t.recent_message?.internal_date ?? 0
+      const have = lastInternalDate.current[t.id] ?? 0
+      const pointerMoved = t.recent_message?.id !== lastRecentMessageId.current[t.id]
+      if (incoming >= have || pointerMoved) {
+        accepted.push(t)
+        lastInternalDate.current[t.id] = incoming
+        lastRecentMessageId.current[t.id] = t.recent_message?.id
+      }
+    }
+    if (accepted.length === 0) return
+
+    setDisplayLayer(prev => { const n = { ...prev }; for (const t of accepted) n[t.id] = t; return n })
     setIdLayer(prev => {
-      const merged = new Set(prev); for (const t of live) merged.add(t.id)
+      const merged = new Set(prev); for (const t of accepted) merged.add(t.id)
       return [...merged].sort((a, b) =>
         (lastInternalDate.current[b] ?? 0) - (lastInternalDate.current[a] ?? 0))
     })
