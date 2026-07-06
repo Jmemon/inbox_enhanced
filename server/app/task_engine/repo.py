@@ -363,3 +363,46 @@ def refold_entity(db: Session, *, task: Task, entity: TaskStateEntity) -> None:
     entity.state = new_state
     entity.updated_at = datetime.now(timezone.utc)
     bump_version(db, task=task)
+
+
+# ---------------------------------------------------------------------------
+# Extraction validator support (Task 6, task_engine.transitions)
+# ---------------------------------------------------------------------------
+
+
+def latest_applied_user_event(db: Session, *, entity_id: str) -> TaskEvent | None:
+    """Most recent (by created_at) origin='user' status='applied' event for
+    this entity, across all fields — the extraction validator's correction
+    fence (spec §4.4 step 5): a proposal may only move this entity if its
+    evidence message is strictly newer than this event."""
+    stmt = (
+        select(TaskEvent)
+        .where(
+            TaskEvent.entity_id == entity_id,
+            TaskEvent.origin == "user",
+            TaskEvent.status == "applied",
+        )
+        .order_by(TaskEvent.created_at.desc())
+        .limit(1)
+    )
+    return db.execute(stmt).scalars().first()
+
+
+def find_event_for_message_field(
+    db: Session, *, task_id: str, message_id: str | None, field: str | None
+) -> TaskEvent | None:
+    """SELECT-first idempotency check for (task_id, message_id, field) — the
+    extraction validator's fast path (spec §4.4 step 7). The partial unique
+    index `uq_task_event_msg_field` (message_id IS NOT NULL) is only the race
+    backstop for migrated DBs; it does not exist in the `create_all` test
+    fixture. message_id=None (user edits) never collides — this always
+    returns None for it, matching the index's own `WHERE message_id IS NOT
+    NULL` exemption."""
+    if message_id is None:
+        return None
+    stmt = select(TaskEvent).where(
+        TaskEvent.task_id == task_id,
+        TaskEvent.message_id == message_id,
+        TaskEvent.field == field,
+    )
+    return db.execute(stmt).scalar_one_or_none()
