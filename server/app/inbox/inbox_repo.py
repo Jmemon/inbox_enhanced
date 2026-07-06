@@ -106,6 +106,11 @@ def upsert_message(
         if label_ids is not None:
             existing.labels = list(label_ids)
             existing.is_unread = "UNREAD" in label_ids
+        # A message returned by a live Gmail fetch definitionally exists —
+        # heals a spurious/duplicated messagesDeleted record (or any other
+        # path that wrongly soft-deleted this row) instead of hiding a
+        # message forever. The insert branch above already defaults False.
+        existing.is_deleted = False
 
     recompute_thread_pointers(db, thread=thread)
     return existing
