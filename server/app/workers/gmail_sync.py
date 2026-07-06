@@ -12,9 +12,18 @@ Three entry points:
    latest 200 threads — never deletes rows; stored non-archived threads that
    vanished from the listed window are marked is_archived=True instead.
 
-All three commit internally and return the list of gmail_thread_ids that were
-touched. Returning ids only (not full thread payloads) keeps callers — the SSE
-publish path in tasks.py — small: the data is in postgres for the api to read.
+All three commit internally. `partial_sync_inbox` and `full_sync_inbox` return
+a 2-tuple `(all_ids, content_ids)` of internal InboxThread.id values (not
+gmail_thread_ids): `all_ids` is every thread touched by this sync (including
+flag-only flips — unread, archive/unarchive, soft-delete/reconcile-archive)
+and is what the SSE publish path forwards to `/api/threads/batch`; `content_ids`
+is the narrower subset whose full content was actually (re)fetched from Gmail
+this round — the only ids worth spending a Sonnet extraction pass on. A
+flag-only touch changes no content a tracker could extract from, so folding it
+into extraction (as a pre-fix version of this module did) fires an extraction
+call that dedupes against unchanged evidence after the LLM cost is already
+spent — and a 404-triggered full_sync_inbox amplifies that waste up to 200x.
+`extend_inbox_history` returns a 3-tuple; see its own docstring.
 """
 
 import logging
@@ -214,7 +223,7 @@ def partial_sync_inbox(
     user: User,
     history_records: list[dict] | None = None,
     new_history_id: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Incremental sync.
 
     If history_records is None, fetches them via fetch_history_records (which
@@ -228,10 +237,17 @@ def partial_sync_inbox(
     upsert), messagesDeleted (soft-delete + recompute pointers + archive-when-
     empty), labelsAdded/labelsRemoved for INBOX (un-archive/archive, or ingest
     a previously-unseen thread when INBOX is added), and labelsAdded/Removed
-    for UNREAD (flip InboxMessage.is_unread). Returns the list of internal
-    InboxThread.id values (UUID hex) touched by ANY of the above — NOT
-    gmail_thread_ids. The SSE publish path forwards these to
-    /api/threads/batch, which filters by InboxThread.id.
+    for UNREAD (flip InboxMessage.is_unread).
+
+    Returns `(all_ids, content_ids)` — both lists of internal InboxThread.id
+    values (UUID hex), NOT gmail_thread_ids. `all_ids` is every thread touched
+    by ANY of the four shapes above (the SSE publish path forwards these to
+    /api/threads/batch, which filters by InboxThread.id). `content_ids` is the
+    narrower subset that actually went through a messagesAdded fetch + upsert
+    this round — a messagesDeleted/labelsAdded/labelsRemoved-only touch flips
+    an in-place flag (soft-delete, archive/unarchive, unread) with no new
+    content for a tracker to extract from, so it's excluded from content_ids;
+    callers route content_ids (not all_ids) into extraction.
 
     Self-healing, not just full-sync-dependent: every messagesAdded fetch
     (threads.get format="full") re-derives is_archived from the fetched
@@ -255,7 +271,7 @@ def partial_sync_inbox(
 
     if not history_records:
         log.info("partial_sync_inbox: user=%s no history records → returning empty", user.id)
-        return []
+        return [], []
 
     touched_gmail_ids: set[str] = set()      # need a threads.get + full upsert
     flag_touched_internal_ids: set[str] = set()  # in-place flag updates only
@@ -348,22 +364,28 @@ def partial_sync_inbox(
         if thread_row is not None:
             thread_row.is_archived = not inbox_present
 
+    # content_ids: snapshot the fetch+upsert loop's output before merging in
+    # flag-only touches — these are the only ids whose content actually
+    # changed this round, so they're the only ones worth an extraction pass.
+    content_ids = list(set(internal_ids))
+
     # Merge in threads touched only by an in-place flag flip (soft-delete,
     # archive/unarchive, unread) — they never went through the upsert loop
     # above but still need to be reported so SSE consumers see the change.
-    internal_ids = list({*internal_ids, *flag_touched_internal_ids})
+    # (They do NOT belong in content_ids — see docstring.)
+    all_ids = list({*internal_ids, *flag_touched_internal_ids})
 
     if new_history_id:
         inbox_repo.update_user_history_id(db, user_id=user.id, history_id=str(new_history_id))
     db.commit()
     log.info(
         "partial_sync_inbox: user=%s done, %d threads upserted",
-        user.id, len(internal_ids),
+        user.id, len(all_ids),
     )
-    return internal_ids
+    return all_ids, content_ids
 
 
-def full_sync_inbox(db: Session, *, user: User) -> list[str]:
+def full_sync_inbox(db: Session, *, user: User) -> tuple[list[str], list[str]]:
     """Bootstrap / 404-recovery sync.
 
     Reconciling upsert, NOT a wipe: repopulates from the 200 most-recently-
@@ -381,10 +403,18 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
     orphan task evidence, and HistoryGoneError recovery (which calls this
     function) must not be destructive.
 
-    Returns the list of internal InboxThread.id values (UUID hex) that were
-    upserted or archived — NOT gmail_thread_ids. The SSE publish path forwards
-    these to /api/threads/batch, which filters by InboxThread.id. Commits
-    internally.
+    Returns `(all_ids, content_ids)` — both lists of internal InboxThread.id
+    values (UUID hex), NOT gmail_thread_ids. `all_ids` is every thread
+    upserted OR reconcile-archived this sync (the SSE publish path forwards
+    these to /api/threads/batch, which filters by InboxThread.id). `content_ids`
+    is the narrower subset that was actually fetched via threads.get and
+    upserted (every listed thread, whether new or reappearing — reconcile's
+    un-archive step reuses that same upsert, so a reappeared thread's id is
+    already in content_ids). Reconcile-archived threads are excluded from
+    content_ids: that step only flips `is_archived` on a stored row it never
+    fetched this round — a flag-only touch, same category as
+    partial_sync_inbox's flag_touched_internal_ids — so it carries nothing new
+    for a tracker to extract from. Commits internally.
     """
     log.info("full_sync_inbox: start user=%s", user.id)
     gmail = get_gmail_client(db, user)
@@ -423,6 +453,11 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
         internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         internal_ids.append(internal_id)
         _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+
+    # content_ids: snapshot before the reconcile step below appends
+    # reconcile-archived ids — those never went through a fetch/upsert this
+    # round (flag-only), so they must not count as content for extraction.
+    content_ids = list(internal_ids)
 
     # Reconcile: full sync's labelIds=["INBOX"] listing is authoritative in
     # BOTH directions within the window it just observed — a thread it lists
@@ -501,7 +536,7 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
         "full_sync_inbox: user=%s done, %d threads touched, max_history_id=%d",
         user.id, len(internal_ids), max_history_id,
     )
-    return internal_ids
+    return internal_ids, content_ids
 
 
 def extend_inbox_history(db: Session, *, user: User, before_internal_date_ms: int) -> tuple[list[str], bool]:

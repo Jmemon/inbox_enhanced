@@ -83,7 +83,7 @@ def test_poll_new_messages_publishes_when_history_returns_records(
          patch("app.workers.tasks.gmail_sync.fetch_history_records",
                return_value=(fake_records, "200")) as mock_fetch, \
          patch("app.workers.tasks.gmail_sync.partial_sync_inbox",
-               return_value=["gT1"]) as mock_partial:
+               return_value=(["gT1"], ["gT1"])) as mock_partial:
         tasks.poll_new_messages.apply(args=["u1"])
 
     mock_fetch.assert_called_once()
@@ -101,6 +101,70 @@ def test_poll_new_messages_publishes_when_history_returns_records(
     # last_sync.mark(user_id) must fire on the partial-sync-complete exit path.
     assert last_sync.get("u1") is not None
     # Task 7: the enqueue hook must fire with this user's touched ids.
+    assert stub_enqueue == [["u1", ["gT1"]]]
+
+
+def test_poll_new_messages_flag_only_touch_publishes_but_skips_extraction(
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
+):
+    """Fix (cost leak): a flag-only partial sync (unread flip, archive/
+    unarchive, soft-delete) has all_ids non-empty but content_ids empty —
+    partial_sync_inbox returns (all_ids, content_ids). poll_new_messages must
+    still publish all_ids (so the client sees the flip) but must NOT enqueue
+    process_task_updates, since no content actually changed for a tracker to
+    extract from."""
+    monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
+    _seed_user(session_factory)
+    ps = _drained_pubsub(fake_redis, "user:u1")
+
+    fake_records = [{"id": "200", "labelsAdded": [{"message": {"id": "gM1", "threadId": "gT1"},
+                                                    "labelIds": ["UNREAD"]}]}]
+
+    gmail = MagicMock()
+    with patch("app.workers.tasks.get_gmail_client", return_value=gmail), \
+         patch("app.workers.tasks.gmail_sync.fetch_history_records",
+               return_value=(fake_records, "200")), \
+         patch("app.workers.tasks.gmail_sync.partial_sync_inbox",
+               return_value=(["gT1"], [])) as mock_partial:
+        tasks.poll_new_messages.apply(args=["u1"])
+
+    mock_partial.assert_called_once()
+    msg = ps.get_message(timeout=1.0)
+    body = json.loads(msg["data"])
+    assert body["event"] == "threads_updated"
+    assert body["thread_ids"] == ["gT1"]  # all_ids still published
+
+    # content_ids empty → the enqueue hook must stay silent.
+    assert stub_enqueue == []
+
+
+def test_poll_new_messages_enqueues_content_ids_only_not_all_ids(
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
+):
+    """Fix (cost leak): when a partial sync batch mixes a messagesAdded thread
+    (content) with a flag-only-touched thread (no content), all_ids (used for
+    publish) must include both, but process_task_updates must be enqueued
+    with EXACTLY the content ids — never the flag-only id."""
+    monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
+    _seed_user(session_factory)
+    ps = _drained_pubsub(fake_redis, "user:u1")
+
+    fake_records = [{"id": "200", "messagesAdded": [{"message": {"id": "gM1", "threadId": "gT1"}}]}]
+
+    gmail = MagicMock()
+    with patch("app.workers.tasks.get_gmail_client", return_value=gmail), \
+         patch("app.workers.tasks.gmail_sync.fetch_history_records",
+               return_value=(fake_records, "200")), \
+         patch("app.workers.tasks.gmail_sync.partial_sync_inbox",
+               return_value=(["gT1", "gT_flag_only"], ["gT1"])) as mock_partial:
+        tasks.poll_new_messages.apply(args=["u1"])
+
+    mock_partial.assert_called_once()
+    msg = ps.get_message(timeout=1.0)
+    body = json.loads(msg["data"])
+    assert sorted(body["thread_ids"]) == ["gT1", "gT_flag_only"]  # all_ids published
+
+    # enqueue must carry exactly the content ids, not the flag-only extra.
     assert stub_enqueue == [["u1", ["gT1"]]]
 
 
@@ -142,7 +206,7 @@ def test_poll_new_messages_falls_back_to_full_sync_on_404(
          patch("app.workers.tasks.gmail_sync.fetch_history_records",
                side_effect=gmail_sync.HistoryGoneError()), \
          patch("app.workers.tasks.gmail_sync.full_sync_inbox",
-               return_value=["gT_new"]) as mock_full, \
+               return_value=(["gT_new"], ["gT_new"])) as mock_full, \
          patch("app.workers.tasks.gmail_sync.partial_sync_inbox") as mock_partial:
         tasks.poll_new_messages.apply(args=["u1"])
 
@@ -169,7 +233,7 @@ def test_poll_new_messages_does_full_sync_when_user_has_no_history_id(
 
     with patch("app.workers.tasks.gmail_sync.fetch_history_records") as mock_fetch, \
          patch("app.workers.tasks.gmail_sync.full_sync_inbox",
-               return_value=["gT_a"]) as mock_full:
+               return_value=(["gT_a"], ["gT_a"])) as mock_full:
         tasks.poll_new_messages.apply(args=["u1"])
 
     mock_fetch.assert_not_called()
@@ -194,7 +258,7 @@ def test_full_sync_inbox_task_marks_last_sync(
     ps = _drained_pubsub(fake_redis, "user:u1")
 
     with patch("app.workers.tasks.gmail_sync.full_sync_inbox",
-               return_value=["gT_full"]) as mock_full:
+               return_value=(["gT_full"], ["gT_full"])) as mock_full:
         tasks.full_sync_inbox_task.apply(args=["u1"])
 
     mock_full.assert_called_once()
@@ -219,7 +283,7 @@ def test_reclassify_user_inbox_marks_last_sync(
     ps = _drained_pubsub(fake_redis, "user:u1")
 
     with patch("app.workers.tasks.gmail_sync.full_sync_inbox",
-               return_value=["gT_reload"]) as mock_full:
+               return_value=(["gT_reload"], ["gT_reload"])) as mock_full:
         tasks.reclassify_user_inbox.apply(args=["u1"])
 
     mock_full.assert_called_once()

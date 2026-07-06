@@ -94,7 +94,14 @@ def poll_new_messages(user_id: str) -> None:
         - 404 → HistoryGoneError → full_sync_inbox (recovery).
         - empty records → return silently.
         - records → partial_sync_inbox(history_records, new_history_id).
-     3. Publish touched thread ids on user:{user_id}.
+     3. Publish ALL touched thread ids on user:{user_id}.
+     4. Enqueue process_task_updates with CONTENT ids only (the subset whose
+        full content was actually fetched this round) — a flag-only touch
+        (unread flip, archive/unarchive, soft-delete) has no new content for a
+        tracker to extract from; enqueueing it anyway spends a Sonnet
+        extraction call that dedupes against unchanged evidence only after
+        the cost is paid, and 404-recovery full_sync_inbox would amplify that
+        waste up to 200x. See gmail_sync module docstring.
 
     Holds a per-user redis lock for the duration so a concurrent
     full_sync_inbox_task or another beat-driven poll can't race on the
@@ -113,11 +120,11 @@ def poll_new_messages(user_id: str) -> None:
 
         if not user.gmail_last_history_id:
             log.info("poll_new_messages: user=%s has no history cursor → full sync", user_id)
-            ids = gmail_sync.full_sync_inbox(db, user=user)
-            log.info("poll_new_messages: user=%s full sync complete, publishing %d ids", user_id, len(ids))
-            _publish_thread_ids(user_id, ids)
-            if ids:
-                task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
+            all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=user)
+            log.info("poll_new_messages: user=%s full sync complete, publishing %d ids", user_id, len(all_ids))
+            _publish_thread_ids(user_id, all_ids)
+            if content_ids:
+                task_engine_tasks.process_task_updates.apply_async(args=[user_id, content_ids], countdown=0)
             last_sync.mark(user_id)
             return
 
@@ -128,11 +135,11 @@ def poll_new_messages(user_id: str) -> None:
             )
         except gmail_sync.HistoryGoneError:
             log.info("poll_new_messages: history 404 for %s; falling back to full sync", user_id)
-            ids = gmail_sync.full_sync_inbox(db, user=user)
-            log.info("poll_new_messages: user=%s recovery full sync complete, publishing %d ids", user_id, len(ids))
-            _publish_thread_ids(user_id, ids)
-            if ids:
-                task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
+            all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=user)
+            log.info("poll_new_messages: user=%s recovery full sync complete, publishing %d ids", user_id, len(all_ids))
+            _publish_thread_ids(user_id, all_ids)
+            if content_ids:
+                task_engine_tasks.process_task_updates.apply_async(args=[user_id, content_ids], countdown=0)
             last_sync.mark(user_id)
             return
 
@@ -142,15 +149,15 @@ def poll_new_messages(user_id: str) -> None:
             return  # silent: no new changes
 
         log.info("poll_new_messages: user=%s got %d history records → partial sync", user_id, len(history_records))
-        ids = gmail_sync.partial_sync_inbox(
+        all_ids, content_ids = gmail_sync.partial_sync_inbox(
             db, user=user,
             history_records=history_records,
             new_history_id=new_history_id,
         )
-        log.info("poll_new_messages: user=%s partial sync complete, publishing %d ids", user_id, len(ids))
-        _publish_thread_ids(user_id, ids)
-        if ids:
-            task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
+        log.info("poll_new_messages: user=%s partial sync complete, publishing %d ids", user_id, len(all_ids))
+        _publish_thread_ids(user_id, all_ids)
+        if content_ids:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, content_ids], countdown=0)
         last_sync.mark(user_id)
     finally:
         db.close()
@@ -176,11 +183,11 @@ def full_sync_inbox_task(user_id: str) -> None:
         if user is None:
             log.warning("full_sync_inbox_task: user %s not found", user_id)
             return
-        ids = gmail_sync.full_sync_inbox(db, user=user)
-        log.info("full_sync_inbox_task: user=%s complete, publishing %d ids", user_id, len(ids))
-        _publish_thread_ids(user_id, ids)
-        if ids:
-            task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
+        all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=user)
+        log.info("full_sync_inbox_task: user=%s complete, publishing %d ids", user_id, len(all_ids))
+        _publish_thread_ids(user_id, all_ids)
+        if content_ids:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, content_ids], countdown=0)
         last_sync.mark(user_id)
     finally:
         db.close()
@@ -394,25 +401,34 @@ def reclassify_user_inbox(self, user_id: str) -> None:
             log.warning("reclassify: user=%s not found", user_id)
             return
 
-        synced_ids = _inline_reload(db, user=user)
+        synced_ids, synced_content_ids = _inline_reload(db, user=user)
         reclassified_ids = _reclassify_all(db, user=user)
 
         touched = list({*synced_ids, *reclassified_ids})
+        # Extraction routing mirrors poll_new_messages: only the sync half's
+        # content ids (not flag-only touches) plus whatever _reclassify_all
+        # itself flagged (bucket changed or a link freshly upserted) — never
+        # the full "touched" publish set, or a flag-only sync touch (e.g. the
+        # inline reload seeing an unread flip) would fire an extraction pass
+        # with no new content behind it.
+        extraction_ids = list({*synced_content_ids, *reclassified_ids})
         log.info("reclassify: user=%s synced=%d reclassified=%d total=%d",
                  user_id, len(synced_ids), len(reclassified_ids), len(touched))
         _publish_thread_ids(user_id, touched)
-        if touched:
-            task_engine_tasks.process_task_updates.apply_async(args=[user_id, touched], countdown=0)
+        if extraction_ids:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, extraction_ids], countdown=0)
         last_sync.mark(user_id)
     finally:
         db.close()
         sync_lock.release(user_id)
 
 
-def _inline_reload(db, *, user) -> list[str]:
+def _inline_reload(db, *, user) -> tuple[list[str], list[str]]:
     """Bring the user's inbox current. Mirrors poll_new_messages's branching
-    without acquiring sync_lock (caller already holds it). Returns the list
-    of internal thread ids touched by the sync."""
+    without acquiring sync_lock (caller already holds it). Returns
+    (all_ids, content_ids) — same shape as gmail_sync.partial_sync_inbox /
+    full_sync_inbox, so reclassify_user_inbox can route extraction off the
+    content half only, same as poll_new_messages does."""
     if not user.gmail_last_history_id:
         log.info("reclassify._inline_reload: user=%s no cursor → full sync", user.id)
         return gmail_sync.full_sync_inbox(db, user=user)
@@ -429,7 +445,7 @@ def _inline_reload(db, *, user) -> list[str]:
     if not history_records:
         log.info("reclassify._inline_reload: user=%s 0 history records, skip partial",
                  user.id)
-        return []
+        return [], []
 
     return gmail_sync.partial_sync_inbox(
         db, user=user,

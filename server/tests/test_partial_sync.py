@@ -97,7 +97,7 @@ def test_partial_sync_uses_passed_records_without_calling_history(db):
     records = [{"id": "200", "messagesAdded": [{"message": {"id": "gM1", "threadId": "gT1"}}]}]
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.partial_sync_inbox(
+        all_ids, content_ids = gmail_sync.partial_sync_inbox(
             db, user=u, history_records=records, new_history_id="200",
         )
 
@@ -106,7 +106,9 @@ def test_partial_sync_uses_passed_records_without_calling_history(db):
     # The worker returns internal InboxThread.id (UUID hex), not gmail_thread_id.
     # /api/threads/batch filters by InboxThread.id, so SSE-published ids must
     # match that column.
-    assert ids == [thread.id]
+    assert all_ids == [thread.id]
+    # messagesAdded → a content fetch, so it's in content_ids too.
+    assert content_ids == [thread.id]
     assert db.get(User, "u1").gmail_last_history_id == "200"
     # Critical: history.list MUST NOT have been called when records were passed.
     gmail.users().history().list.assert_not_called()
@@ -123,10 +125,11 @@ def test_partial_sync_calls_history_when_records_none(db):
     gmail.users().threads().get().execute.return_value = _fake_thread_payload()
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.partial_sync_inbox(db, user=u)
+        all_ids, content_ids = gmail_sync.partial_sync_inbox(db, user=u)
 
     [thread] = inbox_repo.list_threads(db, user_id="u1", limit=10, offset=0)
-    assert ids == [thread.id]  # internal InboxThread.id, not gmail_thread_id
+    assert all_ids == [thread.id]  # internal InboxThread.id, not gmail_thread_id
+    assert content_ids == [thread.id]  # messagesAdded → a content fetch
     gmail.users().history().list.assert_called()
 
 
@@ -136,11 +139,12 @@ def test_partial_sync_returns_empty_when_records_empty(db):
     gmail = MagicMock()
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.partial_sync_inbox(
+        all_ids, content_ids = gmail_sync.partial_sync_inbox(
             db, user=u, history_records=[], new_history_id="100",
         )
 
-    assert ids == []
+    assert all_ids == []
+    assert content_ids == []
     gmail.users().threads().get.assert_not_called()
 
 
@@ -270,13 +274,15 @@ def test_full_sync_inbox_pulls_latest_200_threads_and_writes(db):
     gmail.users().threads().get.side_effect = _fake_threads_get
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.full_sync_inbox(db, user=u)
+        all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=u)
 
     threads = inbox_repo.list_threads(db, user_id="u1", limit=10, offset=0)
     assert {t.gmail_id for t in threads} == {"gT0", "gT1", "gT2"}
     # full sync returns internal InboxThread.id, not gmail_thread_id (the SSE
     # publish path forwards these to /api/threads/batch which filters by .id).
-    assert set(ids) == {t.id for t in threads}
+    assert set(all_ids) == {t.id for t in threads}
+    # every listed thread was fetched fresh this round → all in content_ids too.
+    assert set(content_ids) == {t.id for t in threads}
     # full sync must populate last_history_id from the messages it ingested
     assert db.get(User, "u1").gmail_last_history_id == "999"
 
@@ -322,11 +328,12 @@ def test_full_sync_never_deletes_stale_threads(db):
     gmail.users().threads().get().execute.return_value = new_thread
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.full_sync_inbox(db, user=u)
+        all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=u)
 
     new_row = db.execute(select(InboxThread).where(
         InboxThread.user_id == "u1", InboxThread.gmail_id == "gT_NEW")).scalar_one()
-    assert ids == [new_row.id]  # internal InboxThread.id, not gmail_thread_id
+    assert all_ids == [new_row.id]  # internal InboxThread.id, not gmail_thread_id
+    assert content_ids == [new_row.id]  # freshly fetched this round
 
     surviving = {t.gmail_id for t in inbox_repo.list_threads(db, user_id="u1", limit=10, offset=0)}
     assert surviving == {"STALE_A", "STALE_B", "gT_NEW"}, \
@@ -403,7 +410,7 @@ def test_full_sync_reconciles_instead_of_wiping(db):
     gmail.users().threads().get.side_effect = _fake_threads_get
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.full_sync_inbox(db, user=u)
+        all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=u)
 
     old = db.execute(select(InboxThread).where(
         InboxThread.user_id == u.id, InboxThread.gmail_id == "g-ancient")).scalar_one()
@@ -412,11 +419,15 @@ def test_full_sync_reconciles_instead_of_wiping(db):
     gone = db.execute(select(InboxThread).where(
         InboxThread.user_id == u.id, InboxThread.gmail_id == "g-gone")).scalar_one()
     assert gone.is_archived is True  # inside window, absent from listing
-    assert gone.id in ids            # published so clients evict it
+    assert gone.id in all_ids        # published so clients evict it
+    # Reconcile-archive is a flag-only flip — g-gone was never fetched this
+    # round — so it must NOT count as content worth an extraction pass.
+    assert gone.id not in content_ids
 
     listed = db.execute(select(InboxThread).where(
         InboxThread.user_id == u.id, InboxThread.gmail_id == "gT1")).scalar_one()
     assert listed.subject == "fresh gT1"  # idempotent upsert updates in place
+    assert listed.id in content_ids  # listed threads ARE freshly fetched
 
     # no rows were deleted
     assert db.execute(select(func.count(InboxThread.id)).where(
@@ -473,17 +484,19 @@ def test_full_sync_tolerates_per_thread_fetch_failure(db):
     gmail.users().threads().get.side_effect = _fake_threads_get
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.full_sync_inbox(db, user=u)  # must not raise
+        all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=u)  # must not raise
 
     ok_row = db.execute(select(InboxThread).where(
         InboxThread.user_id == "u1", InboxThread.gmail_id == "gT_ok")).scalar_one()
-    assert ok_row.id in ids  # the other thread still ingests fine
+    assert ok_row.id in all_ids  # the other thread still ingests fine
+    assert ok_row.id in content_ids
 
     flaky_row = db.execute(select(InboxThread).where(
         InboxThread.user_id == "u1", InboxThread.gmail_id == "g-flaky")).scalar_one()
     assert flaky_row.is_archived is False, \
         "a fetch failure must not be treated as 'gmail no longer lists this thread'"
-    assert flaky_row.id not in ids  # untouched: neither upserted nor archived
+    assert flaky_row.id not in all_ids  # untouched: neither upserted nor archived
+    assert flaky_row.id not in content_ids
 
 
 def test_full_sync_window_ignores_messageless_threads(db):
@@ -581,29 +594,41 @@ def test_full_sync_unarchives_reappearing_thread(db):
     gmail.users().threads().get().execute.return_value = fixture
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
-        ids = gmail_sync.full_sync_inbox(db, user=u)
+        all_ids, content_ids = gmail_sync.full_sync_inbox(db, user=u)
 
     row = db.execute(select(InboxThread).where(
         InboxThread.user_id == "u1", InboxThread.gmail_id == "g-reappear")).scalar_one()
     assert row.is_archived is False
-    assert row.id in ids
+    assert row.id in all_ids
+    # Reappearing IS a fresh fetch (every listed thread goes through
+    # threads.get + upsert), so it belongs in content_ids too — unlike a
+    # reconcile-archive flip, this is not a flag-only touch.
+    assert row.id in content_ids
 
 
 def test_partial_sync_soft_deletes_message_and_recomputes(db, user, seeded_thread):
     records = [{"messagesDeleted": [{"message": {"id": "g-m2", "threadId": "g-t1"}}]}]
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=MagicMock()):
-        ids = gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
-                                            new_history_id="99")
+        all_ids, content_ids = gmail_sync.partial_sync_inbox(
+            db, user=user, history_records=records, new_history_id="99")
     m2 = db.execute(select(InboxMessage).where(
         InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m2")).scalar_one()
     assert m2.is_deleted is True            # soft, row survives
     t = db.execute(select(InboxThread).where(
         InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
     assert t.last_activity_at == 100        # pointer recomputed past the deletion
-    assert t.id in ids
+    assert t.id in all_ids
+    # A soft-delete is a flag-only touch — no content was fetched — so it
+    # must NOT be routed into extraction.
+    assert content_ids == []
 
 
 def test_partial_sync_mirrors_archive_and_unread(db, user, seeded_thread):
+    """Fix 1 regression: an unread-flip/archive-only partial sync (no
+    messagesAdded record at all) must publish the touched thread (all_ids)
+    but must NOT surface it as extraction-worthy content (content_ids empty)
+    — this is the exact "unread-flip-only" scenario the cost-leak fix
+    targets."""
     records = [
         {"labelsRemoved": [{"message": {"id": "g-m1", "threadId": "g-t1"},
                             "labelIds": ["INBOX"]}]},
@@ -611,15 +636,16 @@ def test_partial_sync_mirrors_archive_and_unread(db, user, seeded_thread):
                             "labelIds": ["UNREAD"]}]},
     ]
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=MagicMock()):
-        ids = gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
-                                            new_history_id="100")
+        all_ids, content_ids = gmail_sync.partial_sync_inbox(
+            db, user=user, history_records=records, new_history_id="100")
     t = db.execute(select(InboxThread).where(
         InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
     assert t.is_archived is True            # INBOX label removed → archived
     m1 = db.execute(select(InboxMessage).where(
         InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m1")).scalar_one()
     assert m1.is_unread is True
-    assert t.id in ids
+    assert t.id in all_ids
+    assert content_ids == [], "flag-only touches must never be routed to extraction"
 
 
 def test_partial_sync_unarchives_on_inbox_label_added(db, user, seeded_thread):
