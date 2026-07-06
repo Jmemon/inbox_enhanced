@@ -25,6 +25,7 @@ exits are the extraction *validator's* job (Task 6), not a schema flag.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -201,6 +202,11 @@ def _format_validation_error(exc: ValidationError) -> str:
     for err in exc.errors():
         loc = ".".join(str(p) for p in err["loc"])
         msg = err["msg"]
+        # pydantic prefixes model_validator/field_validator ValueError messages
+        # with "Value error, " — internal plumbing noise, not useful context
+        # for the LLM retry loop this message is fed back to.
+        if msg.startswith("Value error, "):
+            msg = msg[len("Value error, ") :]
         parts.append(f"{loc}: {msg}" if loc else msg)
     return "; ".join(parts)
 
@@ -254,6 +260,8 @@ def coerce_value(spec_type: str, value: str, *, enum_values: list[str] | None = 
             f = float(value)
         except (TypeError, ValueError):
             raise ValueError(f"'{value}' is not a valid number") from None
+        if not math.isfinite(f):
+            raise ValueError(f"'{value}' is not a finite number")
         return str(int(f)) if f.is_integer() else str(f)
 
     if spec_type == "boolean":
@@ -280,11 +288,13 @@ def assert_additive_change(old: TaskStateSchema, new: TaskStateSchema) -> None:
     """Enforce the additive-only edit rule used by PATCH.
 
     Allowed: new stages/terminal entries appended anywhere, new attributes,
-    entity noun/identity_hint edits.
+    new enum members appended to an existing enum attribute, entity
+    noun/identity_hint edits.
     Rejected (ValueError naming what changed): removed stages, removed
     terminal entries, removed attributes, attribute type changes (a type
     change is a remove+add of the same key, which v1 does not support —
-    renames aren't supported either), and singleton<->entity flips.
+    renames aren't supported either), removed enum member(s) on an
+    otherwise-unchanged enum attribute, and singleton<->entity flips.
     """
     if (old.entity is None) != (new.entity is None):
         raise ValueError(
@@ -314,3 +324,12 @@ def assert_additive_change(old: TaskStateSchema, new: TaskStateSchema) -> None:
                     f"cannot change type of attribute '{key}' from '{old_attr.type}' to "
                     f"'{new_attr.type}' (a type change is remove+add, which v1 rejects)"
                 )
+            if old_attr.type == "enum" and new_attr.type == "enum":
+                removed_members = sorted(
+                    set(old_attr.values or []) - set(new_attr.values or [])
+                )
+                if removed_members:
+                    raise ValueError(
+                        f"cannot remove enum member(s) from attribute '{key}': "
+                        f"{', '.join(removed_members)}"
+                    )

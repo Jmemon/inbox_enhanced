@@ -135,6 +135,13 @@ def test_blank_stage_name_rejected():
         validate_schema(raw)
 
 
+def test_blank_terminal_name_rejected():
+    raw = singleton_raw()
+    raw["pipeline"]["terminal"] = ["approved", "   "]
+    with pytest.raises(ValueError):
+        validate_schema(raw)
+
+
 def test_attr_key_reserved_field_rejected():
     raw = job_hunt_raw()
     raw["entity"]["attributes"].append({"key": "stage", "type": "string"})
@@ -212,8 +219,22 @@ def test_validate_schema_error_is_value_error_not_pydantic():
         validate_schema(raw)
         pytest.fail("expected ValueError")
     except ValueError as e:
-        assert not type(e).__name__ == "ValidationError"
+        assert type(e) is ValueError
         assert str(e)  # non-empty human-readable message
+
+
+def test_validate_schema_error_strips_pydantic_value_error_prefix():
+    # model_validator(mode="after") raises land in pydantic as "Value error, <msg>";
+    # that internal prefix is noise for an LLM reading the retry message, so
+    # _format_validation_error must strip it before it reaches validate_schema's
+    # caller.
+    raw = singleton_raw()
+    raw["pipeline"]["terminal"] = ["submitted"]  # overlaps a stage -> model_validator raises
+    try:
+        validate_schema(raw)
+        pytest.fail("expected ValueError")
+    except ValueError as e:
+        assert "Value error" not in str(e)
 
 
 def test_validate_schema_garbage_input_rejected():
@@ -276,6 +297,12 @@ def test_coerce_number_happy(raw, expected):
 def test_coerce_number_rejects_non_numeric():
     with pytest.raises(ValueError):
         coerce_value("number", "not-a-number")
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf"])
+def test_coerce_number_rejects_non_finite(raw):
+    with pytest.raises(ValueError):
+        coerce_value("number", raw)
 
 
 # --- coerce_value: boolean -----------------------------------------------------
@@ -440,6 +467,27 @@ def test_additive_change_rejects_attribute_type_change():
     new = validate_schema(raw)
     with pytest.raises(ValueError, match="recruiter"):
         assert_additive_change(old, new)
+
+
+def test_additive_change_rejects_enum_member_removal():
+    old = validate_schema(job_hunt_raw())
+    raw = job_hunt_raw()
+    for a in raw["entity"]["attributes"]:
+        if a["key"] == "level":
+            a["values"] = ["junior", "senior"]  # dropped "mid"
+    new = validate_schema(raw)
+    with pytest.raises(ValueError, match="mid"):
+        assert_additive_change(old, new)
+
+
+def test_additive_change_accepts_enum_member_addition():
+    old = validate_schema(job_hunt_raw())
+    raw = job_hunt_raw()
+    for a in raw["entity"]["attributes"]:
+        if a["key"] == "level":
+            a["values"] = ["junior", "mid", "senior", "staff"]  # widened
+    new = validate_schema(raw)
+    assert_additive_change(old, new)  # should not raise
 
 
 def test_additive_change_rejects_singleton_to_entity_flip():
