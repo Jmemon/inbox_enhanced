@@ -18,6 +18,16 @@ export type SseEvent = SseDataEvent | SseConnEvent
 let _es: EventSource | null = null
 const _handlers = new Set<(e: SseEvent) => void>()
 
+// Reconnect backoff state. There's exactly one EventSource singleton per tab,
+// so plain module vars are fine. `_consecutiveErrors` resets on every
+// successful `onopen` and otherwise only grows across back-to-back
+// `onerror`s; `_reconnectTimer` tracks the pending reopen so `_close()`
+// (explicit unsubscribe / sign-out) can cancel it — otherwise a queued
+// reconnect could resurrect the EventSource seconds after the last handler
+// unsubscribed.
+let _consecutiveErrors = 0
+let _reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
 export function subscribeSse(handler: (e: SseEvent) => void): () => void {
   _handlers.add(handler)
   if (!_es) _open()
@@ -32,6 +42,7 @@ function _open() {
   _es = new EventSource('/api/sse', { withCredentials: true })
   _es.onopen = () => {
     console.debug('[sse] open')
+    _consecutiveErrors = 0
     for (const h of _handlers) h({ event: '_open' })
   }
   _es.onmessage = (ev) => {
@@ -47,10 +58,29 @@ function _open() {
   }
   _es.onerror = () => {
     console.debug('[sse] error')
+    _consecutiveErrors += 1
     for (const h of _handlers) h({ event: '_error' })
     _close()
-    if (_handlers.size > 0) queueMicrotask(_open)
+    if (_handlers.size > 0) {
+      // Exponential backoff (1s, 2s, 4s… capped at 30s) — the old immediate
+      // queueMicrotask(_open) reopen meant an expired session turned every
+      // 401 into a network-paced hammer with no backoff at all.
+      const delay = Math.min(30_000, 1000 * 2 ** (_consecutiveErrors - 1))
+      _reconnectTimer = setTimeout(() => {
+        _reconnectTimer = null
+        _open()
+      }, delay)
+    }
   }
 }
 
-function _close() { _es?.close(); _es = null }
+function _close() {
+  _es?.close()
+  _es = null
+  // Cancel any pending scheduled reopen — without this, an unsubscribe (or
+  // sign-out) that lands mid-backoff would still reopen the stream later.
+  if (_reconnectTimer) {
+    clearTimeout(_reconnectTimer)
+    _reconnectTimer = null
+  }
+}

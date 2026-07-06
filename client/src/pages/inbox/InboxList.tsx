@@ -41,12 +41,17 @@ function BucketPill({ bucket }: { bucket: Bucket | undefined }) {
 export function InboxList({
   threads,
   bucketsById,
+  emptyLabel = 'syncing your inbox…',
 }: {
   threads: InboxThread[]
   bucketsById: Record<string, Bucket>
+  // Overridable copy for the empty state — the default reads correctly for
+  // an inbox that hasn't synced yet, but is misleading for an empty search
+  // result (search call sites pass "no results" instead).
+  emptyLabel?: string
 }) {
   if (threads.length === 0) {
-    return <div style={{ padding: 24, color: '#666' }}>syncing your inbox…</div>
+    return <div style={{ padding: 24, color: '#666' }}>{emptyLabel}</div>
   }
   return (
     <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>
