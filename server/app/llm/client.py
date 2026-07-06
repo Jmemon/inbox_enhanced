@@ -65,7 +65,8 @@ def run_in_loop(coro):
 
 
 async def call_messages(*, model: str, system: str, user: str, max_tokens: int = 1024,
-                        stage: str = "unknown", user_id: str | None = None) -> str:
+                        stage: str = "unknown", user_id: str | None = None,
+                        task_id: str | None = None) -> str:
     _ensure_initialized()
     sem: asyncio.Semaphore = _state["sem"]
     client: AsyncOpenAI = _state["client"]
@@ -103,7 +104,7 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
             usage = getattr(resp, "usage", None)
             details = getattr(usage, "prompt_tokens_details", None) if usage else None
             fields = dict(
-                stage=stage, model=model, user_id=user_id,
+                stage=stage, model=model, user_id=user_id, task_id=task_id,
                 input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
                 output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
                 cache_read_tokens=getattr(details, "cached_tokens", None) if details else None,
@@ -115,7 +116,7 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
             log.exception("openrouter chat.completions.create failed")
             content = ""
             fields = dict(
-                stage=stage, model=model, user_id=user_id,
+                stage=stage, model=model, user_id=user_id, task_id=task_id,
                 duration_ms=duration_ms, outcome="error",
             )
     # Outside the semaphore: exactly one record per call, on either path.

@@ -35,10 +35,20 @@ class Settings(BaseSettings):
     # OpenRouter model ids are provider-prefixed (e.g. "anthropic/claude-haiku-4-5",
     # "openai/gpt-4o-mini", "google/gemini-flash-1.5"). Omitting the prefix 404s.
     llm_classify_model: str = Field(default="anthropic/claude-haiku-4-5", alias="LLM_CLASSIFY_MODEL")
+    # Model used for the task-extraction LLM stage (Phase 2A task engine).
+    # Kept separate from LLM_CLASSIFY_MODEL so extraction quality/cost can be
+    # tuned independently of inbox bucket classification.
+    llm_extract_model: str = Field(default="anthropic/claude-sonnet-4.5", alias="LLM_EXTRACT_MODEL")
     # Process-wide cap on concurrent in-flight LLM calls. One semaphore is
     # shared by classification + draft-preview, so a 200-thread full sync and a
     # user-triggered preview can't both push 16 concurrently.
     llm_concurrency: int = Field(default=16, alias="LLM_CONCURRENCY")
+    # Minimum extraction confidence (0-100) required to auto-apply an extracted
+    # task without user confirmation.
+    task_apply_confidence: int = Field(default=75, alias="TASK_APPLY_CONFIDENCE")
+    # Minimum confidence (0-100) required to auto-link an extracted task to an
+    # existing thread/task rather than creating a new one.
+    task_link_confidence: int = Field(default=60, alias="TASK_LINK_CONFIDENCE")
     # On Railway, ENV is "production"; locally unset → development.
     env: str = Field(default="development", alias="ENV")
 

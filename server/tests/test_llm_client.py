@@ -43,11 +43,12 @@ def test_call_messages_records_success_metrics(monkeypatch):
     client._state["client"] = _C()
 
     out = client.run_in_loop(client.call_messages(
-        model="m", system="s", user="u", stage="classify", user_id="u1"))
+        model="m", system="s", user="u", stage="classify", user_id="u1", task_id="t1"))
     assert out == "hi"
     assert len(calls) == 1
     assert calls[0]["stage"] == "classify"
     assert calls[0]["user_id"] == "u1"
+    assert calls[0]["task_id"] == "t1"
     assert calls[0]["input_tokens"] == 100
     assert calls[0]["output_tokens"] == 20
     assert calls[0]["cost_usd"] == 0.0003
@@ -97,6 +98,7 @@ def test_call_messages_records_error_metrics(monkeypatch):
     class _C: chat = _Chat()
     client._state["client"] = _C()
 
-    assert client.run_in_loop(client.call_messages(model="m", system="s", user="u")) == ""
+    assert client.run_in_loop(client.call_messages(model="m", system="s", user="u", task_id="t2")) == ""
     assert len(calls) == 1
     assert calls[0]["outcome"] == "error"
+    assert calls[0]["task_id"] == "t2"
