@@ -51,6 +51,7 @@ def _serialize_message(msg: InboxMessage | None) -> dict | None:
         "from": msg.from_addr,
         "to": msg.to_addr,
         "body_preview": msg.body_preview,
+        "is_unread": msg.is_unread,
     }
 
 
@@ -67,6 +68,7 @@ def _serialize_thread(db: Session, user_id: str, thread) -> dict:
         "gmail_thread_id": thread.gmail_id,
         "subject": thread.subject,
         "bucket_id": thread.bucket_id,
+        "is_archived": thread.is_archived,
         "recent_message": _serialize_message(recent),
     }
 
@@ -77,10 +79,14 @@ def list_inbox(
     db: Session = Depends(get_db),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
     page: int = Query(default=1, ge=1),
+    include_archived: bool = Query(default=False),
 ) -> dict:
     log.info("list_inbox: user=%s page=%d limit=%d", user.id, page, limit)
     offset = (page - 1) * limit
-    threads = inbox_repo.list_threads(db, user_id=user.id, limit=limit, offset=offset)
+    threads = inbox_repo.list_threads(
+        db, user_id=user.id, limit=limit, offset=offset,
+        include_archived=include_archived,
+    )
     serialized = [_serialize_thread(db, user.id, t) for t in threads]
     log.info("list_inbox: user=%s → %d threads returned", user.id, len(serialized))
     return {

@@ -130,3 +130,13 @@ def test_post_threads_batch_unauthorized_without_session():
     c = TestClient(app)
     r = c.post("/api/threads/batch", json={"thread_ids": ["x"]})
     assert r.status_code == 401
+
+
+def test_inbox_serializer_carries_flags(authed):
+    c, TestSession = authed
+    _seed_thread(TestSession, gmail_thread_id="gA", internal_date=1)
+    r = c.get("/api/inbox")
+    assert r.status_code == 200
+    t = r.json()["threads"][0]
+    assert t["is_archived"] is False
+    assert "is_unread" in t["recent_message"]

@@ -169,3 +169,24 @@ def test_recompute_thread_pointers_skips_deleted_messages(db):
     inbox_repo.recompute_thread_pointers(db, thread=thread)
     assert thread.recent_message_id is None
     assert thread.last_activity_at is None
+
+
+def test_list_threads_excludes_archived_by_default_and_sorts_by_activity(db):
+    user = _mk_user(db)
+    for gid, date in (("g-old", 100), ("g-new", 300), ("g-arch", 200)):
+        inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id=gid,
+                                 subject=gid, bucket_id=None)
+        inbox_repo.upsert_message(
+            db, user_id=user.id, gmail_thread_id=gid, gmail_message_id=f"m-{gid}",
+            gmail_internal_date=date, gmail_history_id="1",
+            to_addr=None, from_addr=None, body_preview=None)
+    arch = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-arch")).scalar_one()
+    arch.is_archived = True
+
+    listed = inbox_repo.list_threads(db, user_id=user.id, limit=10, offset=0)
+    assert [t.gmail_id for t in listed] == ["g-new", "g-old"]
+
+    with_arch = inbox_repo.list_threads(db, user_id=user.id, limit=10, offset=0,
+                                        include_archived=True)
+    assert [t.gmail_id for t in with_arch] == ["g-new", "g-arch", "g-old"]

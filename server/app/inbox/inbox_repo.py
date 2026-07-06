@@ -138,23 +138,28 @@ def recompute_thread_pointers(db: Session, *, thread: InboxThread) -> None:
 
 
 def list_threads(
-    db: Session, *, user_id: str, limit: int, offset: int
+    db: Session, *, user_id: str, limit: int, offset: int,
+    include_archived: bool = False,
 ) -> list[InboxThread]:
-    """Return threads for the user, most-recently-active first.
+    """Threads for the user, most-recently-active first (indexed
+    last_activity_at sort — no join). Archived threads are hidden unless
+    asked for; they remain queryable because tasks may reference them.
 
-    Sort key is the gmail_internal_date of each thread's recent message. Threads
-    with no messages yet (shouldn't happen post-sync, but defensively) sort to
-    the bottom.
-    """
+    Flushes first: sessions here run with autoflush=False (see db/session.py),
+    so a caller that just mutated thread.is_archived (or upserted a message)
+    on an already-loaded ORM object needs that write visible to this SELECT
+    without an explicit commit — same rationale as recompute_thread_pointers."""
+    db.flush()
     stmt = (
-        select(InboxThread, InboxMessage.gmail_internal_date)
-        .outerjoin(InboxMessage, InboxMessage.id == InboxThread.recent_message_id)
+        select(InboxThread)
         .where(InboxThread.user_id == user_id)
-        .order_by(InboxMessage.gmail_internal_date.desc().nulls_last())
+        .order_by(InboxThread.last_activity_at.desc().nulls_last())
         .limit(limit)
         .offset(offset)
     )
-    return [row[0] for row in db.execute(stmt).all()]
+    if not include_archived:
+        stmt = stmt.where(InboxThread.is_archived == False)  # noqa: E712
+    return list(db.execute(stmt).scalars().all())
 
 
 def get_thread(db: Session, *, user_id: str, thread_id: str) -> InboxThread | None:
