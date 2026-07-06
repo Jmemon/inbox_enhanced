@@ -12,7 +12,8 @@ from app.llm.prompts import classify_thread
 log = logging.getLogger(__name__)
 
 
-async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_bucket_id: str | None) -> str | None:
+async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_bucket_id: str | None,
+                        user_id: str | None = None) -> str | None:
     s = get_settings()
     # Stability hint references the current bucket by name, not opaque id, so
     # the model has semantic context. Falls through to None if current points
@@ -25,6 +26,7 @@ async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_
             thread_str=thread_to_string(thread), buckets=buckets,
             current_bucket_name=current_name,
         ),
+        stage="classify", user_id=user_id,
     )
     # parse_response already validates name → id resolution against `buckets`
     # (returns None for null, unknown, or ambiguous duplicate-name picks).
@@ -36,6 +38,7 @@ async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_
 
 def classify(
     threads: list[ParsedThread], buckets: list[Bucket], current_bucket_ids: list[str | None],
+    *, user_id: str | None = None,
 ) -> list[str | None]:
     if not threads:
         return []
@@ -46,7 +49,7 @@ def classify(
 
     async def _all():
         return await asyncio.gather(*[
-            _classify_one(thread=t, buckets=buckets, current_bucket_id=cur)
+            _classify_one(thread=t, buckets=buckets, current_bucket_id=cur, user_id=user_id)
             for t, cur in zip(threads, current_bucket_ids)
         ])
     return client.run_in_loop(_all())

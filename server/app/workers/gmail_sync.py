@@ -89,7 +89,7 @@ def _classify_batch(db: Session, *, user_id: str, parsed_list: list[ParsedThread
             )
         ).scalar_one_or_none()
         current.append(existing)
-    return classify(parsed_list, buckets, current)
+    return classify(parsed_list, buckets, current, user_id=user_id)
 
 
 def fetch_history_records(

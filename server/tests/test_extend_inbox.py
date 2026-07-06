@@ -45,7 +45,7 @@ def test_extend_publishes_typed_event_with_more_flag(fake_redis, session_factory
                         "body": {"data": ""}}}]}
 
     monkeypatch.setattr("app.workers.gmail_sync.classify",
-                        lambda threads, buckets, current: [None] * len(threads))
+                        lambda threads, buckets, current, **kw: [None] * len(threads))
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
         tasks.extend_inbox_history_task.apply(args=["u1", 999_999_000])

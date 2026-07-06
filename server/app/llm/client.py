@@ -10,9 +10,11 @@ instead of crashing a batch.
 import asyncio
 import logging
 import threading
+import time
 from typing import Any
 from openai import AsyncOpenAI
 from app.config import get_settings
+from app.llm import metrics
 
 log = logging.getLogger(__name__)
 
@@ -62,24 +64,46 @@ def run_in_loop(coro):
     return asyncio.run_coroutine_threadsafe(coro, _state["loop"]).result()
 
 
-async def call_messages(*, model: str, system: str, user: str, max_tokens: int = 1024) -> str:
+async def call_messages(*, model: str, system: str, user: str, max_tokens: int = 1024,
+                        stage: str = "unknown", user_id: str | None = None) -> str:
     _ensure_initialized()
     sem: asyncio.Semaphore = _state["sem"]
     client: AsyncOpenAI = _state["client"]
     async with sem:
+        t0 = time.monotonic()
         try:
             # OpenAI-format: the Anthropic top-level `system` becomes a
             # system-role message; response is a single string, not blocks.
+            # extra_body usage.include asks OpenRouter to attach cost + cached
+            # token counts to resp.usage.
             resp = await client.chat.completions.create(
                 model=model, max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
+                extra_body={"usage": {"include": True}},
+            )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            usage = getattr(resp, "usage", None)
+            details = getattr(usage, "prompt_tokens_details", None) if usage else None
+            await asyncio.to_thread(
+                metrics.record_call,
+                stage=stage, model=model, user_id=user_id,
+                input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+                output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+                cache_read_tokens=getattr(details, "cached_tokens", None) if details else None,
+                cost_usd=getattr(usage, "cost", None) if usage else None,
+                duration_ms=duration_ms, outcome="success",
             )
             return resp.choices[0].message.content or ""
         except Exception:
+            duration_ms = int((time.monotonic() - t0) * 1000)
             log.exception("openrouter chat.completions.create failed")
+            await asyncio.to_thread(
+                metrics.record_call, stage=stage, model=model, user_id=user_id,
+                duration_ms=duration_ms, outcome="error",
+            )
             return ""
 
 

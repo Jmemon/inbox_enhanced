@@ -11,7 +11,7 @@ from app.workers import gmail_sync
 @pytest.fixture(autouse=True)
 def _stub_classify(monkeypatch):
     monkeypatch.setattr("app.workers.gmail_sync.classify",
-                        lambda threads, buckets, current: [None] * len(threads))
+                        lambda threads, buckets, current, **kw: [None] * len(threads))
 
 
 def _seed_user(db, *, history_id="100"):

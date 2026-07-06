@@ -320,6 +320,7 @@ def _score_all(db, *, user_id: str, candidates: list[dict], name: str, descripti
             system=score_thread.SYSTEM_PROMPT,
             user=score_thread.build_user_message(
                 thread_str=thread_to_string(parsed), name=name, description=description),
+            stage="score", user_id=user_id,
         )
         return score_thread.parse_response(text)
 
@@ -422,7 +423,7 @@ def _reclassify_all(db, *, user) -> list[str]:
     current = [b for _, b, _ in triples]
     log.info("reclassify._reclassify_all: user=%s classifying %d threads against %d buckets",
              user.id, len(threads), len(buckets))
-    new_bucket_ids = classify(threads, buckets, current)  # Task 8 adds user_id=
+    new_bucket_ids = classify(threads, buckets, current, user_id=user.id)
 
     changed: list[str] = []
     for (internal_id, old_bucket, _), new_bucket in zip(triples, new_bucket_ids):
