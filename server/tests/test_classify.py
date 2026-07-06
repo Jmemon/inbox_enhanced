@@ -1,5 +1,6 @@
+from datetime import datetime, timezone
 import pytest
-from app.db.models import Bucket
+from app.db.models import Bucket, Task
 from app.gmail.parser import ParsedMessage, ParsedThread
 from app.llm import classify as classify_mod, client as llm_client
 
@@ -13,6 +14,11 @@ def _t(tid="gT1"):
 
 
 def _b(id_, name): return Bucket(id=id_, user_id=None, name=name, criteria="x", is_deleted=False)
+
+
+def _task(id_, name):
+    return Task(id=id_, user_id=None, kind="tracker", name=name, goal="", criteria="crit",
+               created_at=datetime.now(timezone.utc))
 
 
 @pytest.fixture(autouse=True)
@@ -36,3 +42,23 @@ def test_classify_preserves_order_and_handles_no_fit_stability(monkeypatch):
 def test_classify_empty_or_no_buckets():
     assert classify_mod.classify([], [_b("b1", "X")], []) == []
     assert classify_mod.classify([_t()], [], [None]) == [None]
+
+
+def test_triage_threads_task_id_through_to_call_messages(monkeypatch):
+    """Fix 4: backfill_task's per-candidate triage() calls carried no task_id,
+    so their llm_calls metrics rows couldn't be attributed to the tracker
+    that triggered them. triage() must accept an optional task_id kwarg and
+    forward it verbatim to call_messages (which already accepts task_id)."""
+    captured = {}
+
+    async def _fake(**kw):
+        captured.update(kw)
+        return '{"bucket_name": null, "relevant_tasks": []}'
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
+
+    classify_mod.triage(
+        [_t("gT1")], [], [_task("tk1", "Tracker")], [None],
+        user_id="u1", task_id="tk1",
+    )
+
+    assert captured["task_id"] == "tk1"

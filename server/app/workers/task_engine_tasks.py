@@ -497,8 +497,10 @@ def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None =
        currently in the live inbox view.
 
        Candidates are triaged in batches of BACKFILL_TRIAGE_BATCH via
-       `classify.triage()`, called with ONLY this tracker in the tracker list
-       and `buckets=[]`. triage() always returns a bucket pick alongside
+       `classify.triage()`, called with ONLY this tracker in the tracker list,
+       `buckets=[]`, and `task_id=task.id` (so each call's llm_calls metrics
+       row is attributable to the tracker being backfilled). triage() always
+       returns a bucket pick alongside
        tracker relevance, but that pick is entirely ignored here -- never
        written to thread.bucket_id or anywhere else. Backfill's only job is
        tracker relevance; with buckets=[] the pick is always None anyway (see
@@ -606,6 +608,7 @@ def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None =
                 results = classify.triage(
                     parsed_list, buckets=[], trackers=[task],
                     current_bucket_ids=[None] * len(parsed_list), user_id=user_id,
+                    task_id=task.id,
                 )
                 for thread_id, (_, relevant_tasks) in zip(ordered_ids, results):
                     if not relevant_tasks:

@@ -40,6 +40,8 @@ def classify(
     threads: list[ParsedThread], buckets: list[Bucket], current_bucket_ids: list[str | None],
     *, user_id: str | None = None,
 ) -> list[str | None]:
+    """No production callers as of Phase 2A (triage() replaced it on the sync
+    path); Phase 4 removes it."""
     if not threads:
         return []
     if not buckets:
@@ -58,6 +60,7 @@ def classify(
 async def _triage_one(
     *, thread: ParsedThread, buckets: list[Bucket], trackers: list[Task],
     current_bucket_id: str | None, user_id: str | None = None,
+    task_id: str | None = None,
 ) -> tuple[str | None, list[tuple[str, int]]]:
     s = get_settings()
     # Same stability-hint semantics as _classify_one.
@@ -72,7 +75,7 @@ async def _triage_one(
         # stage="classify" (not "triage"): this call IS the classify call —
         # one llm_calls row per thread, same cost as before triage replaced
         # classify in the sync path (D2 — no doubled LLM volume).
-        stage="classify", user_id=user_id,
+        stage="classify", user_id=user_id, task_id=task_id,
     )
     bucket_id, tasks = triage_thread.parse_response(text, buckets, trackers)
     if bucket_id is None:
@@ -83,12 +86,22 @@ async def _triage_one(
 def triage(
     threads: list[ParsedThread], buckets: list[Bucket], trackers: list[Task],
     current_bucket_ids: list[str | None], *, user_id: str | None = None,
+    task_id: str | None = None,
 ) -> list[tuple[str | None, list[tuple[str, int]]]]:
     """The single call that replaces classify() in the sync path: one Haiku
     call per thread returns both the bucket pick and tracker relevance
     (D2 — no doubled LLM volume). Same asyncio.gather shape as classify();
     output preserves input order. classify() itself is untouched — this is
-    an additive function for callers that also need tracker relevance."""
+    an additive function for callers that also need tracker relevance.
+
+    task_id is optional and forwarded verbatim to call_messages's own task_id
+    kwarg for llm_calls metrics attribution — most callers (the live sync
+    path's _triage_batch, _reclassify_all) triage against several trackers at
+    once and have no single task_id to attribute a call to, so it defaults to
+    None there. backfill_task calls triage() with exactly one tracker in
+    `trackers` and passes that tracker's own id, so its LLM spend is
+    attributable to the tracker that triggered it.
+    """
     if not threads:
         return []
     if len(current_bucket_ids) != len(threads):
@@ -101,7 +114,7 @@ def triage(
     async def _all():
         return await asyncio.gather(*[
             _triage_one(thread=t, buckets=buckets, trackers=trackers,
-                       current_bucket_id=cur, user_id=user_id)
+                       current_bucket_id=cur, user_id=user_id, task_id=task_id)
             for t, cur in zip(threads, current_bucket_ids)
         ])
     return client.run_in_loop(_all())
