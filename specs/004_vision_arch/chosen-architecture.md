@@ -1,4 +1,4 @@
-<!-- stamp: cd1ea86 (main) | 2026-07-05 | Chosen architecture — synthesis of agents 1–3 -->
+<!-- stamp: 5ecf783 (feature/phase1-routing-shell) | 2026-07-06 | Chosen architecture — synthesis of agents 1–3 -->
 
 # 004 — Chosen Architecture
 
@@ -254,7 +254,10 @@ vocabulary: existing three + `task_draft_ready`, `task_updated
 `ReviewFeed`, `ThreadsPanel`, `SchemaEditor`, `NewTaskWizard` cloned from
 `NewBucketModal`'s form/pending/review + SSE-or-poll idempotency pattern).
 `useInbox`/`useInboxSse` internals survive untouched; inbox watchdogs retire
-only when their producers do.
+only when their producers do. Client state that must survive route
+navigation lives in AppShell-level providers (`InboxProvider`; Phase 2 adds
+a task-store provider alongside it) — pages consume stores, they don't own
+them.
 
 ## 7. Deferred / rejected
 
