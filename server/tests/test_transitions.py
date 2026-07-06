@@ -176,6 +176,32 @@ def test_malformed_proposal_does_not_create_an_entity(db):
 
 
 # ---------------------------------------------------------------------------
+# Step 1b: message reference (foreign / hallucinated gmail message_id)
+# ---------------------------------------------------------------------------
+
+
+def test_foreign_message_id_dropped(db):
+    """A proposal citing a gmail_message_id that isn't among this thread's
+    parsed messages must be dropped outright. Letting it through would
+    resolve to internal_message_id=None at step 7 (wrong attribution to the
+    audit log, and never deduped against a future rerun of the same
+    hallucinated citation)."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=DEFAULT_THREAD, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(entity="stripe", message_id="gm-does-not-exist")],
+        message_id_map=DEFAULT_MAP,
+    )
+    assert result.dropped == 1
+    assert result.applied == [] and result.pending == []
+
+
+# ---------------------------------------------------------------------------
 # Step 2: entity resolution
 # ---------------------------------------------------------------------------
 
@@ -277,6 +303,60 @@ def test_low_similarity_with_is_new_entity_creates_new_entity(db):
     assert set(entities) == {"stripe", "acme corp"}
     assert entities["acme corp"].display_name == "Acme Corp"
     assert len(result.applied) == 1
+
+
+def test_new_entity_with_fabricated_evidence_does_not_mint_entity(db):
+    """Regression: is_new_entity=True + low similarity + evidence that does
+    not appear in the thread must be dropped at step 4 WITHOUT ever
+    persisting an entity row. Before the fix, step 2's create branch called
+    repo.get_or_create_entity() immediately — a fabricated-evidence proposal
+    for a brand new entity would leave a phantom, evidence-free row that
+    silently appears on the next board load even though its only event was
+    dropped."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=DEFAULT_THREAD, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(
+            # similarity('zylo dynamics', 'stripe') ~= 0.105, well under the
+            # 0.4 pending threshold, so this genuinely hits the create-new
+            # branch (not the forced-pending-on-closest-match branch).
+            entity="Zylo Dynamics", is_new=True, field="stage", new_value="applied",
+            evidence="this sentence appears nowhere in the thread", message_id="gm1",
+        )],
+        message_id_map=DEFAULT_MAP,
+    )
+    assert result.dropped == 1
+    assert result.applied == [] and result.pending == []
+    entity_keys = {e.entity_key for e in repo.list_entities(db, task_id=task.id)}
+    assert entity_keys == {"stripe"}  # no phantom "zylo dynamics" row
+
+
+def test_new_entity_survives_evidence_creates_and_touches_entity_ids(db):
+    """Companion to the above: when a brand-new entity's proposal DOES
+    survive every guard, the entity is created (at step 8, immediately
+    before the event is written) and its id lands in touched_entity_ids."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+
+    thread = _thread(_msg("gm1", 1_000, "We received your application to Acme Corp."))
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=thread, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(
+            entity="Acme Corp", is_new=True, field="stage", new_value="applied",
+            evidence="received your application to Acme Corp", message_id="gm1",
+        )],
+        message_id_map={"gm1": "im1"},
+    )
+    entities = repo.list_entities(db, task_id=task.id)
+    assert len(entities) == 1 and entities[0].entity_key == "acme corp"
+    assert len(result.applied) == 1
+    assert result.touched_entity_ids == {entities[0].id}
 
 
 def test_low_similarity_without_is_new_entity_dropped(db):
@@ -418,6 +498,39 @@ def test_fence_blocks_older_message_but_newer_message_passes(db):
     )
     assert len(newer_result.applied) == 1
     assert entity.state["stage"] == "interview"
+
+
+def test_fence_at_exact_message_timestamp_blocks_strictly_newer_contract(db):
+    """Pin the 'strictly newer' contract at its boundary: a proposal whose
+    evidence message shares the EXACT same timestamp as the fencing user
+    correction must still be forced to pending_review — the comparison is
+    `>`, not `>=`."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    entity = repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+
+    fence_event = repo.append_event(
+        db, task=task, entity=entity, origin="user", status="applied",
+        field="stage", new_value="applied",
+    )
+    # M2's gmail_internal_date is 2_000_000 ms == 2000s epoch — exactly equal,
+    # not older, not newer.
+    fence_event.created_at = datetime.fromtimestamp(2000, tz=timezone.utc)
+    db.commit()
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=DEFAULT_THREAD, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(
+            entity="stripe", field="stage", new_value="interview", confidence=95,
+            evidence="moving to the interview stage", message_id="gm2",
+        )],
+        message_id_map=DEFAULT_MAP,
+    )
+    assert result.applied == []
+    assert len(result.pending) == 1
+    assert entity.state == {}  # untouched
 
 
 def test_no_fence_when_no_prior_user_event(db):

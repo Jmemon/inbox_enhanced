@@ -46,14 +46,36 @@ class StagedResult:
     """Outcome of one `validate_and_stage()` call. Every proposal lands in
     exactly one bucket: applied, pending, or dropped. `dropped` is the
     catch-all for every guard-clause exit that isn't a stored event —
-    malformed shape, no entity match, fabricated evidence, a silent no-op, or
-    an idempotent replay — so `len(proposals) == len(applied) + len(pending)
-    + dropped` always holds for one `validate_and_stage` call."""
+    malformed shape, a message_id foreign to this thread, no entity match,
+    fabricated evidence, a silent no-op, or an idempotent replay — so
+    `len(proposals) == len(applied) + len(pending) + dropped` always holds
+    for one `validate_and_stage` call."""
 
     applied: list[TaskEvent] = field(default_factory=list)
     pending: list[TaskEvent] = field(default_factory=list)
     touched_entity_ids: set[str] = field(default_factory=set)
     dropped: int = 0
+
+
+@dataclass
+class PendingCreate:
+    """Step 2 sentinel for the 'is_new_entity, no existing match' resolution
+    branch. Carries just enough (entity_key, display_name) to materialize a
+    real `TaskStateEntity` via `repo.get_or_create_entity()` — but only at
+    step 8, immediately before the event that actually survives to be
+    written. A proposal that gets dropped anywhere in steps 3-7 (stage
+    legality, evidence, fences, no-op, idempotency) never advances past this
+    plain dataclass: no DB row, no phantom entity silently appearing on the
+    next board load.
+
+    `state` is always `{}` (a not-yet-created entity has no state), which is
+    what makes step 3's stage-legality check and step 6's no-op check fall
+    through to their "empty state" branches for free, with no isinstance
+    check needed in either place."""
+
+    entity_key: str
+    display_name: str
+    state: dict = field(default_factory=dict)
 
 
 def normalize_key(name: str) -> str:
@@ -175,9 +197,16 @@ def validate_and_stage(
 def _resolve_entity(
     db: Session, *, task: Task, schema: TaskStateSchema,
     entity_name: str, is_new_entity: bool, known_entities: dict[str, TaskStateEntity],
-) -> tuple[TaskStateEntity | None, bool]:
+) -> tuple[TaskStateEntity | PendingCreate | None, bool]:
     """Step 2. Returns (entity, forced_pending); entity is None for a hard
-    drop (no match, and the LLM didn't flag it as new)."""
+    drop (no match, and the LLM didn't flag it as new).
+
+    The create-new branch returns a `PendingCreate` sentinel rather than
+    minting the entity row immediately: a proposal that reaches this branch
+    still has to survive stage legality, the evidence check, fences, the
+    no-op check, and idempotency (steps 3-7) before it's trustworthy enough
+    to persist. `_process_one` materializes the real row at step 8, right
+    before `append_event`."""
     if schema.entity is None:
         entity = known_entities.get(SINGLETON_KEY)
         if entity is None:
@@ -208,12 +237,7 @@ def _resolve_entity(
         # duplicate, regardless of what the LLM's is_new_entity flag says.
         return known_entities[best_key], True
     if is_new_entity:
-        entity = repo.get_or_create_entity(
-            db, task_id=task.id, user_id=task.user_id,
-            entity_key=normalized, display_name=entity_name,
-        )
-        known_entities[normalized] = entity
-        return entity, False
+        return PendingCreate(entity_key=normalized, display_name=entity_name), False
     return None, False
 
 
@@ -253,6 +277,18 @@ def _process_one(
             result.dropped += 1
             return
 
+    # --- Step 1b: message reference -----------------------------------------
+    # A proposal must cite a message that actually exists in this thread. Left
+    # unchecked, a hallucinated (or omitted) gmail_message_id would resolve to
+    # internal_message_id=None downstream (steps 5 and 7): wrong attribution
+    # in the audit log, and never deduped against a rerun of the very same
+    # hallucinated citation.
+    if gmail_message_id not in message_by_gmail_id:
+        log.info("transitions: dropped task=%s (message_id %r not in thread)",
+                  task.id, gmail_message_id)
+        result.dropped += 1
+        return
+
     # --- Step 2: entity resolution ------------------------------------------
     entity, forced_pending = _resolve_entity(
         db, task=task, schema=schema, entity_name=entity_name,
@@ -287,8 +323,13 @@ def _process_one(
 
     # --- Step 5: correction fences -----------------------------------------------
     # After a user corrects this entity (any field), only evidence strictly
-    # newer than that correction may move it again.
-    fence_event = repo.latest_applied_user_event(db, entity_id=entity.id)
+    # newer than that correction may move it again. A PendingCreate (step 2's
+    # deferred-creation sentinel) has no row yet, hence no id to query
+    # against and, by construction, no prior corrections to fence against.
+    fence_event = (
+        None if isinstance(entity, PendingCreate)
+        else repo.latest_applied_user_event(db, entity_id=entity.id)
+    )
     if fence_event is not None:
         message = message_by_gmail_id.get(gmail_message_id)
         fence_ms = _to_ms_epoch(fence_event.created_at)
@@ -305,11 +346,27 @@ def _process_one(
     if repo.find_event_for_message_field(
         db, task_id=task.id, message_id=internal_message_id, field=field_name,
     ) is not None:
+        log.info("transitions: dropped task=%s entity=%s field=%s message_id=%s (duplicate event)",
+                  task.id, entity.entity_key, field_name, internal_message_id)
         result.dropped += 1
         return
 
     # --- Step 8: confidence gate --------------------------------------------------
     old_value = entity.state.get(field_name)
+    if isinstance(entity, PendingCreate):
+        # Every guard has now passed (shape, message reference, resolution
+        # routing, stage legality, evidence, fences, no-op, idempotency) — only
+        # now is it safe to mint the entity row. Both outcomes below (applied
+        # and pending_review) need a real entity_id on the event they write,
+        # so this happens unconditionally, before branching on confidence.
+        entity = repo.get_or_create_entity(
+            db, task_id=task.id, user_id=task.user_id,
+            entity_key=entity.entity_key, display_name=entity.display_name,
+        )
+        # Seed the roster cache so a later proposal in this same batch that
+        # names the same new entity resolves to this row instead of minting
+        # a duplicate PendingCreate.
+        known_entities[entity.entity_key] = entity
     event_kwargs = dict(
         task=task, entity=entity, origin="llm",
         field=field_name, old_value=old_value, new_value=new_value,
