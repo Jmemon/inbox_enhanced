@@ -289,16 +289,23 @@ def test_patch_destructive_schema_change_409(authed):
     assert "in_progress" in r.json()["detail"]
 
 
-def test_patch_pause_and_resume(authed):
+def test_patch_pause_and_resume(authed, monkeypatch):
+    captured = _capture_publish(monkeypatch)
     c, TS = authed
     task_id = _mk_task(TS)
     r = c.patch(f"/api/tasks/{task_id}", json={"status": "paused"})
     assert r.status_code == 200
     assert r.json()["status"] == "paused"
+    # version bump so a 2B client's version-gap refetch fires even though
+    # only status changed (no state_schema touch on this PATCH).
+    assert r.json()["version"] == 2
+    assert captured[-1][2]["version"] == 2
 
     r2 = c.patch(f"/api/tasks/{task_id}", json={"status": "active"})
     assert r2.status_code == 200
     assert r2.json()["status"] == "active"
+    assert r2.json()["version"] == 3
+    assert captured[-1][2]["version"] == 3
 
 
 def test_patch_bad_status_422(authed):
@@ -308,12 +315,34 @@ def test_patch_bad_status_422(authed):
     assert r.status_code == 422
 
 
-def test_patch_name(authed):
+def test_patch_name(authed, monkeypatch):
+    captured = _capture_publish(monkeypatch)
     c, TS = authed
     task_id = _mk_task(TS, name="Old")
     r = c.patch(f"/api/tasks/{task_id}", json={"name": "New"})
     assert r.status_code == 200
     assert r.json()["name"] == "New"
+    # name-only PATCH must still bump version — otherwise the 2B client's
+    # version-gap refetch sees no gap and keeps the stale name.
+    assert r.json()["version"] == 2
+    assert captured[-1][2]["version"] == 2
+
+
+def test_patch_twice_versions_strictly_increase(authed):
+    """Two successive successful PATCHes (of any field) must each bump the
+    version — the client's version-gap refetch relies on every task_updated
+    carrying a version strictly greater than the last it saw."""
+    c, TS = authed
+    task_id = _mk_task(TS, name="Old")
+    r1 = c.patch(f"/api/tasks/{task_id}", json={"name": "Mid"})
+    assert r1.status_code == 200
+    v1 = r1.json()["version"]
+
+    r2 = c.patch(f"/api/tasks/{task_id}", json={"status": "paused"})
+    assert r2.status_code == 200
+    v2 = r2.json()["version"]
+
+    assert v2 > v1
 
 
 def test_patch_other_user_404(authed):

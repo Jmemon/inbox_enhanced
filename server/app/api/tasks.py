@@ -266,7 +266,18 @@ def patch_task(task_id: str, body: _PatchTaskBody, user: User = Depends(get_curr
             except ValueError as exc:
                 raise HTTPException(409, str(exc))
         task.state_schema = new_schema.model_dump()
-        task_repo.bump_version(db, task=task)
+
+    # Bump version on every successful PATCH — not just state_schema changes.
+    # `version` means "task state a client may need to refetch"; the 2B
+    # client's version-gap refetch compares the version on each task_updated
+    # SSE event to the last one it saw and only refetches when it's NEWER, so
+    # a name- or status-only PATCH that left version unchanged would publish
+    # task_updated with a stale version and the client would skip the
+    # refetch, keeping stale name/status. We bump once per successful PATCH
+    # regardless of which field(s) changed (even a no-op body that matches
+    # the current fields still bumps) — simpler than diffing old vs new
+    # values field-by-field, and an extra refetch is harmless.
+    task_repo.bump_version(db, task=task)
 
     db.commit()
     _publish_task_updated(db, user_id=user.id, task=task)
