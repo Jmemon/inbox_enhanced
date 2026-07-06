@@ -1,8 +1,8 @@
-<!-- stamp: ca21188 (fix/sync-self-healing) | 2026-07-06 -->
+<!-- stamp: 48615ee (feature/phase1-routing-shell) | 2026-07-06 -->
 
 # Inbox Sync Index
 
-> Scope: three-way inbox synchronization — Gmail ↔ Postgres (`inbox_threads`/`inbox_messages`) ↔ browser. Full sync = reconciling upsert (never wipes; archives absent-from-window threads, un-archives listed ones); partial sync mirrors Gmail archive/soft-delete/unread via widened `historyTypes`; extend sync; the Gmail history cursor (`gmail_last_history_id`) + `HistoryGoneError`; the Celery poll/full/extend/reclassify tasks; `sync_lock`/`active_users` Redis gates; the `user:{uid}` pubsub→SSE push path; `GET /api/search` (Postgres FTS/ILIKE); the client `idLayer`/`displayLayer` LWW merge + auto-extend + archived-thread eviction.
+> Scope: three-way inbox synchronization — Gmail ↔ Postgres (`inbox_threads`/`inbox_messages`) ↔ browser. Full sync = reconciling upsert (never wipes; archives absent-from-window threads, un-archives listed ones); partial sync mirrors Gmail archive/soft-delete/unread via widened `historyTypes`; extend sync; the Gmail history cursor (`gmail_last_history_id`) + `HistoryGoneError`; the Celery poll/full/extend/reclassify tasks; `sync_lock`/`active_users` Redis gates; the `last_sync:{uid}` freshness marker + `GET /api/sync/status`; the `user:{uid}` pubsub→SSE push path; `GET /api/search` (Postgres FTS/ILIKE); the client `idLayer`/`displayLayer` LWW merge + auto-extend + archived-thread eviction + shared `useInboxSearch` (HudPage/InboxPage).
 
 This is a cross-cutting doc: it threads the Worker, Data, Realtime, API, and Client
 subsystems along the single axis of "keep the inbox in sync." For depth on any one
@@ -25,12 +25,14 @@ layer see its dedicated index (`WORKERS_INDEX.md`, `CLIENT_INDEX.md`; deeper sti
 | `server/migrations/versions/0006_data_floor.py` | Adds all of the above columns; backfills `inbox_threads.last_activity_at` from `MAX(inbox_messages.gmail_internal_date)` per thread so pre-migration rows keep their sort position under the new `list_threads` order; creates `llm_calls` table + indexes; dialect-guards the FTS DDL (`search_tsv`/`subject_tsv` generated columns + GIN indexes + `pg_trgm` extension) behind `op.get_bind().dialect.name == "postgresql"` so SQLite (tests) skips it — `search_repo`'s non-PG fallback keeps that path testable. |
 | `server/app/realtime/sync_lock.py` | `acquire(uid, *, ttl_seconds=600) -> bool` (`SET sync_lock:{uid} 1 NX EX`), `release(uid)`. Per-user mutex around any writer. |
 | `server/app/realtime/active_users.py` | zset `active_users`, score = expiry unix-secs. `add/refresh(uid, *, ttl_seconds)`, `remove`, `list_active()` (`ZRANGE 0 -1`), `purge_expired()` (`ZREMRANGEBYSCORE -inf now`). |
+| `server/app/realtime/last_sync.py` | (**new**) Per-user last-successful-sync marker, no TTL — a marker overwritten in place, not a log. `mark(user_id)` — `SET last_sync:{uid} <epoch-secs>`. `get(user_id) -> int \| None`. Written by 6 sync-completion sites in `workers/tasks.py` (`poll_new_messages` ×4 exits, `full_sync_inbox_task`, `reclassify_user_inbox`; **not** `extend_inbox_history_task`/`draft_preview_bucket` — see WORKERS_INDEX gotchas). |
 | `server/app/realtime/pubsub.py` | `PubSubDispatcher` (one per uvicorn worker). `subscribe/unsubscribe(uid)` on `user:{uid}`; `_run` drains `pubsub.listen()`, routes frames into per-tab queues via `put_nowait` (drops on `QueueFull`). `_has_subscription` event gates network until first SSE. Module fns `start/stop/subscribe/unsubscribe`. |
 | `server/app/realtime/sse_connections.py` | Per-process `dict[uid -> set[asyncio.Queue]]`. `add -> is_first`, `remove -> was_last`, `iter_queues`, `has_local`, `reset` (test hook). Per-process only — each uvicorn worker subscribes redis for its own queues. |
 | `server/app/api/sse.py` | `GET /api/sse` (cookie-auth, no path uid). Registers queue, subscribes pubsub + `active_users.add` on `is_first`, fires kickoff task, streams `data:`/`: keepalive` frames; on last disconnect unsubscribes + `active_users.remove`. Consts: `QUEUE_MAXSIZE=100`, `HEARTBEAT_SECONDS=5`, `ACTIVE_USERS_TTL_SECONDS=60`. |
 | `server/app/api/inbox.py` | `GET /api/inbox?limit=&page=&include_archived=`, `GET /api/threads/{id}`, `POST /api/threads/batch`, `POST /api/inbox/extend`, `POST /api/inbox/refresh`. `_serialize_thread` (user-scoped recent msg; now includes `is_archived`) and `_serialize_message` (now includes `is_unread`). Consts `DEFAULT_LIMIT=50`, `MAX_LIMIT=200`, `MAX_BATCH_IDS=500`. |
-| `client/src/lib/sse.ts` | `EventSource('/api/sse')` singleton + `subscribeSse(handler)`. Emits synthetic `_open`/`_error` plus parsed data events. Auto-reconnects via `queueMicrotask(_open)` while handlers remain. Types: `SseDataEvent` = `threads_updated` \| `bucket_draft_preview` \| `extend_complete`. |
-| `client/src/pages/inbox/useInbox.tsx` | `idLayer` (ordered ids) + `displayLayer` (id→thread) model. `SNAPSHOT_LIMIT=200`, `PAGE_SIZE=50`, `EXTEND_TIMEOUT_MS=90_000`. `fetchAndReplace`/`snapshot`/`resync`, `applyThreadUpdates` (LWW gate, then **splits accepted threads into `archived`/`live`**: archived ids are deleted from `displayLayer`/`idLayer`/`lastInternalDate` — a thread that leaves the Gmail inbox leaves the list instead of merging), `requestExtend`, auto-extend `useEffect`, extend watchdog. |
+| `server/app/api/sync.py` | (**new**) `GET /api/sync/status` — `{last_synced_at: last_sync.get(uid), has_cursor: bool(user.gmail_last_history_id)}`. Cookie-auth (`Depends(get_current_user)`); synchronous, no Celery/lock/publish involved. Registered in `main.py`. Feeds the client HUD freshness strip (see CLIENT_INDEX `HudPage`). |
+| `client/src/lib/sse.ts` | `EventSource('/api/sse')` singleton + `subscribeSse(handler)`. Emits synthetic `_open`/`_error` plus parsed data events. Auto-reconnects via `queueMicrotask(_open)` while handlers remain. Types: `SseDataEvent` = `threads_updated` \| `bucket_draft_preview` \| `extend_complete`. **New**: `AppShell` (`client/src/AppShell.tsx`) subscribes a permanent no-op handler so the singleton stays open across route changes (see CLIENT_INDEX gotchas — a bare `HudPage` mount otherwise has zero SSE subscribers, which would close the EventSource and deregister the user from `active_users`). |
+| `client/src/pages/inbox/useInbox.tsx` | `idLayer` (ordered ids) + `displayLayer` (id→thread) model; mounted only by `InboxPage` (**new** path, `pages/inbox/InboxPage.tsx` — moved from the deleted `pages/Home.tsx`). `SNAPSHOT_LIMIT=200`, `PAGE_SIZE=50`, `EXTEND_TIMEOUT_MS=90_000`. `fetchAndReplace`/`snapshot`/`resync`, `applyThreadUpdates` (LWW gate, then **splits accepted threads into `archived`/`live`**: archived ids are deleted from `displayLayer`/`idLayer`/`lastInternalDate` — a thread that leaves the Gmail inbox leaves the list instead of merging), `requestExtend`, auto-extend `useEffect`, extend watchdog. |
 | `client/src/pages/inbox/useInboxSse.tsx` | Buffers `threads_updated` until `snapshot()` completes after each `_open`; replays buffer then streams live; `_error` resets the ready flag. |
 
 ## Routes / Tasks / Entrypoints
@@ -43,17 +45,18 @@ layer see its dedicated index (`WORKERS_INDEX.md`, `CLIENT_INDEX.md`; deeper sti
 - `POST /api/inbox/refresh` — 202; Reload button. Branches on cursor: present → `poll_new_messages`, absent → `full_sync_inbox_task`. Result arrives via SSE.
 - `POST /api/inbox/extend {before_internal_date}` — 202; enqueues `extend_inbox_history_task`. Result via SSE `extend_complete`.
 - `GET /api/search?q=&limit=&page=&include_archived=` — same response shape as `/api/inbox`; server-side text search (see `search_repo` in Files). Synchronous request/response, no SSE/task involved.
+- `GET /api/sync/status` (**new**) — `{last_synced_at, has_cursor}`; reads `last_sync:{uid}` (Redis) + `User.gmail_last_history_id` (Postgres). Synchronous, no Celery/SSE. Powers the client HUD freshness strip.
 
 **Celery tasks (worker process):**
 - `enqueue_polls` — beat-fired (30s). `purge_expired()` → `list_active()` → `poll_new_messages.apply_async([uid], countdown=0)` per active uid.
-- `poll_new_messages(uid)` — `sync_lock.acquire` (silent return if held). No cursor → `full_sync_inbox`. Else `fetch_history_records`: 404 → `full_sync_inbox`; empty → silent (no publish); records → `partial_sync_inbox(records, new_id)`. Publishes `threads_updated` with internal ids.
-- `full_sync_inbox_task(uid)` — locked full sync; SSE kickoff (no cursor) + refresh (no cursor).
-- `extend_inbox_history_task(uid, before_ms)` — locked; `extend_inbox_history`; publishes `extend_complete {thread_ids, more}`.
-- `reclassify_user_inbox(uid)` — locked (retry `countdown=30` if contended, max 3). `_inline_reload` (poll-equivalent without re-locking) + `_reclassify_all` (reads every stored thread from Postgres via `load_parsed_threads` — no Gmail refetch — classifies w/ stability hint, writes only changed `bucket_id`). Publishes union of touched ids. Triggered by `POST /api/buckets`.
+- `poll_new_messages(uid)` — `sync_lock.acquire` (silent return if held). No cursor → `full_sync_inbox`. Else `fetch_history_records`: 404 → `full_sync_inbox`; empty → silent (no publish); records → `partial_sync_inbox(records, new_id)`. Publishes `threads_updated` with internal ids. Marks `last_sync:{uid}` (**new**) on all 4 exit paths (see WORKERS_INDEX).
+- `full_sync_inbox_task(uid)` — locked full sync; SSE kickoff (no cursor) + refresh (no cursor). Marks `last_sync:{uid}` (**new**).
+- `extend_inbox_history_task(uid, before_ms)` — locked; `extend_inbox_history`; publishes `extend_complete {thread_ids, more}`. Does **not** mark `last_sync` (on-demand history pull, not a periodic sync).
+- `reclassify_user_inbox(uid)` — locked (retry `countdown=30` if contended, max 3). `_inline_reload` (poll-equivalent without re-locking) + `_reclassify_all` (reads every stored thread from Postgres via `load_parsed_threads` — no Gmail refetch — classifies w/ stability hint, writes only changed `bucket_id`). Publishes union of touched ids. Marks `last_sync:{uid}` (**new**). Triggered by `POST /api/buckets`.
 
 **Beat:** `enqueue-polls-every-30s` → `enqueue_polls`. One replica only.
 
-**Client hooks:** `useInboxSse` (snapshot+buffer lifecycle) drives `useInbox.applyThreadUpdates`; `useInbox` owns pagination + auto-extend + archived-thread eviction. `Home.tsx` additionally owns the search box (debounced 300ms, monotonic-token race guard) that swaps the rendered list to `GET /api/search` results while a query is active.
+**Client hooks:** `useInboxSse` (snapshot+buffer lifecycle) drives `useInbox.applyThreadUpdates`; `useInbox` owns pagination + auto-extend + archived-thread eviction — both mounted only by `InboxPage` (**new** path — `Home.tsx` was deleted, moved to `pages/inbox/InboxPage.tsx`). The shared `useInboxSearch()` hook (`pages/search/`, **new** — used identically by `HudPage` and `InboxPage`, see CLIENT_INDEX) owns the search box (debounced 300ms, monotonic-token race guard) that swaps the mounted page's rendered list to `GET /api/search` results while a query is active.
 
 ## Data & state touched
 
@@ -67,6 +70,7 @@ layer see its dedicated index (`WORKERS_INDEX.md`, `CLIENT_INDEX.md`; deeper sti
 - `sync_lock:{uid}` — `SET NX EX 600`. Held by every writer task; releases in `finally`. TTL is the crash safety net.
 - `active_users` (zset) — `ZADD` on first SSE conn + every 5s heartbeat (score = now+60); `ZREM` on last disconnect; `enqueue_polls` reads + purges. Gates *whom beat polls* (only users with a live SSE).
 - `user:{uid}` (pubsub) — worker `PUBLISH`es; per-process dispatcher subscribes/routes to SSE queues. Transient; dropped if no subscriber.
+- `last_sync:{uid}` (**new**) — `SET`, no TTL, overwritten in place (marker, not a log). Written by `last_sync.mark()` at 6 sync-completion sites (`poll_new_messages` ×4 exits, `full_sync_inbox_task`, `reclassify_user_inbox`); **not** written by `extend_inbox_history_task`/`draft_preview_bucket`. Read by `GET /api/sync/status` (`last_sync.get()`) to power the HUD freshness strip.
 - (broker/backend) — task messages.
 
 **External:** Gmail v1 (`history.list` `historyTypes=["messageAdded","messageDeleted","labelAdded","labelRemoved"]` `labelId="INBOX"`; `threads.list maxResults=200 labelIds=["INBOX"]` ±`q=before:<secs>`; `threads.get format=full`); OpenRouter (OpenAI-compatible `chat.completions`, `LLM_CLASSIFY_MODEL` default `anthropic/claude-haiku-4-5`) for classify, per-thread, via `_classify_batch` — see WORKERS for the client/metrics detail.
@@ -110,13 +114,21 @@ useInbox auto-extend (page ≥ pageCount-1) ──[POST /api/inbox/extend {befor
     Worker ──[PUBLISH {extend_complete, thread_ids, more}]──> Redis → SSE → useInbox (setMore + applyThreadUpdates)
 ```
 
-Reclassify (bucket created): `POST /api/buckets ──> reclassify_user_inbox` → inline reload + reclassify-all (Postgres-only, no Gmail) → publish union as `threads_updated`. Client also runs a 60s+150s watchdog `resync()` (see `Home.tsx`) to cover SSE loss during the long (~110s) task.
+Reclassify (bucket created): `POST /api/buckets ──> reclassify_user_inbox` → inline reload + reclassify-all (Postgres-only, no Gmail) → publish union as `threads_updated` → marks `last_sync:{uid}`. Client also runs a 60s+150s watchdog `resync()` (see `InboxPage.tsx`, renamed from `Home.tsx`) to cover SSE loss during the long (~110s) task.
 
 Search (synchronous, no sync/publish involved):
 ```
-Home.tsx search box (debounced 300ms) ──[GET /api/search?q=]──> API
+useInboxSearch (HudPage or InboxPage, debounced 300ms) ──[GET /api/search?q=]──> API
   API ──[search_repo.search_threads]──> Postgres (PG: subject_tsv/search_tsv FTS; else ILIKE)
     Postgres ──[{threads}]──> API ──[same shape as /api/inbox]──> Browser (renders via InboxList)
+```
+
+Sync-status read (**new**, synchronous, no sync/publish involved):
+```
+HudPage.refresh() ──[GET /api/sync/status]──> API
+  API ──[last_sync.get(uid)]──> Redis
+  API ──[user.gmail_last_history_id]──> Postgres (already-loaded User row)
+    API ──[{last_synced_at, has_cursor}]──> Browser (freshness strip; see CLIENT_INDEX HudPage)
 ```
 
 ## Decision points & gotchas
@@ -141,3 +153,5 @@ Home.tsx search box (debounced 300ms) ──[GET /api/search?q=]──> API
 - **Active-user gating.** Beat only polls users in `active_users`; the SSE heartbeat (5s) refreshes a 60s TTL, and `enqueue_polls` purges expired entries — so a dead API process can't strand a user as "active." (Note: `active_users.refresh` docstring says "every 20s" but the live cadence is the SSE `HEARTBEAT_SECONDS=5`.)
 - **SSE delivery is best-effort.** Dispatcher `put_nowait` drops frames on a full queue (`QUEUE_MAXSIZE=100`), and `_publish` logs `subscribers=0` when nobody's listening (subscribe/unsubscribe churn during SSE flapping). The client compensates with the 90s extend watchdog, the reclassify resync timers, and the `snapshot`-then-buffer-flush in `useInboxSse`.
 - **Eager-mode tests.** `CELERY_TASK_ALWAYS_EAGER=1` runs tasks inline inside the test txn; `fakeredis` backs `sync_lock`/`active_users`/pubsub; `SessionLocal` in `tasks.py` is monkeypatched onto the in-memory engine.
+- **`last_sync:{uid}` tracks sync attempts, not sync changes** (**new**). Marked on every successful `poll_new_messages`/`full_sync_inbox_task`/`reclassify_user_inbox` completion — including the 0-history-records no-op exit — so `GET /api/sync/status`'s `last_synced_at` means "last time this user's inbox was successfully checked," not "last time something changed." `extend_inbox_history_task`/`draft_preview_bucket` deliberately don't mark it (full writer/reader detail in WORKERS_INDEX).
+- **AppShell pins the SSE singleton open** (**new**). `lib/sse.ts`'s `EventSource` closes when its last `subscribeSse` handler unsubscribes. Since `/` (`HudPage`) mounts no `useInboxSse` and `/inbox` (`InboxPage`) only subscribes while mounted, a route-only view could otherwise drop to zero SSE subscribers and close the connection — deregistering the user from `active_users` (this doc's steady-state loop above) and starving beat polling until reconnect. `client/src/AppShell.tsx` subscribes a permanent no-op handler for the life of the authed shell to prevent that (full detail in CLIENT_INDEX gotchas).
