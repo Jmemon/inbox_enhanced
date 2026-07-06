@@ -20,7 +20,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.session import SessionLocal as _AppSessionLocal
 from app.db.models import User, InboxThread, InboxMessage
-from app.realtime import active_users, sync_lock
+from app.realtime import active_users, last_sync, sync_lock
 from app.realtime import redis_client as _redis_client
 from app.gmail.client import get_gmail_client
 from app.gmail.parser import thread_to_string
@@ -115,6 +115,7 @@ def poll_new_messages(user_id: str) -> None:
             ids = gmail_sync.full_sync_inbox(db, user=user)
             log.info("poll_new_messages: user=%s full sync complete, publishing %d ids", user_id, len(ids))
             _publish_thread_ids(user_id, ids)
+            last_sync.mark(user_id)
             return
 
         gmail = get_gmail_client(db, user)
@@ -127,10 +128,12 @@ def poll_new_messages(user_id: str) -> None:
             ids = gmail_sync.full_sync_inbox(db, user=user)
             log.info("poll_new_messages: user=%s recovery full sync complete, publishing %d ids", user_id, len(ids))
             _publish_thread_ids(user_id, ids)
+            last_sync.mark(user_id)
             return
 
         if not history_records:
             log.info("poll_new_messages: user=%s history returned 0 records → no publish", user_id)
+            last_sync.mark(user_id)  # a successful check IS a sync, even with nothing new
             return  # silent: no new changes
 
         log.info("poll_new_messages: user=%s got %d history records → partial sync", user_id, len(history_records))
@@ -141,6 +144,7 @@ def poll_new_messages(user_id: str) -> None:
         )
         log.info("poll_new_messages: user=%s partial sync complete, publishing %d ids", user_id, len(ids))
         _publish_thread_ids(user_id, ids)
+        last_sync.mark(user_id)
     finally:
         db.close()
         sync_lock.release(user_id)
@@ -168,6 +172,7 @@ def full_sync_inbox_task(user_id: str) -> None:
         ids = gmail_sync.full_sync_inbox(db, user=user)
         log.info("full_sync_inbox_task: user=%s complete, publishing %d ids", user_id, len(ids))
         _publish_thread_ids(user_id, ids)
+        last_sync.mark(user_id)
     finally:
         db.close()
         sync_lock.release(user_id)
@@ -376,6 +381,7 @@ def reclassify_user_inbox(self, user_id: str) -> None:
         log.info("reclassify: user=%s synced=%d reclassified=%d total=%d",
                  user_id, len(synced_ids), len(reclassified_ids), len(touched))
         _publish_thread_ids(user_id, touched)
+        last_sync.mark(user_id)
     finally:
         db.close()
         sync_lock.release(user_id)
