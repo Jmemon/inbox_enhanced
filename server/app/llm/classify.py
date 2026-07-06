@@ -4,10 +4,10 @@ under the shared semaphore. Output preserves input order."""
 import asyncio
 import logging
 from app.config import get_settings
-from app.db.models import Bucket
+from app.db.models import Bucket, Task
 from app.gmail.parser import ParsedThread, thread_to_string
 from app.llm import client
-from app.llm.prompts import classify_thread
+from app.llm.prompts import classify_thread, triage_thread
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,58 @@ def classify(
     async def _all():
         return await asyncio.gather(*[
             _classify_one(thread=t, buckets=buckets, current_bucket_id=cur, user_id=user_id)
+            for t, cur in zip(threads, current_bucket_ids)
+        ])
+    return client.run_in_loop(_all())
+
+
+async def _triage_one(
+    *, thread: ParsedThread, buckets: list[Bucket], trackers: list[Task],
+    current_bucket_id: str | None, user_id: str | None = None,
+) -> tuple[str | None, list[tuple[str, int]]]:
+    s = get_settings()
+    # Same stability-hint semantics as _classify_one.
+    current_name = next((b.name for b in buckets if b.id == current_bucket_id), None)
+    text = await client.call_messages(
+        model=s.llm_classify_model,
+        system=triage_thread.SYSTEM_PROMPT,
+        user=triage_thread.build_user_message(
+            thread_str=thread_to_string(thread), buckets=buckets, trackers=trackers,
+            current_bucket_name=current_name,
+        ),
+        # stage="classify" (not "triage"): this call IS the classify call —
+        # one llm_calls row per thread, same cost as before triage replaced
+        # classify in the sync path (D2 — no doubled LLM volume).
+        stage="classify", user_id=user_id,
+    )
+    bucket_id, tasks = triage_thread.parse_response(text, buckets, trackers)
+    if bucket_id is None:
+        bucket_id = current_bucket_id  # no-fit: keep existing (None for new threads)
+    return bucket_id, tasks
+
+
+def triage(
+    threads: list[ParsedThread], buckets: list[Bucket], trackers: list[Task],
+    current_bucket_ids: list[str | None], *, user_id: str | None = None,
+) -> list[tuple[str | None, list[tuple[str, int]]]]:
+    """The single call that replaces classify() in the sync path: one Haiku
+    call per thread returns both the bucket pick and tracker relevance
+    (D2 — no doubled LLM volume). Same asyncio.gather shape as classify();
+    output preserves input order. classify() itself is untouched — this is
+    an additive function for callers that also need tracker relevance."""
+    if not threads:
+        return []
+    if len(current_bucket_ids) != len(threads):
+        raise ValueError("current_bucket_ids length must match threads length")
+    if not buckets and not trackers:
+        # Nothing for the LLM to determine either way — skip the call
+        # entirely, mirroring classify()'s empty-buckets short-circuit.
+        return [(None, [])] * len(threads)
+
+    async def _all():
+        return await asyncio.gather(*[
+            _triage_one(thread=t, buckets=buckets, trackers=trackers,
+                       current_bucket_id=cur, user_id=user_id)
             for t, cur in zip(threads, current_bucket_ids)
         ])
     return client.run_in_loop(_all())

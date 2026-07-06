@@ -3,15 +3,35 @@ from unittest.mock import MagicMock, patch
 import pytest
 from googleapiclient.errors import HttpError
 from sqlalchemy import select, func
+from app.config import get_settings
 from app.db.models import Base, InboxMessage, InboxThread, User
+from app.gmail.parser import ParsedMessage, ParsedThread
 from app.inbox import inbox_repo
+from app.task_engine import repo as task_repo
 from app.workers import gmail_sync
 
 
 @pytest.fixture(autouse=True)
-def _stub_classify(monkeypatch):
-    monkeypatch.setattr("app.workers.gmail_sync.classify",
-                        lambda threads, buckets, current, **kw: [None] * len(threads))
+def _stub_triage(monkeypatch):
+    """Default stub for gmail_sync.triage (formerly gmail_sync.classify):
+    no-fit bucket for every thread, zero tracker hits. Individual tests that
+    need specific bucket/tracker outcomes override this via monkeypatch or
+    `patch("app.workers.gmail_sync.triage", ...)` inside the test body."""
+    monkeypatch.setattr(
+        "app.workers.gmail_sync.triage",
+        lambda threads, buckets, trackers, current, **kw: [(None, []) for _ in threads],
+    )
+
+
+def _parsed_thread(tid="g-t1"):
+    """A minimal ParsedThread, for tests that call gmail_sync._triage_batch
+    directly rather than through the full gmail-fetch + partial_sync_inbox
+    path."""
+    m = ParsedMessage(gmail_message_id=f"m_{tid}", gmail_thread_id=tid,
+                      gmail_internal_date=1, gmail_history_id="1",
+                      subject="s", from_addr="a@b", to_addr="me",
+                      body_text="b", body_preview="b", label_ids=["INBOX"])
+    return ParsedThread(gmail_thread_id=tid, subject="s", recent_internal_date=1, messages=[m])
 
 
 def _seed_user(db, *, history_id="100"):
@@ -701,3 +721,102 @@ def test_partial_sync_heals_soft_deleted_message_when_refetched(db, user, seeded
     healed = db.execute(select(InboxMessage).where(
         InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m2")).scalar_one()
     assert healed.is_deleted is False
+
+
+# ---------------------------------------------------------------------------
+# Task 5: _triage_batch (formerly _classify_batch) + dual-write task links
+# ---------------------------------------------------------------------------
+
+
+def test_triage_batch_zero_trackers_matches_old_classify_wiring(db):
+    """Regression guarantee: with zero active trackers, _triage_batch's
+    bucket-half wiring must be identical to the old _classify_batch — same
+    buckets loaded, same postgres-read current bucket_id passed as the
+    stability hint, same passthrough of whatever triage() returns. Stubs
+    classify.triage (patched as gmail_sync.triage) to prove the wiring itself
+    rather than depending on live prompt/model behavior."""
+    u = _seed_user(db)
+    inbox_repo.upsert_thread(db, user_id=u.id, gmail_thread_id="g-t1", subject="hi",
+                             bucket_id="old-bucket")
+    db.commit()
+
+    captured = {}
+
+    def _fake_triage(threads, buckets, trackers, current, **kw):
+        captured["trackers"] = trackers
+        captured["current"] = current
+        return [("new-bucket", [])]
+
+    with patch("app.workers.gmail_sync.triage", side_effect=_fake_triage):
+        out = gmail_sync._triage_batch(db, user_id=u.id, parsed_list=[_parsed_thread("g-t1")])
+
+    assert out == [("new-bucket", [])]
+    assert captured["trackers"] == []              # zero active trackers for this user
+    assert captured["current"] == ["old-bucket"]    # stability hint read from postgres
+
+
+def test_partial_sync_writes_link_above_threshold_and_skips_below(db, user, seeded_thread):
+    """One active tracker scored above TASK_LINK_CONFIDENCE gets a link row
+    with its confidence; another scored below the threshold gets none."""
+    task_hi = task_repo.create_task(db, user_id=user.id, name="Hi", goal="", criteria="",
+                                    state_schema=None)
+    task_lo = task_repo.create_task(db, user_id=user.id, name="Lo", goal="", criteria="",
+                                    state_schema=None)
+    db.commit()
+    threshold = get_settings().task_link_confidence
+
+    records = [{"messagesAdded": [{"message": {"id": "g-m3", "threadId": "g-t1"}}]}]
+    payload = _fake_thread_payload(tid="g-t1", mid="g-m3", history_id="300")
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    def _fake_triage(threads, buckets, trackers, current, **kw):
+        return [(None, [(task_hi.id, 90), (task_lo.id, threshold - 1)])]
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail), \
+         patch("app.workers.gmail_sync.triage", side_effect=_fake_triage):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="300")
+
+    thread = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
+
+    hi_link = task_repo.get_link(db, task_id=task_hi.id, thread_id=thread.id)
+    assert hi_link is not None
+    assert hi_link.origin == "llm"
+    assert hi_link.state == "attached"
+    assert hi_link.confidence == 90
+
+    lo_link = task_repo.get_link(db, task_id=task_lo.id, thread_id=thread.id)
+    assert lo_link is None, "below-threshold task hit must not create a link row"
+
+
+def test_partial_sync_does_not_overwrite_existing_user_origin_link(db, user, seeded_thread):
+    """A user's explicit detach (origin='user') must survive a later sync
+    that triages the same thread as a high-confidence match for the same
+    task — upsert_link's sticky rule protects it."""
+    task = task_repo.create_task(db, user_id=user.id, name="T", goal="", criteria="",
+                                 state_schema=None)
+    db.commit()
+
+    task_repo.upsert_link(db, task_id=task.id, thread_id=seeded_thread.id, user_id=user.id,
+                          origin="user", state="detached")
+    db.commit()
+
+    records = [{"messagesAdded": [{"message": {"id": "g-m3", "threadId": "g-t1"}}]}]
+    payload = _fake_thread_payload(tid="g-t1", mid="g-m3", history_id="300")
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    def _fake_triage(threads, buckets, trackers, current, **kw):
+        return [(None, [(task.id, 95)])]
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail), \
+         patch("app.workers.gmail_sync.triage", side_effect=_fake_triage):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="300")
+
+    link = task_repo.get_link(db, task_id=task.id, thread_id=seeded_thread.id)
+    assert link.origin == "user"
+    assert link.state == "detached", \
+        "sticky rule: an origin='user' detached link must not be re-attached by an llm upsert"

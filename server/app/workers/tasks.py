@@ -26,8 +26,9 @@ from app.gmail.client import get_gmail_client
 from app.gmail.parser import thread_to_string
 from app.inbox import bucket_repo, inbox_repo, preview_cache
 from app.llm import client as llm_client
-from app.llm.classify import classify
+from app.llm.classify import triage
 from app.llm.prompts import score_thread
+from app.task_engine import repo as task_repo
 from app.workers import gmail_sync
 from app.workers.celery_app import celery_app
 
@@ -429,21 +430,38 @@ def _inline_reload(db, *, user) -> list[str]:
 def _reclassify_all(db, *, user) -> list[str]:
     """Reclassify every stored thread from Postgres bodies (0006+). The old
     per-thread gmail.threads.get loop (~200ms each) is gone — reclassify of a
-    200-thread inbox is now LLM-bound."""
+    200-thread inbox is now LLM-bound.
+
+    Task 5: uses triage() instead of classify() so the same LLM call also
+    recomputes tracker relevance (D2 — no doubled LLM volume). Bucket writes
+    are unchanged (only written when the picked bucket actually differs from
+    the stored one). Link upserts happen on every run for every returned
+    (task_id, confidence) at/above TASK_LINK_CONFIDENCE — a thread's relevance
+    to a tracker can shift even when its bucket doesn't, and upsert_link's
+    sticky rule protects any existing origin='user' row regardless.
+    """
     triples = inbox_repo.load_parsed_threads(db, user_id=user.id)
     if not triples:
         log.info("reclassify._reclassify_all: user=%s no threads", user.id)
         return []
 
     buckets = bucket_repo.list_active(db, user_id=user.id)
+    trackers = task_repo.list_active_trackers(db, user_id=user.id)
     threads = [p for _, _, p in triples]
     current = [b for _, b, _ in triples]
     log.info("reclassify._reclassify_all: user=%s classifying %d threads against %d buckets",
              user.id, len(threads), len(buckets))
-    new_bucket_ids = classify(threads, buckets, current, user_id=user.id)
+    settings = get_settings()
+    triage_results = triage(threads, buckets, trackers, current, user_id=user.id)
 
     changed: list[str] = []
-    for (internal_id, old_bucket, _), new_bucket in zip(triples, new_bucket_ids):
+    for (internal_id, old_bucket, _), (new_bucket, task_hits) in zip(triples, triage_results):
+        for task_id, confidence in task_hits:
+            if confidence >= settings.task_link_confidence:
+                task_repo.upsert_link(
+                    db, task_id=task_id, thread_id=internal_id, user_id=user.id,
+                    origin="llm", state="attached", confidence=confidence,
+                )
         if new_bucket == old_bucket:
             continue
         thread_row = db.get(InboxThread, internal_id)

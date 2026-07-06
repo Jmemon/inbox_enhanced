@@ -44,8 +44,10 @@ def test_extend_publishes_typed_event_with_more_flag(fake_redis, session_factory
                         "headers": [{"name": "Subject", "value": "old"}],
                         "body": {"data": ""}}}]}
 
-    monkeypatch.setattr("app.workers.gmail_sync.classify",
-                        lambda threads, buckets, current, **kw: [None] * len(threads))
+    monkeypatch.setattr(
+        "app.workers.gmail_sync.triage",
+        lambda threads, buckets, trackers, current, **kw: [(None, []) for _ in threads],
+    )
 
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
         tasks.extend_inbox_history_task.apply(args=["u1", 999_999_000])

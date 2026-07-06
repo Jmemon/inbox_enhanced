@@ -11,6 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.models import Base, InboxMessage, InboxThread, User
 from app.inbox import inbox_repo
 from app.realtime import last_sync
+from app.task_engine import repo as task_repo
 from app.workers import tasks, gmail_sync
 
 
@@ -220,7 +221,14 @@ def test_reclassify_all_reads_postgres_no_gmail(session_factory):
     rows via inbox_repo.load_parsed_threads — it must never refetch Gmail.
     A get_gmail_client stub that raises if called proves the path is
     Gmail-free; body_text is seeded straight into Postgres via
-    upsert_message, mirroring what sync would have persisted."""
+    upsert_message, mirroring what sync would have persisted.
+
+    Task 5: _reclassify_all now calls triage() (not classify()) — same
+    (bucket_id, [(task_id, confidence), ...]) tuple shape every other triage
+    caller gets. This user has zero trackers, so list_active_trackers's real
+    (unmocked) query against the in-memory db returns []; the stubbed
+    triage() return value carries no task hits either, so no link upserts
+    are expected — this test only pins the bucket-write half."""
     db = session_factory()
     user = User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc))
     db.add(user)
@@ -241,13 +249,48 @@ def test_reclassify_all_reads_postgres_no_gmail(session_factory):
 
     with patch("app.workers.tasks.get_gmail_client", side_effect=_raise_if_called), \
          patch("app.workers.tasks.bucket_repo.list_active", return_value=[]) as mock_buckets, \
-         patch("app.workers.tasks.classify", return_value=["new-bucket"]) as mock_classify:
+         patch("app.workers.tasks.triage", return_value=[("new-bucket", [])]) as mock_triage:
         changed = tasks._reclassify_all(db, user=user)
 
     mock_buckets.assert_called_once()
-    mock_classify.assert_called_once()
+    mock_triage.assert_called_once()
     assert changed == [thread.id]
     assert thread.bucket_id == "new-bucket"
+
+
+def test_reclassify_all_writes_task_links_even_when_bucket_unchanged(session_factory):
+    """Task 5: link upserts must happen for every triage-returned
+    (task_id, confidence) at/above TASK_LINK_CONFIDENCE on every reclassify
+    run — independent of whether the thread's bucket pick changed. A thread's
+    relevance to a tracker can shift even when its bucket doesn't."""
+    db = session_factory()
+    user = User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc))
+    db.add(user)
+    db.commit()
+
+    thread = inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="gT1",
+                                      subject="hi", bucket_id="same-bucket")
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="gT1", gmail_message_id="gM1",
+        gmail_internal_date=1, gmail_history_id="1",
+        to_addr=None, from_addr="a@b.com", body_preview="prev",
+        body_text="full body text",
+    )
+    task = task_repo.create_task(db, user_id="u1", name="Tracker", goal="", criteria="",
+                                 state_schema=None)
+    db.commit()
+
+    with patch("app.workers.tasks.bucket_repo.list_active", return_value=[]), \
+         patch("app.workers.tasks.triage",
+               return_value=[("same-bucket", [(task.id, 90)])]) as mock_triage:
+        changed = tasks._reclassify_all(db, user=user)
+
+    mock_triage.assert_called_once()
+    assert changed == []  # bucket unchanged -> not reported as changed
+    link = task_repo.get_link(db, task_id=task.id, thread_id=thread.id)
+    assert link is not None
+    assert link.origin == "llm"
+    assert link.confidence == 90
 
 
 def test_read_candidates_sorts_by_last_activity_and_skips_archived(session_factory):

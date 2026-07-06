@@ -22,9 +22,11 @@ import logging
 from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
 from sqlalchemy import select
+from app.config import get_settings
 from app.db.models import Bucket, InboxMessage, InboxThread, User
 from app.inbox import inbox_repo, bucket_repo
-from app.llm.classify import classify
+from app.llm.classify import triage
+from app.task_engine import repo as task_repo
 from app.gmail.client import get_gmail_client
 from app.gmail.parser import assemble_thread, ParsedThread
 
@@ -52,7 +54,7 @@ def _upsert_thread_with_messages(
 ) -> str:
     """Write a thread and all its messages to postgres with a precomputed bucket_id.
 
-    Classification is NOT done here — caller must call _classify_batch first and
+    Classification is NOT done here — caller must call _triage_batch first and
     pass the resolved bucket_id. Caller is responsible for the surrounding
     transaction (db.commit happens in partial_sync_inbox / full_sync_inbox).
 
@@ -78,18 +80,32 @@ def _upsert_thread_with_messages(
     return thread.id
 
 
-def _classify_batch(db: Session, *, user_id: str, parsed_list: list[ParsedThread]) -> list[str | None]:
-    """Classify a batch of parsed threads in one parallel LLM call.
+def _triage_batch(
+    db: Session, *, user_id: str, parsed_list: list[ParsedThread],
+) -> list[tuple[str | None, list[tuple[str, int]]]]:
+    """Triage a batch of parsed threads in one parallel LLM call: bucket pick
+    AND tracker relevance from a single call per thread (D2 — no doubled LLM
+    volume; formerly _classify_batch).
 
-    Loads active buckets for the user once, then fetches each thread's existing
-    bucket_id from postgres as a stability hint (prevents needless re-routing
-    of already-classified threads). Delegates to classify() which runs all
-    _classify_one coroutines concurrently under the shared semaphore.
-    Returns a list of bucket_ids (or None) in the same order as parsed_list.
+    Loads active buckets for the user once (unchanged from the old
+    _classify_batch), plus active trackers (task_engine.repo.list_active_trackers),
+    then fetches each thread's existing bucket_id from postgres as a stability
+    hint (prevents needless re-routing of already-classified threads).
+    Delegates to triage() which runs all _triage_one coroutines concurrently
+    under the shared semaphore. Returns (bucket_id, [(task_id, confidence),
+    ...]) tuples in the same order as parsed_list.
+
+    Regression guarantee: with zero active trackers, the bucket half of this
+    output is identical to the old classify-only path — triage() with
+    trackers=[] renders the exact same prompt classify() would have
+    (triage_thread.build_user_message delegates the bucket section to
+    classify_thread.build_user_message) and applies the same no-fit ->
+    current_bucket_id fallback.
     """
     if not parsed_list:
         return []
     buckets = bucket_repo.list_active(db, user_id=user_id)
+    trackers = task_repo.list_active_trackers(db, user_id=user_id)
     current = []
     for parsed in parsed_list:
         existing = db.execute(
@@ -99,7 +115,28 @@ def _classify_batch(db: Session, *, user_id: str, parsed_list: list[ParsedThread
             )
         ).scalar_one_or_none()
         current.append(existing)
-    return classify(parsed_list, buckets, current, user_id=user_id)
+    return triage(parsed_list, buckets, trackers, current, user_id=user_id)
+
+
+def _write_task_links(
+    db: Session, *, user_id: str, thread_id: str, tasks: list[tuple[str, int]],
+) -> None:
+    """Dual-write half of the triage contract: for every (task_id, confidence)
+    triage returned at or above TASK_LINK_CONFIDENCE, upsert an origin='llm'
+    link. task_engine.repo.upsert_link's sticky rule protects any existing
+    origin='user' row from being silently overwritten by this automatic pass.
+    Runs inside the caller's sync transaction (no commit here) — the caller
+    (partial_sync_inbox / full_sync_inbox / extend_inbox_history) commits
+    once at the end, same as every other write in this module.
+    """
+    settings = get_settings()
+    for task_id, confidence in tasks:
+        if confidence < settings.task_link_confidence:
+            continue
+        task_repo.upsert_link(
+            db, task_id=task_id, thread_id=thread_id, user_id=user_id,
+            origin="llm", state="attached", confidence=confidence,
+        )
 
 
 def fetch_history_records(
@@ -277,7 +314,7 @@ def partial_sync_inbox(
     )
 
     # Parse all touched threads first, then classify in one batch call, then upsert.
-    # This lets classify() parallelize LLM calls across all threads in a single gather().
+    # This lets triage() parallelize LLM calls across all threads in a single gather().
     # Per-thread try/except tolerates 404s on threads that were deleted between when
     # Gmail emitted the history record and when we fetch them — without it the whole
     # task crashes and the history cursor never advances past the deleted thread,
@@ -293,11 +330,12 @@ def partial_sync_inbox(
             continue
         parsed_list.append(assemble_thread(thread_id=tid, raw_messages=thread_resp.get("messages", []) or []))
 
-    bucket_ids = _classify_batch(db, user_id=user.id, parsed_list=parsed_list)
+    triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
     internal_ids = []
-    for p, b in zip(parsed_list, bucket_ids):
+    for p, (b, task_hits) in zip(parsed_list, triage_results):
         internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         internal_ids.append(internal_id)
+        _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
 
         # Heal is_archived from the fetched thread's own label state. The
         # flag-record loop above (labelsAdded/labelsRemoved INBOX) runs BEFORE
@@ -361,7 +399,7 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
     log.info("full_sync_inbox: user=%s listing returned %d thread stubs", user.id, len(thread_stubs))
 
     # Parse all threads first, then classify in one batch call, then upsert.
-    # This lets classify() parallelize LLM calls across all threads in a single gather().
+    # This lets triage() parallelize LLM calls across all threads in a single gather().
     # Per-thread try/except (matching partial_sync_inbox/extend_inbox_history below):
     # one flaky threads.get() must not 500 the whole bootstrap/recovery sync. Failed
     # stub ids are remembered so the reconcile step below can tell "gmail didn't list
@@ -379,11 +417,12 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
             continue
         parsed_list.append(assemble_thread(thread_id=tid, raw_messages=thread_resp.get("messages", []) or []))
 
-    bucket_ids = _classify_batch(db, user_id=user.id, parsed_list=parsed_list)
-    internal_ids = [
-        _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
-        for p, b in zip(parsed_list, bucket_ids)
-    ]
+    triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
+    internal_ids = []
+    for p, (b, task_hits) in zip(parsed_list, triage_results):
+        internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
+        internal_ids.append(internal_id)
+        _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
 
     # Reconcile: full sync's labelIds=["INBOX"] listing is authoritative in
     # BOTH directions within the window it just observed — a thread it lists
@@ -488,10 +527,11 @@ def extend_inbox_history(db: Session, *, user: User, before_internal_date_ms: in
         except Exception:
             log.exception("extend: threads.get failed for %s", tid)
 
-    bucket_ids = _classify_batch(db, user_id=user.id, parsed_list=parsed_list)
-    internal_ids = [
-        _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
-        for p, b in zip(parsed_list, bucket_ids)
-    ]
+    triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
+    internal_ids = []
+    for p, (b, task_hits) in zip(parsed_list, triage_results):
+        internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
+        internal_ids.append(internal_id)
+        _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
     db.commit()
     return internal_ids, len(stubs) == 200
