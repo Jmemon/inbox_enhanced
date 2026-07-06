@@ -1,8 +1,8 @@
-<!-- stamp: 13a07e5 (main) | 2026-05-29 -->
+<!-- stamp: 00d736e (feature/phase0-data-floor) | 2026-07-05 -->
 
 # Client Index
 
-> Scope: React 19 + Vite browser SPA (client/src) — App/AuthProvider routing, lib/api fetch wrappers + lib/sse EventSource singleton, useInbox/useInboxSse/useBuckets hooks, inbox list + pagination + reload, bucket filter/new/view modals; the Browser↔API fetch+SSE realtime layer (§1.6, §2.1, §2.11, §3.4).
+> Scope: React 19 + Vite browser SPA (client/src) — App/AuthProvider routing, lib/api fetch wrappers (+ `searchInbox`) + lib/sse EventSource singleton, useInbox/useInboxSse/useBuckets hooks (archived-thread eviction on LWW-accept), Home's debounced inbox search bar, inbox list + pagination + reload, bucket filter/new/view modals; the Browser↔API fetch+SSE realtime layer (§1.6, §2.1, §2.11, §3.4).
 
 ## Files
 | Path | Role / key exports (components, hooks) |
@@ -12,10 +12,10 @@
 | client/src/auth/useAuth.tsx | `AuthProvider`, `useAuth()`, types `Me`/`AuthState`. Context state `loading|authed|anon`. `refresh()`→`getJSON('/auth/me')`, `signOut()`→`postEmpty('/auth/logout')`. `useEffect` calls `refresh()` on mount. |
 | client/src/auth/Login.tsx | `Login` (default). Static card; button → `window.location.assign('/auth/login')`. Reads `?authError` from URL (`denied`→"sign-in cancelled"). |
 | client/src/auth/Splash.tsx | `Splash` (default). Static "loading…" screen for the `loading` auth state. |
-| client/src/lib/api.ts | Fetch wrappers + types. Exports `getJSON`/`postEmpty` (401→`throw {kind:'unauthorized'}`), `getInbox`, `getThread`, `getThreadsBatch`, `requestRefresh`, `getBuckets`, `createBucket`, `patchBucket`, `deleteBucket`, `postBucketDraftPreview`, `getBucketDraftPreview`, `postInboxExtend`. Types `InboxMessage`/`InboxThread`/`InboxPage`/`Bucket`/`BucketExampleIn`/`DraftPreviewPoll`/`AuthError`. All `credentials:'same-origin'`; verbose `console.log` timing. |
+| client/src/lib/api.ts | Fetch wrappers + types. Exports `getJSON`/`postEmpty` (401→`throw {kind:'unauthorized'}`), `getInbox`, `searchInbox(q)` (**new** — `GET /api/search?q=`→`InboxPage`, same shape as `getInbox`; no console timing wrapper unlike the other calls), `getThread`, `getThreadsBatch`, `requestRefresh`, `getBuckets`, `createBucket`, `patchBucket`, `deleteBucket`, `postBucketDraftPreview`, `getBucketDraftPreview`, `postInboxExtend`. Types `InboxMessage` (**new** `is_unread?: boolean`) / `InboxThread` (**new** `is_archived: boolean`) / `InboxPage`/`Bucket`/`BucketExampleIn`/`DraftPreviewPoll`/`AuthError`. All `credentials:'same-origin'`; verbose `console.log` timing (searchInbox excepted). |
 | client/src/lib/sse.ts | EventSource singleton. Exports `subscribeSse(handler)→unsub`, types `PreviewExample`/`SseDataEvent`/`SseConnEvent`/`SseEvent`. One `_es=EventSource('/api/sse',{withCredentials:true})`; `_handlers:Set`; auto-reopen via `queueMicrotask(_open)` on error if handlers remain. |
-| client/src/pages/Home.tsx | `Home` (default). Top-level authed page. Wires `useBuckets`, `useInbox`, `useInboxSse`; owns `filterSelection`/`showView`/`showNew` state, `createWithWatchdog`, reclassify watchdog, `hydrateCurrentPage` on page change. Renders header, `<SecondaryHeader>`, `<InboxList>`, modals. |
-| client/src/pages/inbox/useInbox.tsx | `useInbox({buckets,filterSelection})`. Owns inbox id/display layers, pagination, auto-extend, LWW gate. (details below). `PAGE_SIZE=50`, `SNAPSHOT_LIMIT=200`, `EXTEND_TIMEOUT_MS=90_000`, `UNCLASSIFIED='unclassified'`. |
+| client/src/pages/Home.tsx | `Home` (default). Top-level authed page. Wires `useBuckets`, `useInbox`, `useInboxSse`; owns `filterSelection`/`showView`/`showNew` state, `createWithWatchdog`, reclassify watchdog, `hydrateCurrentPage` on page change, and **new** the inbox search box: `searchQuery`/`searchResults`/`searchError` state + `searchSeq` ref (monotonic request-token race guard) driving a 300ms-debounced `useEffect`→`searchInbox(q)`. Non-null `searchResults` swaps `<InboxList>`'s source to search results in place of `inbox.pageThreads`; clearing/emptying the query restores the inbox view. Renders header, `<SecondaryHeader>`, search input, `<InboxList>`, modals. |
+| client/src/pages/inbox/useInbox.tsx | `useInbox({buckets,filterSelection})`. Owns inbox id/display layers, pagination, auto-extend, LWW gate. **New**: `applyThreadUpdates` partitions LWW-accepted threads into **archived** (evicted outright from `idLayer`/`displayLayer`/`lastInternalDate` — mirrors a Gmail archive) vs **live** (merged + re-sorted as before). (details below). `PAGE_SIZE=50`, `SNAPSHOT_LIMIT=200`, `EXTEND_TIMEOUT_MS=90_000`, `UNCLASSIFIED='unclassified'`. |
 | client/src/pages/inbox/useInboxSse.tsx | `useInboxSse({onApply,snapshot})`. Subscribes SSE; on `_open` runs snapshot→buffer-drain lifecycle; buffers `threads_updated` until `ready`; on `_error` clears `ready`. |
 | client/src/pages/inbox/InboxList.tsx | `InboxList({threads,bucketsById})`. Grid rows (bucket pill, from, subject, preview). Helpers `abbreviate`, `BucketPill`. Empty→"syncing your inbox…". |
 | client/src/pages/inbox/Pagination.tsx | `Pagination({page,pageCount,extending,onChange})`. prev/next + "page N of M" + "loading more…" when extending. Returns null when `pageCount<=1 && !extending`. |
@@ -30,8 +30,9 @@
 - **Routing** — `App.tsx`'s `Routes()` is the only router (no react-router): branches on `useAuth().state.status`. No URL paths beyond the `?authError` query read in `Login`.
 - **useAuth** — owns auth context (`loading|authed|anon`). Bootstrap `useEffect`→`/auth/me`. `signOut`→`/auth/logout`.
 - **useBuckets** — owns the canonical bucket list rendered everywhere (one instance, lives in `Home`). `create/rename/softDelete` mutate then `refresh()` (`GET /api/buckets`). `byId` map drives `InboxList` pills + filter.
-- **useInbox** — owns inbox data model: `idLayer:string[]` (ordered ids) + `displayLayer:Record<id,InboxThread>` (rows), `page`, `more:boolean|null`, `extendInFlight`. Provides `snapshot` (loading toggle), `resync` (silent), `applyThreadUpdates(ids)`, `requestExtend`, `hydrateCurrentPage`, derived `pageThreads`/`pageCount`/`filteredIdLayer`.
+- **useInbox** — owns inbox data model: `idLayer:string[]` (ordered ids) + `displayLayer:Record<id,InboxThread>` (rows), `page`, `more:boolean|null`, `extendInFlight`. Provides `snapshot` (loading toggle), `resync` (silent), `applyThreadUpdates(ids)` (LWW-gates, then partitions accepted threads into archived-evict vs live-merge), `requestExtend`, `hydrateCurrentPage`, derived `pageThreads`/`pageCount`/`filteredIdLayer`.
 - **useInboxSse** — bridges the SSE bus to `useInbox`: `_open`→`snapshot()`, then drains buffered `threads_updated` via `onApply`; live `threads_updated` apply directly once ready.
+- **Search** (**new**, `Home`) — debounced (300ms) search box: `searchQuery`/`searchResults`/`searchError` state + `searchSeq` ref (monotonic token, discards stale out-of-order responses) driving `searchInbox(q)`→`GET /api/search`. Non-null `searchResults` replaces `<InboxList>`'s source; clearing the query (or an empty trimmed value) restores `inbox.pageThreads`. Independent of `useInbox` — does not touch `idLayer`/`displayLayer`/pagination/filter.
 - **Modals** — `NewBucketModal` (form→pending→review draft flow), `ViewBucketsModal` (rename/soft-delete). Both shown conditionally from `Home`.
 - **Key components** — `Home` (composition root), `SecondaryHeader` (toolbar), `InboxList`, `Pagination`, `ReloadButton`, `FilterByBucketDropdown`.
 
@@ -39,6 +40,7 @@
 - **API endpoints via lib/api.ts** (all cookie-auth `same-origin`):
   - `GET /auth/me`, `POST /auth/logout` — useAuth.
   - `GET /api/inbox?page&limit` (`getInbox`, snapshot uses `limit=200`) — useInbox.
+  - `GET /api/search?q=` (`searchInbox`, **new**) — Home's debounced search box; same `InboxPage` response shape as `/api/inbox`, no page/limit args passed by the client.
   - `POST /api/threads/batch {thread_ids}` (`getThreadsBatch`) — SSE replay / hydrate / extend apply.
   - `GET /api/threads/{id}` (`getThread`) — exported, **no current call site**.
   - `POST /api/inbox/refresh` (`requestRefresh`, 202) — ReloadButton.
@@ -46,7 +48,7 @@
   - `GET /api/buckets`, `POST /api/buckets`, `PATCH /api/buckets/{id}`, `DELETE /api/buckets/{id}` (204) — useBuckets.
   - `POST /api/buckets/draft/preview {name,description,exclude_thread_ids}` (202→`{draft_id}`) + `GET /api/buckets/draft/preview/{draft_id}` (202 pending / 200 ready / 404 gone) — NewBucketModal.
 - **SSE — lib/sse.ts** `EventSource('/api/sse')`. Data events consumed: `threads_updated{thread_ids}` (useInboxSse→useInbox.applyThreadUpdates), `extend_complete{thread_ids,more}` (useInbox), `bucket_draft_preview{draft_id,positives,near_misses}` (NewBucketModal). Synthetic conn events `_open`/`_error` broadcast to all handlers. Server `: keepalive` frames (5s) are non-JSON and ignored by `onmessage` try/catch.
-- **Client-side state**: pagination cursor `page` + derived `pageCount` (PAGE_SIZE=50); `more` (history exhaustion); `extendInFlight`; refs `lastInternalDate` (LWW gate per id), `lastExtendAtLength` (no-progress guard), `extendWatchdog` (90s timer); NewBucketModal `appliedRef` (per-draft idempotency); Home reclassify `setTimeout`s (60s+150s).
+- **Client-side state**: pagination cursor `page` + derived `pageCount` (PAGE_SIZE=50); `more` (history exhaustion); `extendInFlight`; refs `lastInternalDate` (LWW gate per id), `lastExtendAtLength` (no-progress guard), `extendWatchdog` (90s timer); NewBucketModal `appliedRef` (per-draft idempotency); Home reclassify `setTimeout`s (60s+150s); **new** Home search `searchQuery`/`searchResults`/`searchError` state + `searchSeq` ref (monotonic token, guards stale async responses).
 - **fetch vs SSE**: snapshot/hydrate/mutations are fetch; new/changed threads, extend completion, and draft-preview results are pushed over SSE (with HTTP polling fallback only for draft preview).
 
 ## Data flows / cross-subsystem touchpoints
@@ -58,6 +60,7 @@
 - `Browser ──[POST /api/inbox/extend {before_internal_date}]──> API` (202) — worker extends Gmail history; completion arrives as SSE `extend_complete`.
 - `Browser ──[POST /api/buckets/draft/preview]──> API ──[{draft_id}]──> Browser`; result via SSE `bucket_draft_preview` OR polled `GET /api/buckets/draft/preview/{draft_id}` (redis cache, 600s TTL).
 - `Browser ──[POST /api/buckets]──> API` enqueues `reclassify_user_inbox`; completion *should* arrive as `threads_updated` but Home schedules 60s+150s `resync()` watchdogs to compensate.
+- `Browser ──[GET /api/search?q=]──> API ──[JSON InboxPage]──> Browser` (**new**) — Home's debounced (300ms) search box; plain synchronous request/response, no SSE involved; `searchSeq` discards a response if a newer query has since superseded it; results replace `<InboxList>`'s source until the query is cleared.
 - **Intra-tab (§2.11)**: `useInboxSse ↔ useInbox` and `NewBucketModal` all subscribe the single `lib/sse.ts` `EventSource` via the `_handlers` Set — one socket fans out to many React hooks.
 - **SSE→state mutation**: `threads_updated`→`getThreadsBatch(ids)`→LWW-gate→merge `displayLayer` + re-sort `idLayer` desc by `internal_date`. `extend_complete`→`setMore`+clear watchdog+apply ids. `bucket_draft_preview`→push examples + flip modal to `review`.
 
@@ -72,3 +75,6 @@
 - **Single useBuckets instance**: `NewBucketModal` takes `onSave` from Home's `useBuckets` rather than calling `useBuckets()` itself — a second instance would refresh nobody's rendered list, leaving toolbar/filter stale.
 - **StaticFiles / dev-proxy split**: prod — Vite builds into `server/app/static/` (`VITE_OUT_DIR` override), served by FastAPI `StaticFiles` + SPA catch-all (same origin, no proxy). Dev — Vite dev server `:5173` proxies `/auth` and `/api` to `http://localhost:8000` (`vite.config.ts`); `same-origin`/`withCredentials` cookies work because the proxy keeps one origin.
 - **401 handling**: `getJSON`/`getThreadsBatch` throw `{kind:'unauthorized'}`; `useAuth.refresh` maps any error to `anon`. Other hooks (`useInbox`, `useBuckets`) do not specially route 401 — they log/swallow.
+- **Archived-thread eviction, not a flag** (useInbox, **new**): `applyThreadUpdates` splits LWW-accepted threads into archived vs live; archived ids are deleted outright from `displayLayer`/`idLayer`/`lastInternalDate` — there's no rendered "archived" state, the row just disappears on the next SSE-driven batch fetch. This mirrors the server's reconciling archive/un-archive (see INBOX_SYNC_INDEX) but the client only ever sees the one-way "thread left the inbox" transition; an un-archive re-adds the thread as an ordinary live merge (it's just `is_archived:false` on the next accepted update).
+- **Search race guard, not cancellation** (Home, **new**): the 300ms debounce timer is cleared per-keystroke, but an in-flight `searchInbox` fetch is never aborted — `searchSeq` just discards its result if a newer query (or a clear) has since superseded it (`seq !== searchSeq.current`). Clearing the box bumps `searchSeq` too, so a slow stale response can't repopulate results after the user backs out.
+- **Search bypasses `useInbox` entirely**: `searchResults` is a flat one-shot array from `GET /api/search`, not merged into `idLayer`/`displayLayer`. While search is active, `useInbox`'s pagination/auto-extend/bucket filter keep running against the underlying inbox in the background but are invisible until the query is cleared and `<InboxList>` switches back to `inbox.pageThreads`.
