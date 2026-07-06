@@ -129,7 +129,7 @@ def _triage_batch(
 
 def _write_task_links(
     db: Session, *, user_id: str, thread_id: str, tasks: list[tuple[str, int]],
-) -> None:
+) -> bool:
     """Dual-write half of the triage contract: for every (task_id, confidence)
     triage returned at or above TASK_LINK_CONFIDENCE, upsert an origin='llm'
     link. task_engine.repo.upsert_link's sticky rule protects any existing
@@ -137,15 +137,24 @@ def _write_task_links(
     Runs inside the caller's sync transaction (no commit here) — the caller
     (partial_sync_inbox / full_sync_inbox / extend_inbox_history) commits
     once at the end, same as every other write in this module.
+
+    Returns True if at least one upsert_link call actually wrote/updated a row
+    (i.e. wasn't a sticky-rule no-op). extend_inbox_history uses this to know
+    which threads it just linked, so it can route exactly those into
+    extraction — see its own docstring for why that routing exists.
     """
     settings = get_settings()
+    wrote = False
     for task_id, confidence in tasks:
         if confidence < settings.task_link_confidence:
             continue
-        task_repo.upsert_link(
+        link = task_repo.upsert_link(
             db, task_id=task_id, thread_id=thread_id, user_id=user_id,
             origin="llm", state="attached", confidence=confidence,
         )
+        if link is not None:
+            wrote = True
+    return wrote
 
 
 def fetch_history_records(
@@ -539,9 +548,26 @@ def full_sync_inbox(db: Session, *, user: User) -> tuple[list[str], list[str]]:
     return internal_ids, content_ids
 
 
-def extend_inbox_history(db: Session, *, user: User, before_internal_date_ms: int) -> tuple[list[str], bool]:
+def extend_inbox_history(
+    db: Session, *, user: User, before_internal_date_ms: int,
+) -> tuple[list[str], bool, list[str]]:
     """Pull threads older than the given gmail_internal_date_ms. Returns
-    (internal_thread_ids, more). more = (gmail returned 200 stubs).
+    (internal_thread_ids, more, new_link_ids).
+
+    more = (gmail returned 200 stubs).
+
+    new_link_ids = the subset of internal_thread_ids where _write_task_links
+    actually wrote/updated a task_thread_links row this call (i.e. a tracker
+    picked up relevance to this thread). Unlike the live sync path, every
+    thread pulled in here IS freshly fetched content — there's no separate
+    "content vs flag-only" distinction to route on (see partial_sync_inbox/
+    full_sync_inbox) — so new-link-ness is the signal: extend_inbox_history_task
+    uses new_link_ids to enqueue exactly the threads that just became relevant
+    to a tracker into process_task_updates. Without this, a thread pulled in
+    via "load more history" that turns out to match a tracker would sit
+    attached-but-never-extracted until some unrelated future sync happened to
+    re-touch it.
+
     Caller manages the surrounding sync_lock. Does NOT touch gmail_last_history_id
     or clear inbox rows."""
     log.info("extend: user=%s before_ms=%d", user.id, before_internal_date_ms)
@@ -564,9 +590,11 @@ def extend_inbox_history(db: Session, *, user: User, before_internal_date_ms: in
 
     triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
     internal_ids = []
+    new_link_ids = []
     for p, (b, task_hits) in zip(parsed_list, triage_results):
         internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         internal_ids.append(internal_id)
-        _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+        if _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits):
+            new_link_ids.append(internal_id)
     db.commit()
-    return internal_ids, len(stubs) == 200
+    return internal_ids, len(stubs) == 200, new_link_ids

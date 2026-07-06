@@ -295,6 +295,49 @@ def test_reclassify_user_inbox_marks_last_sync(
     assert stub_enqueue == [["u1", ["gT_reload"]]]
 
 
+def test_reclassify_user_inbox_enqueues_extraction_for_newly_linked_unchanged_bucket_thread(
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
+):
+    """Fix (linked-but-never-extracted): a thread whose bucket pick doesn't
+    change during reclassify but which newly matches a tracker must still be
+    enqueued into process_task_updates. Uses a cursor-less user so
+    _inline_reload's full_sync_inbox is stubbed to contribute nothing (empty
+    all_ids/content_ids) — the enqueued id must come entirely from
+    _reclassify_all's new-link reporting."""
+    monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
+    _seed_user(session_factory, history_id=None)
+    ps = _drained_pubsub(fake_redis, "user:u1")
+
+    db = session_factory()
+    thread = inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="gT1",
+                                      subject="hi", bucket_id="same-bucket")
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="gT1", gmail_message_id="gM1",
+        gmail_internal_date=1, gmail_history_id="1",
+        to_addr=None, from_addr="a@b.com", body_preview="prev",
+        body_text="full body text",
+    )
+    task = task_repo.create_task(db, user_id="u1", name="Tracker", goal="", criteria="",
+                                 state_schema=None)
+    db.commit()
+    task_id = task.id
+    thread_id = thread.id
+    db.close()
+
+    with patch("app.workers.tasks.gmail_sync.full_sync_inbox", return_value=([], [])), \
+         patch("app.workers.tasks.bucket_repo.list_active", return_value=[]), \
+         patch("app.workers.tasks.triage",
+               return_value=[("same-bucket", [(task_id, 90)])]):
+        tasks.reclassify_user_inbox.apply(args=["u1"])
+
+    msg = ps.get_message(timeout=1.0)
+    body = json.loads(msg["data"])
+    assert body["event"] == "threads_updated"
+    assert body["thread_ids"] == [thread_id]
+    # The freshly-created link (bucket unchanged) must still route to extraction.
+    assert stub_enqueue == [["u1", [thread_id]]]
+
+
 def test_enqueue_polls_purges_and_fans_out(fake_redis, monkeypatch):
     fake_redis.zadd("active_users", {"u1": 99999999999, "u2": 99999999999})
     enqueued: list[str] = []
@@ -352,7 +395,14 @@ def test_reclassify_all_writes_task_links_even_when_bucket_unchanged(session_fac
     """Task 5: link upserts must happen for every triage-returned
     (task_id, confidence) at/above TASK_LINK_CONFIDENCE on every reclassify
     run — independent of whether the thread's bucket pick changed. A thread's
-    relevance to a tracker can shift even when its bucket doesn't."""
+    relevance to a tracker can shift even when its bucket doesn't.
+
+    Fix (linked-but-never-extracted): a freshly-written link must ALSO be
+    reported back in _reclassify_all's return value even though the bucket
+    didn't change — reclassify_user_inbox's process_task_updates enqueue is
+    fed entirely from this return value (plus the inline-reload's content
+    ids), so a thread that's reported here is the only way it ever gets an
+    extraction pass."""
     db = session_factory()
     user = User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc))
     db.add(user)
@@ -373,10 +423,12 @@ def test_reclassify_all_writes_task_links_even_when_bucket_unchanged(session_fac
     with patch("app.workers.tasks.bucket_repo.list_active", return_value=[]), \
          patch("app.workers.tasks.triage",
                return_value=[("same-bucket", [(task.id, 90)])]) as mock_triage:
-        changed = tasks._reclassify_all(db, user=user)
+        touched = tasks._reclassify_all(db, user=user)
 
     mock_triage.assert_called_once()
-    assert changed == []  # bucket unchanged -> not reported as changed
+    # bucket unchanged, but the link is BRAND NEW (upsert_link returned a row)
+    # -> must be reported so it reaches process_task_updates.
+    assert touched == [thread.id]
     link = task_repo.get_link(db, task_id=task.id, thread_id=thread.id)
     assert link is not None
     assert link.origin == "llm"

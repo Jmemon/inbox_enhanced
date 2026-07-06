@@ -315,6 +315,12 @@ def extend_inbox_history_task(user_id: str, before_internal_date_ms: int) -> Non
     extend_complete event with the list of internal thread ids and a 'more' flag
     that is True when Gmail returned the full page of 200 stubs (meaning there
     are likely even older threads available).
+
+    Also enqueues process_task_updates for any thread extend_inbox_history
+    freshly linked to a tracker (new_link_ids) — without this, a thread pulled
+    in via "load more history" that matches a tracker would sit
+    attached-but-never-extracted until an unrelated future sync happened to
+    re-touch it.
     """
     if not sync_lock.acquire(user_id):
         log.info("extend_task: user=%s syncing already, skip", user_id)
@@ -325,11 +331,13 @@ def extend_inbox_history_task(user_id: str, before_internal_date_ms: int) -> Non
         if user is None:
             return
         log.info("extend_task: user=%s starting before_ms=%d", user_id, before_internal_date_ms)
-        ids, more = gmail_sync.extend_inbox_history(
+        ids, more, new_link_ids = gmail_sync.extend_inbox_history(
             db, user=user, before_internal_date_ms=before_internal_date_ms,
         )
         log.info("extend_task: user=%s upserted %d ids, more=%s; publishing", user_id, len(ids), more)
         _publish(user_id, "extend_complete", {"thread_ids": ids, "more": more})
+        if new_link_ids:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, new_link_ids], countdown=0)
     finally:
         db.close()
         sync_lock.release(user_id)
@@ -465,6 +473,15 @@ def _reclassify_all(db, *, user) -> list[str]:
     (task_id, confidence) at/above TASK_LINK_CONFIDENCE — a thread's relevance
     to a tracker can shift even when its bucket doesn't, and upsert_link's
     sticky rule protects any existing origin='user' row regardless.
+
+    Fix (linked-but-never-extracted): returns the UNION of bucket-changed ids
+    AND freshly-linked ids (upsert_link returned a non-None row), not just
+    bucket-changed ids. Before this fix, a thread whose bucket pick stayed the
+    same but which newly matched a tracker (upsert_link created/updated its
+    row) never made it into this function's return value — and
+    reclassify_user_inbox's process_task_updates enqueue is fed entirely from
+    this return value plus the inline-reload's content ids, so that thread
+    would sit linked but never get an extraction pass.
     """
     triples = inbox_repo.load_parsed_threads(db, user_id=user.id)
     if not triples:
@@ -480,22 +497,28 @@ def _reclassify_all(db, *, user) -> list[str]:
     settings = get_settings()
     triage_results = triage(threads, buckets, trackers, current, user_id=user.id)
 
-    changed: list[str] = []
+    touched: list[str] = []
     for (internal_id, old_bucket, _), (new_bucket, task_hits) in zip(triples, triage_results):
+        linked = False
         for task_id, confidence in task_hits:
             if confidence >= settings.task_link_confidence:
-                task_repo.upsert_link(
+                link = task_repo.upsert_link(
                     db, task_id=task_id, thread_id=internal_id, user_id=user.id,
                     origin="llm", state="attached", confidence=confidence,
                 )
-        if new_bucket == old_bucket:
-            continue
-        thread_row = db.get(InboxThread, internal_id)
-        if thread_row is None:
-            continue
-        thread_row.bucket_id = new_bucket
-        changed.append(internal_id)
+                if link is not None:
+                    linked = True
+
+        bucket_actually_changed = False
+        if new_bucket != old_bucket:
+            thread_row = db.get(InboxThread, internal_id)
+            if thread_row is not None:
+                thread_row.bucket_id = new_bucket
+                bucket_actually_changed = True
+
+        if bucket_actually_changed or linked:
+            touched.append(internal_id)
     db.commit()
-    log.info("reclassify._reclassify_all: user=%s %d threads moved buckets",
-             user.id, len(changed))
-    return changed
+    log.info("reclassify._reclassify_all: user=%s %d threads touched (bucket-changed or freshly linked)",
+             user.id, len(touched))
+    return touched
