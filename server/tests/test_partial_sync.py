@@ -403,6 +403,69 @@ def test_full_sync_reconciles_instead_of_wiping(db):
         InboxThread.user_id == u.id)).scalar_one() >= 4
 
 
+def test_full_sync_tolerates_per_thread_fetch_failure(db):
+    """One stub's threads.get() raising (transient 500/network blip) must not
+    500 the whole bootstrap sync, and — critically — must not cause the
+    reconcile step to wrongly archive that stub's already-stored thread. A
+    fetch failure means "we don't know its state this round," not "gmail no
+    longer lists it"; the fix folds failed ids into the reconcile-archive
+    exclusion set alongside listed_gmail_ids."""
+    u = _seed_user(db, history_id=None)
+
+    # g-flaky is already stored with activity (7000) inside the window this
+    # listing will cover ([6000, 7000] once gT_ok's fixture is parsed) — if
+    # its failed fetch were treated as "gmail dropped it" (i.e. excluded from
+    # window_dates/listed_gmail_ids only), the reconcile-archive filter
+    # (last_activity_at >= window_min AND gmail_id not in listed) would sweep
+    # it up and wrongly archive a thread that's still very much in the inbox.
+    inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="g-flaky", subject="flaky", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="g-flaky", gmail_message_id="m-flaky",
+        gmail_internal_date=7000, gmail_history_id="700",
+        to_addr=None, from_addr=None, body_preview="flaky",
+    )
+    db.commit()
+
+    listing = {"threads": [{"id": "gT_ok"}, {"id": "g-flaky"}]}
+
+    def _fake_threads_get(*, userId, id, format):
+        if id == "g-flaky":
+            inner = MagicMock()
+            inner.execute.side_effect = RuntimeError("transient threads.get failure")
+            return inner
+        inner = MagicMock()
+        inner.execute.return_value = {
+            "id": "gT_ok",
+            "messages": [{
+                "id": "m_ok", "threadId": "gT_ok",
+                "internalDate": "6000", "historyId": "999",
+                "payload": {
+                    "mimeType": "text/plain",
+                    "headers": [{"name": "Subject", "value": "ok"}],
+                    "body": {"data": ""},
+                },
+            }],
+        }
+        return inner
+
+    gmail = MagicMock()
+    gmail.users().threads().list().execute.return_value = listing
+    gmail.users().threads().get.side_effect = _fake_threads_get
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        ids = gmail_sync.full_sync_inbox(db, user=u)  # must not raise
+
+    ok_row = db.execute(select(InboxThread).where(
+        InboxThread.user_id == "u1", InboxThread.gmail_id == "gT_ok")).scalar_one()
+    assert ok_row.id in ids  # the other thread still ingests fine
+
+    flaky_row = db.execute(select(InboxThread).where(
+        InboxThread.user_id == "u1", InboxThread.gmail_id == "g-flaky")).scalar_one()
+    assert flaky_row.is_archived is False, \
+        "a fetch failure must not be treated as 'gmail no longer lists this thread'"
+    assert flaky_row.id not in ids  # untouched: neither upserted nor archived
+
+
 def test_full_sync_window_ignores_messageless_threads(db):
     """A malformed listed thread with zero messages must not collapse the
     reconcile window to 0. parser.assemble_thread returns recent_internal_date=0

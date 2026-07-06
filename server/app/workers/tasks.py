@@ -230,18 +230,29 @@ def _read_candidates(db, *, user_id: str, exclude: set[str], limit: int) -> list
     Returns a list of dicts with keys: thread_id, gmail_thread_id, subject,
     sender, body_preview. Overfetches to account for excluded threads so the
     final pool is as close to `limit` as possible.
+
+    Sorts by InboxThread.last_activity_at (the denormalized pointer
+    inbox_repo.recompute_thread_pointers maintains and list_threads already
+    sorts by) instead of the joined recent-message's gmail_internal_date —
+    the two can diverge (e.g. a thread's most-recent message was soft-deleted
+    and pointers recomputed) and last_activity_at is the source of truth
+    everywhere else threads are ordered. Also excludes is_archived threads,
+    matching list_threads' default view, so a bucket-draft preview never
+    scores threads the user no longer sees in their inbox. The join against
+    InboxMessage is kept (not dropped) purely to pull from_addr/body_preview
+    for the still-current recent_message_id.
     """
     stmt = (
         select(InboxThread.id, InboxThread.gmail_id, InboxThread.subject,
-               InboxMessage.from_addr, InboxMessage.body_preview, InboxMessage.gmail_internal_date)
+               InboxMessage.from_addr, InboxMessage.body_preview)
         .outerjoin(InboxMessage, InboxMessage.id == InboxThread.recent_message_id)
-        .where(InboxThread.user_id == user_id)
-        .order_by(InboxMessage.gmail_internal_date.desc().nulls_last())
+        .where(InboxThread.user_id == user_id, InboxThread.is_archived == False)  # noqa: E712
+        .order_by(InboxThread.last_activity_at.desc().nulls_last())
         .limit(limit + len(exclude))  # fetch extra so excludes don't shrink the pool
     )
     out = []
     for row in db.execute(stmt).all():
-        tid, gid, subject, sender, preview, _date = row
+        tid, gid, subject, sender, preview = row
         if tid in exclude:
             continue
         out.append({"thread_id": tid, "gmail_thread_id": gid, "subject": subject,

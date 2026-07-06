@@ -69,6 +69,14 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
     _ensure_initialized()
     sem: asyncio.Semaphore = _state["sem"]
     client: AsyncOpenAI = _state["client"]
+    # The API call itself is the only part that needs to be concurrency-bounded
+    # (LLM_CONCURRENCY caps in-flight OpenRouter requests). The metrics write is
+    # a Postgres round-trip on a small default pool (5+10 connections) that is
+    # smaller than LLM_CONCURRENCY (default 16) — doing it inside `async with
+    # sem:` would let a slow/hung DB write hold a semaphore slot and throttle
+    # LLM throughput for unrelated in-flight calls. So: do the API call under
+    # the semaphore, capture everything needed for the metrics row into local
+    # `fields`/`content`, release the semaphore, then record exactly once.
     async with sem:
         t0 = time.monotonic()
         try:
@@ -85,17 +93,16 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
                 extra_body={"usage": {"include": True}},
             )
             duration_ms = int((time.monotonic() - t0) * 1000)
-            # Extract content BEFORE recording metrics: a malformed 200 (empty
-            # `choices`, or `message` None — a real OpenRouter edge case for
-            # content-filtered completions) must raise here and fall through
-            # to the `except` below, not after a success row is already
-            # recorded — otherwise one real call double-counts as both a
-            # success and an error row in llm_calls.
+            # Extract content BEFORE finalizing metrics fields: a malformed 200
+            # (empty `choices`, or `message` None — a real OpenRouter edge case
+            # for content-filtered completions) must raise here and fall
+            # through to the `except` below, not after success fields are
+            # already finalized — otherwise one real call double-counts as
+            # both a success and an error row in llm_calls.
             content = resp.choices[0].message.content or ""
             usage = getattr(resp, "usage", None)
             details = getattr(usage, "prompt_tokens_details", None) if usage else None
-            await asyncio.to_thread(
-                metrics.record_call,
+            fields = dict(
                 stage=stage, model=model, user_id=user_id,
                 input_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
                 output_tokens=getattr(usage, "completion_tokens", None) if usage else None,
@@ -103,15 +110,17 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
                 cost_usd=getattr(usage, "cost", None) if usage else None,
                 duration_ms=duration_ms, outcome="success",
             )
-            return content
         except Exception:
             duration_ms = int((time.monotonic() - t0) * 1000)
             log.exception("openrouter chat.completions.create failed")
-            await asyncio.to_thread(
-                metrics.record_call, stage=stage, model=model, user_id=user_id,
+            content = ""
+            fields = dict(
+                stage=stage, model=model, user_id=user_id,
                 duration_ms=duration_ms, outcome="error",
             )
-            return ""
+    # Outside the semaphore: exactly one record per call, on either path.
+    await asyncio.to_thread(metrics.record_call, **fields)
+    return content
 
 
 def reset_for_tests() -> None:

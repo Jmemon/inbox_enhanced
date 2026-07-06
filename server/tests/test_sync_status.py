@@ -62,6 +62,19 @@ def test_mark_then_get_roundtrip(fake_redis):
     assert isinstance(got, int) and got > 0
 
 
+def test_mark_sets_a_self_expiring_ttl(fake_redis):
+    """mark() must carry a TTL so a user who stops syncing entirely (account
+    abandoned/deleted, Gmail access revoked) doesn't leave an unbounded
+    last_sync:{uid} key in Redis forever. Refreshed on every mark(), so an
+    active user's key effectively never expires in practice."""
+    from app.realtime import last_sync
+
+    last_sync.mark("u1")
+    ttl = fake_redis.ttl(last_sync._key("u1"))
+    assert ttl > 0
+    assert ttl == last_sync.TTL_SECONDS
+
+
 def test_sync_status_endpoint_shape(authed, fake_redis):
     # user seeded WITHOUT gmail_last_history_id; no mark() called.
     c, _TestSession = authed
