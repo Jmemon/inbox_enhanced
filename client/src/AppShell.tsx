@@ -1,7 +1,6 @@
-import { useEffect } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from './auth/useAuth'
-import { subscribeSse } from './lib/sse'
+import { InboxProvider } from './state/InboxProvider'
 
 const navStyle = ({ isActive }: { isActive: boolean }) => ({
   fontSize: 13, padding: '4px 10px', borderRadius: 6, textDecoration: 'none',
@@ -11,12 +10,6 @@ const navStyle = ({ isActive }: { isActive: boolean }) => ({
 
 export function AppShell() {
   const { state, signOut } = useAuth()
-
-  // Pin the SSE singleton open for the life of the authed shell. lib/sse.ts
-  // closes the EventSource when its LAST handler unsubscribes; without this,
-  // navigating to a route that mounts no inbox hooks would close the stream,
-  // deregister the user from active_users, and stop beat polling.
-  useEffect(() => subscribeSse(() => {}), [])
 
   if (state.status !== 'authed') return null
   return (
@@ -37,7 +30,9 @@ export function AppShell() {
           <button onClick={signOut} style={{ fontSize: 13, padding: '6px 10px' }}>sign out</button>
         </div>
       </header>
-      <Outlet />
+      <InboxProvider>
+        <Outlet />
+      </InboxProvider>
     </div>
   )
 }

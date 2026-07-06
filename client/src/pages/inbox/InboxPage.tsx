@@ -1,23 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useInbox } from './useInbox'
-import { useInboxSse } from './useInboxSse'
 import { InboxList } from './InboxList'
-import { useBuckets } from '../buckets/useBuckets'
 import { SecondaryHeader } from '../buckets/SecondaryHeader'
 import { ViewBucketsModal } from '../buckets/ViewBucketsModal'
 import { NewBucketModal } from '../buckets/NewBucketModal'
 import { useInboxSearch } from '../search/useInboxSearch'
 import { SearchBar } from '../search/SearchBar'
+import { useInboxStore } from '../../state/InboxProvider'
 
 
 export default function InboxPage() {
-  const { buckets, byId: bucketsById, create, rename, softDelete } = useBuckets()
-  const [filterSelection, setFilterSelection] = useState<Set<string> | null>(null)
+  const { buckets, inbox, filterSelection, setFilterSelection } = useInboxStore()
   const [showView, setShowView] = useState(false)
   const [showNew, setShowNew] = useState(false)
-
-  const inbox = useInbox({ buckets, filterSelection })
-  useInboxSse({ onApply: inbox.applyThreadUpdates, snapshot: inbox.snapshot })
 
   const search = useInboxSearch()
 
@@ -28,13 +22,13 @@ export default function InboxPage() {
   // 60s + 150s. resync() doesn't toggle the loading flag, so it doesn't flash
   // the list — it just merges the current server state into the display layer.
   const createWithWatchdog = useCallback(async (
-    body: Parameters<typeof create>[0],
+    body: Parameters<typeof buckets.create>[0],
   ) => {
-    const bucket = await create(body)
+    const bucket = await buckets.create(body)
     setTimeout(() => { void inbox.resync() }, 60_000)
     setTimeout(() => { void inbox.resync() }, 150_000)
     return bucket
-  }, [create, inbox])
+  }, [buckets.create, inbox])
 
   // Hydrate the current page when navigating to a page whose thread ids are
   // not yet in the display layer.
@@ -45,7 +39,7 @@ export default function InboxPage() {
       {/* SecondaryHeader owns the reload button, filter dropdown, bucket controls,
           and (right-aligned) the pagination row for the inbox list. */}
       <SecondaryHeader
-        buckets={buckets} filterSelection={filterSelection}
+        buckets={buckets.buckets} filterSelection={filterSelection}
         onFilterChange={setFilterSelection}
         onViewBuckets={() => setShowView(true)}
         onNewBucket={() => setShowNew(true)}
@@ -60,13 +54,13 @@ export default function InboxPage() {
         {search.results !== null ? (
           <>
             {search.error && <div style={{ color: '#8a1c25', padding: 16 }}>search error: {search.error}</div>}
-            <InboxList threads={search.results} bucketsById={bucketsById} />
+            <InboxList threads={search.results} bucketsById={buckets.byId} />
           </>
         ) : (
           <>
             {inbox.error && <div style={{ color: '#8a1c25', padding: 16 }}>error: {inbox.error}</div>}
             {!inbox.error && inbox.loading && <div style={{ padding: 24 }}>loading…</div>}
-            {!inbox.loading && <InboxList threads={inbox.pageThreads} bucketsById={bucketsById} />}
+            {!inbox.loading && <InboxList threads={inbox.pageThreads} bucketsById={buckets.byId} />}
             {inbox.more === false && (
               <div style={{ padding: 12, fontSize: 12, color: '#888', textAlign: 'center' }}>
                 (end of inbox history)
@@ -76,8 +70,8 @@ export default function InboxPage() {
         )}
       </main>
 
-      {showView && <ViewBucketsModal buckets={buckets} onClose={() => setShowView(false)}
-                                       onRename={rename} onDelete={softDelete} />}
+      {showView && <ViewBucketsModal buckets={buckets.buckets} onClose={() => setShowView(false)}
+                                       onRename={buckets.rename} onDelete={buckets.softDelete} />}
       {showNew && <NewBucketModal onClose={() => setShowNew(false)} onSave={createWithWatchdog} />}
     </>
   )
