@@ -8,6 +8,15 @@ captured via `app.workers.tasks._publish` (task_engine_tasks late-imports it
 at call time to avoid the tasks<->task_engine_tasks import cycle — see that
 module's docstring — so patching the attribute on `app.workers.tasks` is what
 the late import actually picks up).
+
+Task 9's `backfill_task` tests are appended at the bottom of this file
+(rather than a new `test_backfill.py`) since they reuse every fixture above
+verbatim — the only new machinery is `_seed_user`/`_seed_backfill_thread`
+(multiple threads under one user, explicit `last_activity_at`) and
+`_backfill_llm_fake` (one `call_messages` fake that branches on
+`kwargs["stage"]` to serve either a canned triage or extraction response,
+since backfill_task's triage phase and extraction phase both funnel through
+that same patched call point).
 """
 
 import os
@@ -24,7 +33,7 @@ from app.config import get_settings
 from app.db.models import Base, InboxMessage, InboxThread, User
 from app.llm import client as llm_client
 from app.task_engine import repo as task_repo
-from app.task_engine.schema import PipelineSpec, TaskStateSchema
+from app.task_engine.schema import AttributeSpec, EntitySpec, PipelineSpec, TaskStateSchema
 from app.workers import task_engine_tasks
 
 USER_ID = "u1"
@@ -470,3 +479,302 @@ def test_extract_for_thread_skips_non_tracker_kind(session_factory, fake_redis, 
 
     assert call_count == 0
     assert captured == []
+
+
+# ---------------------------------------------------------------------------
+# Task 9: backfill_task
+# ---------------------------------------------------------------------------
+
+
+def _seed_user(session_factory, *, user_id=USER_ID):
+    db = session_factory()
+    db.add(User(id=user_id, email=f"{user_id}@x.com", created_at=datetime.now(timezone.utc)))
+    db.commit()
+    db.close()
+
+
+def _seed_backfill_thread(
+    session_factory, *, user_id=USER_ID, thread_id, gmail_thread_id, message_gmail_id,
+    body_text, last_activity_at, is_archived=False,
+):
+    """Seed one thread + its one message for backfill tests.
+
+    Unlike `_seed_user_thread_message` (which also creates the User row),
+    this assumes the user already exists -- backfill tests seed several
+    threads under one shared user via `_seed_user` -- and sets
+    `last_activity_at` explicitly, since the ascending-extraction-order test
+    needs distinct, controlled values (recall `_seed_user_thread_message`
+    never sets it at all)."""
+    db = session_factory()
+    db.add(InboxThread(
+        id=thread_id, user_id=user_id, gmail_id=gmail_thread_id, subject="Re: application",
+        bucket_id=None, recent_message_id=None, is_archived=is_archived,
+        last_activity_at=last_activity_at,
+    ))
+    db.add(InboxMessage(
+        id=f"im-{message_gmail_id}", thread_id=thread_id, user_id=user_id,
+        gmail_id=message_gmail_id, gmail_thread_id=gmail_thread_id,
+        gmail_internal_date=last_activity_at, gmail_history_id="h1",
+        to_addr="me@x.com", from_addr="hr@corp.example",
+        body_preview=body_text[:150], body_text=body_text,
+    ))
+    db.commit()
+    db.close()
+
+
+def _backfill_llm_fake(*, tracker_name, marker_confidences, marker_extractions):
+    """One `call_messages` fake covering BOTH of backfill_task's LLM call
+    shapes -- classify.triage()'s per-candidate relevance call (stage=
+    "classify") and engine.extract_for_pair's per-thread extraction call
+    (stage="extract") -- since both funnel through the same patched
+    `llm_client.call_messages` attribute.
+
+    Threads are told apart by a marker substring embedded in their
+    body_text, which both `thread_to_string` (triage) and
+    `thread_to_string_with_ids` (extraction) embed verbatim into the
+    rendered user message. `marker_confidences` maps marker -> confidence
+    (None means "no relevant_tasks entry at all", i.e. a clean non-match).
+    `marker_extractions` maps marker -> the canned extraction JSON string
+    returned for that thread's extract call (threads not present there fall
+    back to "[]", i.e. no proposals)."""
+    async def _fake(**kwargs):
+        stage = kwargs.get("stage")
+        user_msg = kwargs.get("user", "")
+        if stage == "classify":
+            for marker, confidence in marker_confidences.items():
+                if marker in user_msg:
+                    if confidence is None:
+                        return json.dumps({"bucket_name": None, "relevant_tasks": []})
+                    return json.dumps({
+                        "bucket_name": None,
+                        "relevant_tasks": [{"name": tracker_name, "confidence": confidence}],
+                    })
+            return json.dumps({"bucket_name": None, "relevant_tasks": []})
+        if stage == "extract":
+            for marker, response in marker_extractions.items():
+                if marker in user_msg:
+                    return response
+            return "[]"
+        return "[]"
+    return _fake
+
+
+def _multi_entity_schema_dict() -> dict:
+    """Non-singleton schema (named 'company' entities with a freeform string
+    attribute) -- used by the ascending-order test below because plain
+    'stage' transitions are validator-guaranteed to converge to whichever
+    target is furthest along the pipeline REGARDLESS of processing order
+    (forward moves always apply, backward moves always defer to
+    pending_review -- see transitions.py step 3), which makes 'stage' useless
+    for proving chronological processing order. A plain attribute field has
+    no such ordering guard: whichever proposal is applied LAST simply wins,
+    so it's the only field kind that can actually distinguish "processed
+    ascending" from "processed in the wrong order."""
+    return TaskStateSchema(
+        version=1,
+        entity=EntitySpec(noun="company", attributes=[AttributeSpec(key="status_note", type="string")]),
+        pipeline=PipelineSpec(stages=["todo"], terminal=["done"]),
+    ).model_dump()
+
+
+def test_backfill_task_links_matches_and_extracts_ascending_final_state_reflects_later_message(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory, state_schema=_multi_entity_schema_dict())
+
+    # THREAD_A is older (last_activity_at=1_000_000), THREAD_B is newer
+    # (2_000_000) -- extraction must run A then B for B's value to win.
+    _seed_backfill_thread(
+        session_factory, thread_id="bfA", gmail_thread_id="gbfA", message_gmail_id="mA",
+        body_text="MARKER-A Acme Corp status update: applied for the role.",
+        last_activity_at=1_000_000,
+    )
+    _seed_backfill_thread(
+        session_factory, thread_id="bfB", gmail_thread_id="gbfB", message_gmail_id="mB",
+        body_text="MARKER-B Acme Corp status update: interview scheduled next week.",
+        last_activity_at=2_000_000,
+    )
+
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker",
+        marker_confidences={"MARKER-A": 90, "MARKER-B": 90},
+        marker_extractions={
+            "MARKER-A": json.dumps([{
+                "entity": "Acme Corp", "is_new_entity": True, "field": "status_note",
+                "new_value": "Applied", "evidence_quote": "applied for the role",
+                "message_id": "mA", "confidence": 90,
+            }]),
+            "MARKER-B": json.dumps([{
+                "entity": "Acme Corp", "is_new_entity": True, "field": "status_note",
+                "new_value": "Interview scheduled", "evidence_quote": "interview scheduled next week",
+                "message_id": "mB", "confidence": 90,
+            }]),
+        },
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+
+    db = session_factory()
+    link_a = task_repo.get_link(db, task_id=task_id, thread_id="bfA")
+    link_b = task_repo.get_link(db, task_id=task_id, thread_id="bfB")
+    assert link_a is not None and link_a.state == "attached" and link_a.origin == "llm"
+    assert link_b is not None and link_b.state == "attached" and link_b.origin == "llm"
+
+    entities = task_repo.list_entities(db, task_id=task_id)
+    assert len(entities) == 1  # both proposals resolved to the same "Acme Corp" entity
+    # Ascending (A then B) means B's proposal is applied LAST -- if backfill
+    # extracted in the wrong order, this would read "Applied" (A's value)
+    # instead.
+    assert entities[0].state["status_note"] == "Interview scheduled"
+
+    events = task_repo.list_events(db, task_id=task_id, status="applied")
+    assert len(events) == 2  # both applied -- plain attribute field, no stage-ordering guard
+
+
+def test_backfill_task_publishes_progress_every_interval_and_terminal_done(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)  # default singleton schema, name "Job tracker"
+
+    # Small batch/interval so 4 seeded threads cross the progress cadence
+    # twice without needing 50+ real rows.
+    monkeypatch.setattr(task_engine_tasks, "BACKFILL_TRIAGE_BATCH", 2)
+    monkeypatch.setattr(task_engine_tasks, "BACKFILL_PROGRESS_INTERVAL", 2)
+
+    # Descending last_activity_at so list_threads' recency order is
+    # deterministic: candidate batches are [M1, N1] then [M2, N2].
+    _seed_backfill_thread(session_factory, thread_id="m1", gmail_thread_id="gm1",
+                          message_gmail_id="mm1", body_text="MARKER-M1 relevant thread.",
+                          last_activity_at=4000)
+    _seed_backfill_thread(session_factory, thread_id="n1", gmail_thread_id="gn1",
+                          message_gmail_id="mn1", body_text="MARKER-N1 unrelated thread.",
+                          last_activity_at=3000)
+    _seed_backfill_thread(session_factory, thread_id="m2", gmail_thread_id="gm2",
+                          message_gmail_id="mm2", body_text="MARKER-M2 relevant thread.",
+                          last_activity_at=2000)
+    _seed_backfill_thread(session_factory, thread_id="n2", gmail_thread_id="gn2",
+                          message_gmail_id="mn2", body_text="MARKER-N2 unrelated thread.",
+                          last_activity_at=1000)
+
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker",
+        marker_confidences={
+            "MARKER-M1": 90, "MARKER-M2": 90, "MARKER-N1": None, "MARKER-N2": None,
+        },
+        marker_extractions={},  # extraction phase is a no-op -- only progress matters here
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+
+    progress = [(e, p) for _, e, p in captured if e == "task_backfill_progress"]
+    updated = [(e, p) for _, e, p in captured if e == "task_updated"]
+
+    assert [p for _, p in progress] == [
+        {"task_id": task_id, "scanned": 2, "matched": 1, "done": False},
+        {"task_id": task_id, "scanned": 4, "matched": 2, "done": False},
+        {"task_id": task_id, "scanned": 4, "matched": 2, "done": True},
+    ]
+    assert len(updated) == 1  # exactly one final task_updated, after the terminal progress
+    assert captured[-1][1] == "task_updated"  # task_updated is always last
+
+
+def test_backfill_task_rerun_is_idempotent_and_publish_counts_match(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _seed_backfill_thread(
+        session_factory, thread_id="bf1", gmail_thread_id="g1", message_gmail_id="m1",
+        body_text="MARKER-1 evidence: moved to in_progress review.", last_activity_at=1000,
+    )
+
+    settings = get_settings()
+    high_confidence = min(100, settings.task_apply_confidence + 10)
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker",
+        marker_confidences={"MARKER-1": 90},
+        marker_extractions={
+            "MARKER-1": _extraction_response(
+                confidence=high_confidence, message_id="m1",
+                evidence="moved to in_progress review",
+            ),
+        },
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+    first_publishes = list(captured)
+    captured.clear()
+
+    db = session_factory()
+    events_after_first = task_repo.list_events(db, task_id=task_id)
+    assert len(events_after_first) == 1
+    links_after_first = task_repo.list_attached_thread_ids(db, task_id=task_id)
+    assert links_after_first == {"bf1"}
+
+    # Re-run with the exact same input.
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+    second_publishes = list(captured)
+
+    db2 = session_factory()
+    events_after_second = task_repo.list_events(db2, task_id=task_id)
+    assert len(events_after_second) == 1  # no duplicate event
+    links_after_second = task_repo.list_attached_thread_ids(db2, task_id=task_id)
+    assert links_after_second == {"bf1"}  # no duplicate link row either
+
+    # Backfill is a one-shot job the wizard waits on -- it always reports a
+    # definitive completion, so BOTH runs publish the same shape (unlike
+    # process_task_updates' skip-on-no-change suppression for a sync tick).
+    assert [e for _, e, _ in first_publishes] == [e for _, e, _ in second_publishes] == [
+        "task_backfill_progress", "task_updated",
+    ]
+    assert first_publishes[0][2] == second_publishes[0][2] == {
+        "task_id": task_id, "scanned": 1, "matched": 1, "done": True,
+    }
+    assert first_publishes[1][2] == second_publishes[1][2]  # same version/pending_count
+
+
+def test_backfill_task_never_reattaches_user_detached_link(session_factory, fake_redis, monkeypatch):
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _seed_backfill_thread(
+        session_factory, thread_id="bfD", gmail_thread_id="gD", message_gmail_id="mD",
+        body_text="MARKER-D strong evidence this thread matches the tracker.",
+        last_activity_at=500,
+    )
+
+    # User explicitly detached this thread from the tracker before backfill
+    # ever ran (e.g. attached automatically once, then the user removed it).
+    db = session_factory()
+    task_repo.upsert_link(db, task_id=task_id, thread_id="bfD", user_id=USER_ID,
+                          origin="user", state="detached")
+    db.commit()
+    db.close()
+
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker",
+        marker_confidences={"MARKER-D": 95},  # high confidence -- would normally link
+        marker_extractions={"MARKER-D": _extraction_response(confidence=90, message_id="mD")},
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+
+    db2 = session_factory()
+    link = task_repo.get_link(db2, task_id=task_id, thread_id="bfD")
+    assert link is not None
+    assert link.origin == "user" and link.state == "detached"  # never re-attached
+
+    assert task_repo.list_events(db2, task_id=task_id) == []  # never extracted either
+
+    # Progress still reports scanned=1 but matched=0 -- the sticky rule
+    # blocked the attach, so this thread never counted as matched.
+    progress = [p for _, e, p in captured if e == "task_backfill_progress" and p["done"]]
+    assert progress == [{"task_id": task_id, "scanned": 1, "matched": 0, "done": True}]

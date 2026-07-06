@@ -32,6 +32,7 @@ from app.config import get_settings
 from app.db.models import User
 from app.db.session import SessionLocal as _AppSessionLocal
 from app.inbox import inbox_repo, search_repo
+from app.llm import classify
 from app.llm import client as llm_client
 from app.llm.prompts import propose_task
 from app.task_engine import draft_cache
@@ -452,5 +453,213 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
         # rationale in workers/tasks.py.
         draft_cache.store_result(draft_id, user_id=user_id, payload=payload)
         _publish(user_id, "task_draft_ready", {"draft_id": draft_id})
+    finally:
+        db.close()
+
+
+# --- backfill_task constants ---
+# Cap on unique candidate threads collected across all keyword_probes' FTS
+# hits -- same shape as PROPOSE_CANDIDATE_CAP, just ~8x wider: backfill scans
+# a brand-new tracker's entire history once at creation time (not a cheap
+# draft preview), so a much wider net is worth the extra LLM calls.
+BACKFILL_PROBE_CANDIDATE_CAP = 500
+# Per-probe search_threads() limit feeding the cap above.
+BACKFILL_SEARCH_LIMIT_PER_PROBE = 100
+# Newest-N threads unioned on top of the FTS hits (include_archived=True --
+# an archived thread is still task history, e.g. a job-application thread
+# archived after applying), so a tracker whose keyword_probes underperform
+# still sees recent traffic.
+BACKFILL_RECENCY_LIMIT = 200
+# Threads per classify.triage() call -- bounds each round-trip's asyncio
+# fan-out. 25 evenly divides BACKFILL_PROGRESS_INTERVAL below, so a progress
+# publish lands on a clean batch boundary whenever load_parsed_threads
+# doesn't drop any candidate out of a batch.
+BACKFILL_TRIAGE_BATCH = 25
+# Publish task_backfill_progress after at least this many threads have been
+# scanned since the last publish (a running remainder, not a strict multiple
+# check -- see the loop below -- so a batch that lands off-boundary because
+# load_parsed_threads dropped a thread still triggers a timely publish).
+BACKFILL_PROGRESS_INTERVAL = 50
+
+
+@celery_app.task(name="app.workers.task_engine_tasks.backfill_task")
+def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None = None) -> None:
+    """Run a newly created tracker over a user's stored history.
+
+    Two phases, in order:
+
+    1. Triage phase. Candidate pool = FTS union over `keyword_probes`
+       (`search_repo.search_threads`, capped at BACKFILL_PROBE_CANDIDATE_CAP
+       unique threads across all probes) unioned with the newest
+       BACKFILL_RECENCY_LIMIT threads (`inbox_repo.list_threads(...,
+       include_archived=True)`). Both sources use include_archived=True --
+       backfill's whole point is to scan everything stored, not just what's
+       currently in the live inbox view.
+
+       Candidates are triaged in batches of BACKFILL_TRIAGE_BATCH via
+       `classify.triage()`, called with ONLY this tracker in the tracker list
+       and `buckets=[]`. triage() always returns a bucket pick alongside
+       tracker relevance, but that pick is entirely ignored here -- never
+       written to thread.bucket_id or anywhere else. Backfill's only job is
+       tracker relevance; with buckets=[] the pick is always None anyway (see
+       classify._triage_one's no-fit fallthrough), so there's nothing
+       meaningful to write even if we wanted to.
+
+       A candidate whose confidence for this one tracker clears
+       `settings.task_link_confidence` is linked via
+       `repo.upsert_link(..., origin="llm", state="attached")`. upsert_link's
+       own sticky rule (an origin='user' row can never be downgraded by an
+       origin='llm' call) is ALL the protection a user-detached thread needs
+       here -- there is deliberately no extra "is this link user-owned?"
+       guard in this function; upsert_link simply returns None for that row
+       and this loop moves on, exactly as it would for any other no-op. A
+       thread only counts toward `matched` (and the extraction phase below)
+       when upsert_link actually returns a row.
+
+    2. Extraction phase. Every thread this run actually attached is
+       re-fetched and extracted via `extract_for_pair` in ASCENDING
+       `last_activity_at` order -- chronological order matters here in a way
+       it doesn't for `process_task_updates`' single-sync-tick batch: a fresh
+       tracker's pipeline (e.g. todo -> in_progress -> done) must replay a
+       thread's history oldest-first so later messages' transitions land on
+       top of earlier ones, not the reverse. Each thread is extracted +
+       committed independently, wrapped in its own try/except (log +
+       rollback + continue, same idiom `process_task_updates` uses per-task)
+       -- one thread's extraction blowing up must not abort the rest of a
+       possibly long-running backfill.
+
+    Progress: `task_backfill_progress` publishes every BACKFILL_PROGRESS_
+    INTERVAL threads scanned during phase 1 (`{"task_id", "scanned",
+    "matched", "done": False}`), a terminal one with `"done": True` once
+    phase 2 finishes, and exactly one final `task_updated` (fresh version +
+    pending_count, via `_publish_task_updated`) after that.
+
+    Idempotent by construction: re-running this task for the same task_id
+    re-derives the same candidate pool, `upsert_link` no-ops on rows already
+    at the target state, and extraction's own SELECT-first idempotency check
+    (`transitions.validate_and_stage` step 7) drops any proposal it's already
+    staged an event for -- a second run relinks nothing new and stages no
+    duplicate events; it still publishes progress + a terminal task_updated
+    (backfill is a one-shot job the wizard waits on, so it always reports a
+    definitive completion, unlike `process_task_updates`' skip-if-no-change
+    publish suppression for a periodic sync tick).
+    """
+    from app.workers.tasks import _publish
+
+    db = SessionLocal()
+    try:
+        task = task_repo.get_owned_task(db, user_id=user_id, task_id=task_id)
+        if (
+            task is None
+            or task.kind != "tracker"
+            or task.status != "active"
+            or task.state_schema is None
+        ):
+            log.info(
+                "backfill_task: task=%s not an active schema-bearing tracker, skipping",
+                task_id,
+            )
+            return
+
+        settings = get_settings()
+
+        # --- Candidate pool ---
+        seen: set[str] = set()
+        candidate_ids: list[str] = []
+        for probe in (keyword_probes or []):
+            if len(seen) >= BACKFILL_PROBE_CANDIDATE_CAP:
+                break
+            for thread in search_repo.search_threads(
+                db, user_id=user_id, q=probe, include_archived=True,
+                limit=BACKFILL_SEARCH_LIMIT_PER_PROBE,
+            ):
+                if thread.id in seen:
+                    continue
+                seen.add(thread.id)
+                candidate_ids.append(thread.id)
+                if len(seen) >= BACKFILL_PROBE_CANDIDATE_CAP:
+                    break
+        for thread in inbox_repo.list_threads(
+            db, user_id=user_id, limit=BACKFILL_RECENCY_LIMIT, offset=0,
+            include_archived=True,
+        ):
+            if thread.id in seen:
+                continue
+            seen.add(thread.id)
+            candidate_ids.append(thread.id)
+
+        # --- Triage phase ---
+        scanned = 0
+        last_published = 0
+        matched_thread_ids: set[str] = set()
+
+        for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
+            batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
+            # load_parsed_threads may drop an id with no usable (non-deleted)
+            # messages -- ordered_ids/parsed_list are derived from its
+            # OWN returned triples (not batch_ids) so triage()'s
+            # input-order-preserving output zips back up correctly.
+            triples = inbox_repo.load_parsed_threads(db, user_id=user_id, internal_ids=batch_ids)
+            if triples:
+                ordered_ids = [tid for tid, _, _ in triples]
+                parsed_list = [parsed for _, _, parsed in triples]
+                results = classify.triage(
+                    parsed_list, buckets=[], trackers=[task],
+                    current_bucket_ids=[None] * len(parsed_list), user_id=user_id,
+                )
+                for thread_id, (_, relevant_tasks) in zip(ordered_ids, results):
+                    if not relevant_tasks:
+                        continue
+                    # Only this one tracker was passed in, so relevant_tasks
+                    # has at most one entry.
+                    _, confidence = relevant_tasks[0]
+                    if confidence < settings.task_link_confidence:
+                        continue
+                    link = task_repo.upsert_link(
+                        db, task_id=task.id, thread_id=thread_id, user_id=user_id,
+                        origin="llm", state="attached", confidence=confidence,
+                    )
+                    if link is not None:
+                        matched_thread_ids.add(thread_id)
+                db.commit()
+
+            # scanned tracks progress through the whole candidate pool,
+            # including ids load_parsed_threads dropped -- those still
+            # represent forward progress for the wizard's progress bar.
+            scanned += len(batch_ids)
+            if scanned - last_published >= BACKFILL_PROGRESS_INTERVAL:
+                _publish(user_id, "task_backfill_progress", {
+                    "task_id": task_id, "scanned": scanned,
+                    "matched": len(matched_thread_ids), "done": False,
+                })
+                last_published = scanned
+
+        # --- Extraction phase: ascending last_activity_at ---
+        matched_threads = inbox_repo.get_threads_batch(
+            db, user_id=user_id, thread_ids=list(matched_thread_ids),
+        )
+        matched_threads.sort(key=lambda t: (t.last_activity_at is None, t.last_activity_at))
+
+        for thread in matched_threads:
+            try:
+                staged = extract_for_pair(
+                    db, task=task, thread_internal_id=thread.id, user_id=user_id,
+                )
+                if staged is None:
+                    continue
+                db.commit()
+            except Exception:
+                log.exception(
+                    "backfill_task: task=%s thread=%s extraction failed; continuing",
+                    task.id, thread.id,
+                )
+                db.rollback()
+                continue
+
+        _publish(user_id, "task_backfill_progress", {
+            "task_id": task_id, "scanned": scanned,
+            "matched": len(matched_thread_ids), "done": True,
+        })
+        _publish_task_updated(db, user_id=user_id, task=task)
     finally:
         db.close()
