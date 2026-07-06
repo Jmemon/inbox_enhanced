@@ -16,6 +16,7 @@ from app.api.auth import router as auth_router
 from app.api.buckets import router as buckets_router
 from app.api.gmail import router as gmail_router
 from app.api.inbox import router as inbox_router
+from app.api.search import router as search_router
 from app.api.sse import router as sse_router
 from app.config import get_settings
 from app.realtime import pubsub
@@ -43,6 +44,7 @@ app.include_router(auth_router)
 app.include_router(buckets_router)
 app.include_router(gmail_router)
 app.include_router(inbox_router)
+app.include_router(search_router)
 app.include_router(sse_router)
 
 
