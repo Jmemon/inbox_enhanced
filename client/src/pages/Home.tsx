@@ -7,6 +7,7 @@ import { useBuckets } from './buckets/useBuckets'
 import { SecondaryHeader } from './buckets/SecondaryHeader'
 import { ViewBucketsModal } from './buckets/ViewBucketsModal'
 import { NewBucketModal } from './buckets/NewBucketModal'
+import { searchInbox, type InboxThread } from '../lib/api'
 
 
 export default function Home() {
@@ -18,6 +19,26 @@ export default function Home() {
 
   const inbox = useInbox({ buckets, filterSelection })
   useInboxSse({ onApply: inbox.applyThreadUpdates, snapshot: inbox.snapshot })
+
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<InboxThread[] | null>(null)
+  const [searchError, setSearchError] = useState<string | null>(null)
+
+  // Debounced server search: /api/search (Postgres FTS). Empty query exits
+  // search mode and restores the normal inbox list.
+  useEffect(() => {
+    const q = searchQuery.trim()
+    if (!q) { setSearchResults(null); setSearchError(null); return }
+    const t = setTimeout(async () => {
+      try {
+        const r = await searchInbox(q)
+        setSearchResults(r.threads); setSearchError(null)
+      } catch (e: any) {
+        setSearchError(String(e?.message ?? e))
+      }
+    }, 300)
+    return () => clearTimeout(t)
+  }, [searchQuery])
 
   // Reclassify watchdog: POST /api/buckets enqueues reclassify_user_inbox,
   // which takes ~30-150s and publishes threads_updated when done. SSE
@@ -65,14 +86,39 @@ export default function Home() {
         onResync={inbox.resync}
       />
 
+      <div style={{ padding: '8px 24px', borderBottom: '1px solid #eee' }}>
+        <input
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="search your inbox…"
+          style={{ width: 360, maxWidth: '100%', padding: '6px 10px', fontSize: 14 }}
+        />
+        {searchResults !== null && (
+          <span style={{ marginLeft: 12, fontSize: 12, color: '#888' }}>
+            {searchResults.length} result{searchResults.length === 1 ? '' : 's'}
+            <button onClick={() => setSearchQuery('')}
+                    style={{ marginLeft: 8, fontSize: 12 }}>clear</button>
+          </span>
+        )}
+      </div>
+
       <main>
-        {inbox.error && <div style={{ color: '#8a1c25', padding: 16 }}>error: {inbox.error}</div>}
-        {!inbox.error && inbox.loading && <div style={{ padding: 24 }}>loading…</div>}
-        {!inbox.loading && <InboxList threads={inbox.pageThreads} bucketsById={bucketsById} />}
-        {inbox.more === false && (
-          <div style={{ padding: 12, fontSize: 12, color: '#888', textAlign: 'center' }}>
-            (end of inbox history)
-          </div>
+        {searchResults !== null ? (
+          <>
+            {searchError && <div style={{ color: '#8a1c25', padding: 16 }}>search error: {searchError}</div>}
+            <InboxList threads={searchResults} bucketsById={bucketsById} />
+          </>
+        ) : (
+          <>
+            {inbox.error && <div style={{ color: '#8a1c25', padding: 16 }}>error: {inbox.error}</div>}
+            {!inbox.error && inbox.loading && <div style={{ padding: 24 }}>loading…</div>}
+            {!inbox.loading && <InboxList threads={inbox.pageThreads} bucketsById={bucketsById} />}
+            {inbox.more === false && (
+              <div style={{ padding: 12, fontSize: 12, color: '#888', textAlign: 'center' }}>
+                (end of inbox history)
+              </div>
+            )}
+          </>
         )}
       </main>
 

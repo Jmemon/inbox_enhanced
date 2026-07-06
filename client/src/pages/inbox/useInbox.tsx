@@ -98,9 +98,21 @@ export function useInbox(opts: {
       }
     }
     if (accepted.length === 0) return
-    setDisplayLayer(prev => { const n = { ...prev }; for (const t of accepted) n[t.id] = t; return n })
+    // Archived threads (mirrored from Gmail) leave the list instead of merging.
+    const archived = accepted.filter(t => t.is_archived)
+    const live = accepted.filter(t => !t.is_archived)
+    if (archived.length > 0) {
+      const drop = new Set(archived.map(t => t.id))
+      for (const t of archived) delete lastInternalDate.current[t.id]
+      setDisplayLayer(prev => {
+        const n = { ...prev }; for (const t of archived) delete n[t.id]; return n
+      })
+      setIdLayer(prev => prev.filter(id => !drop.has(id)))
+    }
+    if (live.length === 0) return
+    setDisplayLayer(prev => { const n = { ...prev }; for (const t of live) n[t.id] = t; return n })
     setIdLayer(prev => {
-      const merged = new Set(prev); for (const t of accepted) merged.add(t.id)
+      const merged = new Set(prev); for (const t of live) merged.add(t.id)
       return [...merged].sort((a, b) =>
         (lastInternalDate.current[b] ?? 0) - (lastInternalDate.current[a] ?? 0))
     })

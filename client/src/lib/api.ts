@@ -41,6 +41,7 @@ export type InboxMessage = {
   from: string | null
   to: string | null
   body_preview: string | null
+  is_unread?: boolean
 }
 
 export type InboxThread = {
@@ -49,6 +50,7 @@ export type InboxThread = {
   subject: string | null
   bucket_id: string | null
   recent_message: InboxMessage | null
+  is_archived: boolean
 }
 
 export type InboxPage = {
@@ -73,6 +75,11 @@ export function getInbox(opts: { page?: number; limit?: number } = {}): Promise<
     console.error('[api] getInbox failed', e)
     throw e
   })
+}
+
+export function searchInbox(q: string): Promise<InboxPage> {
+  const params = new URLSearchParams({ q })
+  return getJSON<InboxPage>(`/api/search?${params.toString()}`)
 }
 
 export function getThread(id: string): Promise<InboxThread> {
