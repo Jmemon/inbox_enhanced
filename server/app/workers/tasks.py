@@ -29,7 +29,7 @@ from app.llm import client as llm_client
 from app.llm.classify import triage
 from app.llm.prompts import score_thread
 from app.task_engine import repo as task_repo
-from app.workers import gmail_sync
+from app.workers import gmail_sync, task_engine_tasks
 from app.workers.celery_app import celery_app
 
 
@@ -116,6 +116,8 @@ def poll_new_messages(user_id: str) -> None:
             ids = gmail_sync.full_sync_inbox(db, user=user)
             log.info("poll_new_messages: user=%s full sync complete, publishing %d ids", user_id, len(ids))
             _publish_thread_ids(user_id, ids)
+            if ids:
+                task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
             last_sync.mark(user_id)
             return
 
@@ -129,6 +131,8 @@ def poll_new_messages(user_id: str) -> None:
             ids = gmail_sync.full_sync_inbox(db, user=user)
             log.info("poll_new_messages: user=%s recovery full sync complete, publishing %d ids", user_id, len(ids))
             _publish_thread_ids(user_id, ids)
+            if ids:
+                task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
             last_sync.mark(user_id)
             return
 
@@ -145,6 +149,8 @@ def poll_new_messages(user_id: str) -> None:
         )
         log.info("poll_new_messages: user=%s partial sync complete, publishing %d ids", user_id, len(ids))
         _publish_thread_ids(user_id, ids)
+        if ids:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
         last_sync.mark(user_id)
     finally:
         db.close()
@@ -173,6 +179,8 @@ def full_sync_inbox_task(user_id: str) -> None:
         ids = gmail_sync.full_sync_inbox(db, user=user)
         log.info("full_sync_inbox_task: user=%s complete, publishing %d ids", user_id, len(ids))
         _publish_thread_ids(user_id, ids)
+        if ids:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, ids], countdown=0)
         last_sync.mark(user_id)
     finally:
         db.close()
@@ -393,6 +401,8 @@ def reclassify_user_inbox(self, user_id: str) -> None:
         log.info("reclassify: user=%s synced=%d reclassified=%d total=%d",
                  user_id, len(synced_ids), len(reclassified_ids), len(touched))
         _publish_thread_ids(user_id, touched)
+        if touched:
+            task_engine_tasks.process_task_updates.apply_async(args=[user_id, touched], countdown=0)
         last_sync.mark(user_id)
     finally:
         db.close()

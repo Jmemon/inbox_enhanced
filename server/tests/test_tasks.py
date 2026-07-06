@@ -12,7 +12,7 @@ from app.db.models import Base, InboxMessage, InboxThread, User
 from app.inbox import inbox_repo
 from app.realtime import last_sync
 from app.task_engine import repo as task_repo
-from app.workers import tasks, gmail_sync
+from app.workers import tasks, gmail_sync, task_engine_tasks
 
 
 @pytest.fixture
@@ -20,6 +20,24 @@ def fake_redis(monkeypatch):
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     monkeypatch.setattr("app.realtime.redis_client.get_redis", lambda: r)
     return r
+
+
+@pytest.fixture(autouse=True)
+def stub_enqueue(monkeypatch):
+    """Task 7: poll_new_messages/full_sync_inbox_task/reclassify_user_inbox
+    now enqueue task_engine_tasks.process_task_updates after publishing
+    thread ids. These tests exercise the sync tasks themselves, not
+    extraction, and don't patch task_engine_tasks.SessionLocal — so left
+    unstubbed, eager celery would run process_task_updates for real against
+    the production (schema-less in these tests) DB. Stub the enqueue call and
+    record its args so the handful of tests that care can assert the hook
+    fired with the right (user_id, ids)."""
+    enqueued: list[list] = []
+    monkeypatch.setattr(
+        "app.workers.task_engine_tasks.process_task_updates.apply_async",
+        lambda args, countdown=0: enqueued.append(args),
+    )
+    return enqueued
 
 
 @pytest.fixture
@@ -49,7 +67,7 @@ def _drained_pubsub(fake_redis, channel: str):
 
 
 def test_poll_new_messages_publishes_when_history_returns_records(
-    fake_redis, session_factory, monkeypatch,
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
 ):
     """Happy path: history.list returns records → partial_sync called with them
     → ids published. history.list MUST be called by the task itself, not by
@@ -82,10 +100,12 @@ def test_poll_new_messages_publishes_when_history_returns_records(
 
     # last_sync.mark(user_id) must fire on the partial-sync-complete exit path.
     assert last_sync.get("u1") is not None
+    # Task 7: the enqueue hook must fire with this user's touched ids.
+    assert stub_enqueue == [["u1", ["gT1"]]]
 
 
 def test_poll_new_messages_silent_when_history_returns_no_records(
-    fake_redis, session_factory, monkeypatch,
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
 ):
     """No new history records → no publish, no partial_sync call."""
     monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
@@ -104,10 +124,12 @@ def test_poll_new_messages_silent_when_history_returns_no_records(
 
     # a successful check IS a sync, even with nothing new — mark() must still fire.
     assert last_sync.get("u1") is not None
+    # No touched ids → the `if ids:` guard must keep the enqueue hook silent.
+    assert stub_enqueue == []
 
 
 def test_poll_new_messages_falls_back_to_full_sync_on_404(
-    fake_redis, session_factory, monkeypatch,
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
 ):
     """When history.list raises HistoryGoneError (gmail 404), the task must
     invoke full_sync_inbox and publish the resulting ids."""
@@ -134,10 +156,11 @@ def test_poll_new_messages_falls_back_to_full_sync_on_404(
 
     # 404-recovery full-sync exit path must also mark last_sync.
     assert last_sync.get("u1") is not None
+    assert stub_enqueue == [["u1", ["gT_new"]]]
 
 
 def test_poll_new_messages_does_full_sync_when_user_has_no_history_id(
-    fake_redis, session_factory, monkeypatch,
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
 ):
     """First-time poll (no cursor): skip history.list entirely, go full_sync."""
     monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
@@ -158,10 +181,11 @@ def test_poll_new_messages_does_full_sync_when_user_has_no_history_id(
 
     # no-cursor full-sync exit path must also mark last_sync.
     assert last_sync.get("u1") is not None
+    assert stub_enqueue == [["u1", ["gT_a"]]]
 
 
 def test_full_sync_inbox_task_marks_last_sync(
-    fake_redis, session_factory, monkeypatch,
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
 ):
     """full_sync_inbox_task's success exit is one of the 6 last_sync.mark
     call sites — pin that it fires after publishing."""
@@ -179,10 +203,11 @@ def test_full_sync_inbox_task_marks_last_sync(
     assert body["event"] == "threads_updated"
     assert body["thread_ids"] == ["gT_full"]
     assert last_sync.get("u1") is not None
+    assert stub_enqueue == [["u1", ["gT_full"]]]
 
 
 def test_reclassify_user_inbox_marks_last_sync(
-    fake_redis, session_factory, monkeypatch,
+    fake_redis, session_factory, monkeypatch, stub_enqueue,
 ):
     """reclassify_user_inbox's success exit is one of the 6 last_sync.mark
     call sites. Uses a cursor-less user with an empty inbox so
@@ -203,6 +228,7 @@ def test_reclassify_user_inbox_marks_last_sync(
     assert body["event"] == "threads_updated"
     assert body["thread_ids"] == ["gT_reload"]
     assert last_sync.get("u1") is not None
+    assert stub_enqueue == [["u1", ["gT_reload"]]]
 
 
 def test_enqueue_polls_purges_and_fans_out(fake_redis, monkeypatch):
