@@ -49,11 +49,16 @@ def seeded_thread(db, user):
         InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
 
 
-def _fake_thread_payload(*, tid="gT1", mid="gM1", history_id="200", subject="hi", body=""):
+def _fake_thread_payload(*, tid="gT1", mid="gM1", history_id="200", subject="hi", body="",
+                          labels=("INBOX",)):
+    # labels defaults to ("INBOX",) — realistic for a message reaching the
+    # inbox at all; partial_sync_inbox now derives is_archived from this per
+    # DEFECT 2a, so tests not specifically exercising archive-healing need a
+    # believable label set to keep their upserted thread visible/non-archived.
     return {
         "id": tid, "messages": [{
             "id": mid, "threadId": tid, "internalDate": "1700000000000",
-            "historyId": history_id,
+            "historyId": history_id, "labelIds": list(labels),
             "payload": {
                 "mimeType": "text/plain",
                 "headers": [{"name": "Subject", "value": subject}],
@@ -135,6 +140,83 @@ def test_fetch_history_records_translates_404_to_history_gone_error(db):
     with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
         with pytest.raises(gmail_sync.HistoryGoneError):
             gmail_sync.fetch_history_records(gmail, start_history_id=u.gmail_last_history_id)
+
+
+def test_fetch_history_records_paginates_across_pages(db):
+    """Gmail pages users.history.list at ~100 records; a >100-record batch
+    (bulk archive, stale cursor) spans multiple pages linked by
+    nextPageToken. fetch_history_records must follow nextPageToken,
+    accumulating records from every page, and return the FINAL page's
+    historyId — not the first page's (which is stale once more pages
+    remain)."""
+    u = _seed_user(db)
+
+    page1 = {
+        "history": [{"id": "101", "messagesAdded": [{"message": {"id": "gM1", "threadId": "gT1"}}]}],
+        "nextPageToken": "tok2",
+        "historyId": "150",  # stale — must not be what's returned
+    }
+    page2 = {
+        "history": [{"id": "201", "messagesAdded": [{"message": {"id": "gM2", "threadId": "gT2"}}]}],
+        "historyId": "300",
+    }
+
+    def _fake_list(*, userId, startHistoryId, historyTypes, labelId, pageToken=None):
+        assert userId == "me"
+        assert startHistoryId == u.gmail_last_history_id
+        assert historyTypes == ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
+        assert labelId == "INBOX"
+        inner = MagicMock()
+        if pageToken is None:
+            inner.execute.return_value = page1
+        else:
+            assert pageToken == "tok2"
+            inner.execute.return_value = page2
+        return inner
+
+    gmail = MagicMock()
+    gmail.users().history().list.side_effect = _fake_list
+
+    records, history_id = gmail_sync.fetch_history_records(
+        gmail, start_history_id=u.gmail_last_history_id
+    )
+
+    assert records == page1["history"] + page2["history"]
+    assert history_id == "300"
+
+
+def test_fetch_history_records_raises_history_gone_when_page_cap_exceeded(db):
+    """If nextPageToken keeps appearing past MAX_HISTORY_PAGES, treat the
+    cursor as unrecoverable via pagination and raise HistoryGoneError — this
+    reuses the existing 404 recovery path (caller falls back to
+    full_sync_inbox, which reconciles correctly) instead of looping forever
+    or silently dropping records beyond the cap.
+
+    (poll_new_messages' behavior on HistoryGoneError — falling back to
+    full_sync_inbox and publishing its result — is already covered by
+    test_poll_new_messages_falls_back_to_full_sync_on_404 in test_tasks.py;
+    this test only exercises fetch_history_records' own pagination cap.)"""
+    u = _seed_user(db)
+    call_count = 0
+
+    def _fake_list(*, userId, startHistoryId, historyTypes, labelId, pageToken=None):
+        nonlocal call_count
+        call_count += 1
+        inner = MagicMock()
+        inner.execute.return_value = {
+            "history": [{"id": str(call_count)}],
+            "nextPageToken": f"tok{call_count}",  # never terminates
+            "historyId": "999",
+        }
+        return inner
+
+    gmail = MagicMock()
+    gmail.users().history().list.side_effect = _fake_list
+
+    with pytest.raises(gmail_sync.HistoryGoneError):
+        gmail_sync.fetch_history_records(gmail, start_history_id=u.gmail_last_history_id)
+
+    assert call_count == gmail_sync.MAX_HISTORY_PAGES
 
 
 def test_full_sync_inbox_pulls_latest_200_threads_and_writes(db):
@@ -468,3 +550,91 @@ def test_partial_sync_unarchives_on_inbox_label_added(db, user, seeded_thread):
         gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
                                       new_history_id="101")
     assert t.is_archived is False
+
+
+def test_partial_sync_archives_fetched_thread_without_inbox_label(db, user):
+    """A messagesAdded record triggers a threads.get(format=full) fetch — the
+    freshest possible label state available. If the fetched thread's messages
+    carry no INBOX label, the thread must be marked is_archived=True right
+    away instead of waiting for a labelsRemoved record (which may have been
+    missed/dropped) or the next full sync."""
+    records = [{"messagesAdded": [{"message": {"id": "gM1", "threadId": "gT1"}}]}]
+    payload = _fake_thread_payload(tid="gT1", mid="gM1", history_id="200")
+    payload["messages"][0]["labelIds"] = ["SENT"]  # no INBOX
+
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="200")
+
+    t = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "gT1")).scalar_one()
+    assert t.is_archived is True
+
+
+def test_partial_sync_heals_archived_thread_when_fetch_shows_inbox_label(db, user, seeded_thread):
+    """A missed/dropped labelsAdded INBOX record can leave is_archived stale
+    at True. When the same batch's messagesAdded path fetches the thread
+    anyway (a fresh threads.get), the fetched label state is at-least-as-
+    fresh as any label record processed earlier in the same batch (the flag
+    loop runs before the fetch loop), so the derived write must win: healed
+    back to is_archived=False even though no record explicitly said "INBOX
+    added"."""
+    seeded_thread.is_archived = True
+    db.flush()  # tests must flush explicitly; production read helpers never do
+
+    records = [{"messagesAdded": [{"message": {"id": "g-m3", "threadId": "g-t1"}}]}]
+    payload = _fake_thread_payload(tid="g-t1", mid="g-m3", history_id="300")
+    payload["messages"][0]["labelIds"] = ["INBOX"]
+
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="300")
+
+    t = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
+    assert t.is_archived is False
+
+
+def test_partial_sync_heals_soft_deleted_message_when_refetched(db, user, seeded_thread):
+    """A spurious/duplicated messagesDeleted record can soft-delete a message
+    Gmail never actually removed. If a later messagesAdded record for the
+    same thread triggers a fresh threads.get that still returns that
+    message, a live Gmail fetch is definitional proof the message exists —
+    is_deleted must be healed back to False rather than hiding the message
+    forever."""
+    m2 = db.execute(select(InboxMessage).where(
+        InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m2")).scalar_one()
+    m2.is_deleted = True
+    db.flush()  # tests must flush explicitly; production read helpers never do
+
+    records = [{"messagesAdded": [{"message": {"id": "g-m2", "threadId": "g-t1"}}]}]
+
+    def _msg(mid, date, history_id):
+        return {
+            "id": mid, "threadId": "g-t1", "internalDate": str(date),
+            "historyId": history_id, "labelIds": ["INBOX"],
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [{"name": "Subject", "value": "hi"}],
+                "body": {"data": ""},
+            },
+        }
+
+    payload = {"id": "g-t1", "messages": [_msg("g-m1", 100, "50"), _msg("g-m2", 200, "60")]}
+
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="300")
+
+    healed = db.execute(select(InboxMessage).where(
+        InboxMessage.user_id == user.id, InboxMessage.gmail_id == "g-m2")).scalar_one()
+    assert healed.is_deleted is False

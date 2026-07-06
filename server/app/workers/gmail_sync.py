@@ -31,6 +31,16 @@ from app.gmail.parser import assemble_thread, ParsedThread
 
 log = logging.getLogger(__name__)
 
+# Gmail pages users.history.list at ~100 records per response. With the
+# widened historyTypes (messageAdded/messageDeleted/labelAdded/labelRemoved),
+# a single poll interval can realistically produce >100 records (a bulk
+# archive, or a stale cursor after downtime), so fetch_history_records must
+# paginate. This bounds that pagination: past MAX_HISTORY_PAGES (~2000
+# records) we stop trusting the cursor to catch up via pagination and fall
+# back to the existing HistoryGoneError → full_sync_inbox recovery path
+# instead of looping indefinitely.
+MAX_HISTORY_PAGES = 20
+
 
 class HistoryGoneError(Exception):
     """users.history.list returned 404. The startHistoryId is older than the
@@ -95,14 +105,31 @@ def _classify_batch(db: Session, *, user_id: str, parsed_list: list[ParsedThread
 def fetch_history_records(
     gmail_client, *, start_history_id: str
 ) -> tuple[list[dict], str | None]:
-    """Call users.history.list and return (records, latest_history_id).
+    """Call users.history.list, following nextPageToken until Gmail reports no
+    more pages, and return (all records across every page, the final page's
+    historyId).
 
-    Raises HistoryGoneError when gmail returns 404 (the cursor is past the
-    retention window). All other HttpErrors propagate.
+    Gmail pages history.list responses at ~100 records; returning only the
+    first page's records/historyId (as this function used to) would silently
+    and permanently lose any records on unfetched later pages — the cursor
+    would advance past history the caller never saw. So this loops on
+    nextPageToken, accumulating records from every page, up to
+    MAX_HISTORY_PAGES. If a nextPageToken still remains once the cap is hit,
+    the cursor is treated as unrecoverable via pagination and HistoryGoneError
+    is raised — reusing the existing 404 recovery path (caller falls back to
+    full_sync_inbox, which reconciles correctly) instead of looping forever or
+    dropping the remainder.
+
+    Raises HistoryGoneError when gmail returns 404 on any page fetch (the
+    cursor is past the retention window). All other HttpErrors propagate.
     """
     log.info("fetch_history_records: start_history_id=%s", start_history_id)
-    try:
-        resp = gmail_client.users().history().list(
+    all_records: list[dict] = []
+    new_history_id: str | None = None
+    page_token: str | None = None
+
+    for page_num in range(1, MAX_HISTORY_PAGES + 1):
+        kwargs = dict(
             userId="me",
             startHistoryId=start_history_id,
             historyTypes=["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
@@ -111,15 +138,38 @@ def fetch_history_records(
             # the UI as a thread "from a different address". Singular labelId per the
             # users.history.list API contract (vs labelIds plural on threads.list).
             labelId="INBOX",
-        ).execute()
-    except HttpError as e:
-        if getattr(e.resp, "status", None) == 404:
-            raise HistoryGoneError() from e
-        raise
-    history = resp.get("history", []) or []
-    new_history_id = resp.get("historyId")
-    log.info("fetch_history_records: got %d records, new historyId=%s", len(history), new_history_id)
-    return history, new_history_id
+        )
+        if page_token is not None:
+            kwargs["pageToken"] = page_token
+        try:
+            resp = gmail_client.users().history().list(**kwargs).execute()
+        except HttpError as e:
+            if getattr(e.resp, "status", None) == 404:
+                raise HistoryGoneError() from e
+            raise
+        page_records = resp.get("history", []) or []
+        all_records.extend(page_records)
+        new_history_id = resp.get("historyId")
+        page_token = resp.get("nextPageToken")
+        log.info(
+            "fetch_history_records: page %d got %d records, nextPageToken=%s",
+            page_num, len(page_records), bool(page_token),
+        )
+        if not page_token:
+            log.info(
+                "fetch_history_records: got %d records across %d page(s), new historyId=%s",
+                len(all_records), page_num, new_history_id,
+            )
+            return all_records, new_history_id
+
+    # Exhausted MAX_HISTORY_PAGES pages and a nextPageToken still remains —
+    # more history than we're willing to paginate through in one call. Falls
+    # back to full_sync_inbox via the same recovery path as a 404.
+    log.warning(
+        "fetch_history_records: exceeded MAX_HISTORY_PAGES=%d with nextPageToken still "
+        "present; treating cursor as gone", MAX_HISTORY_PAGES,
+    )
+    raise HistoryGoneError()
 
 
 def partial_sync_inbox(
@@ -145,6 +195,14 @@ def partial_sync_inbox(
     InboxThread.id values (UUID hex) touched by ANY of the above — NOT
     gmail_thread_ids. The SSE publish path forwards these to
     /api/threads/batch, which filters by InboxThread.id.
+
+    Self-healing, not just full-sync-dependent: every messagesAdded fetch
+    (threads.get format="full") re-derives is_archived from the fetched
+    labels and writes it, so a missed/dropped labelsAdded/Removed INBOX
+    record heals immediately instead of waiting for the next full sync.
+    Likewise, upsert_message's update path (inbox_repo.upsert_message) clears
+    is_deleted whenever a message is re-seen via a live fetch, healing a
+    spurious/duplicated messagesDeleted record.
     """
     records_provided = history_records is not None
     log.info(
@@ -236,10 +294,21 @@ def partial_sync_inbox(
         parsed_list.append(assemble_thread(thread_id=tid, raw_messages=thread_resp.get("messages", []) or []))
 
     bucket_ids = _classify_batch(db, user_id=user.id, parsed_list=parsed_list)
-    internal_ids = [
-        _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
-        for p, b in zip(parsed_list, bucket_ids)
-    ]
+    internal_ids = []
+    for p, b in zip(parsed_list, bucket_ids):
+        internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
+        internal_ids.append(internal_id)
+
+        # Heal is_archived from the fetched thread's own label state. The
+        # flag-record loop above (labelsAdded/labelsRemoved INBOX) runs BEFORE
+        # this fetch loop, so a threads.get(format="full") result here is
+        # at-least-as-fresh as any label record earlier in the same batch —
+        # this derived write correctly wins over (and heals) a missed/dropped
+        # label record instead of waiting for the next full sync.
+        inbox_present = any("INBOX" in m.label_ids for m in p.messages)
+        thread_row = db.get(InboxThread, internal_id)
+        if thread_row is not None:
+            thread_row.is_archived = not inbox_present
 
     # Merge in threads touched only by an in-place flag flip (soft-delete,
     # archive/unarchive, unread) — they never went through the upsert loop
