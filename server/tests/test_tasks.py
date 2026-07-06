@@ -8,7 +8,7 @@ import fakeredis
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from app.db.models import Base, User
+from app.db.models import Base, InboxMessage, InboxThread, User
 from app.inbox import inbox_repo
 from app.realtime import last_sync
 from app.workers import tasks, gmail_sync
@@ -248,3 +248,44 @@ def test_reclassify_all_reads_postgres_no_gmail(session_factory):
     mock_classify.assert_called_once()
     assert changed == [thread.id]
     assert thread.bucket_id == "new-bucket"
+
+
+def test_read_candidates_sorts_by_last_activity_and_skips_archived(session_factory):
+    """_read_candidates must sort by InboxThread.last_activity_at desc (the
+    denormalized pointer list_threads already uses) and exclude is_archived
+    threads — not the old recent_message_id-joined InboxMessage.gmail_internal_date
+    sort, which ignored both. t_old carries a LATER gmail_internal_date on its
+    joined message than t_new does, despite an OLDER last_activity_at — proving
+    the sort key really is the thread pointer, not the message date."""
+    db = session_factory()
+    db.add(User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc)))
+    db.commit()
+
+    db.add_all([
+        InboxThread(id="t_old", user_id="u1", gmail_id="g_old", subject="old",
+                   bucket_id=None, recent_message_id="m_old", last_activity_at=200,
+                   is_archived=False),
+        InboxMessage(id="m_old", thread_id="t_old", user_id="u1", gmail_id="g_m_old",
+                    gmail_thread_id="g_old", gmail_internal_date=999, gmail_history_id="1",
+                    to_addr="me", from_addr="old@x.com", body_preview="old preview"),
+        InboxThread(id="t_new", user_id="u1", gmail_id="g_new", subject="new",
+                   bucket_id=None, recent_message_id="m_new", last_activity_at=500,
+                   is_archived=False),
+        InboxMessage(id="m_new", thread_id="t_new", user_id="u1", gmail_id="g_m_new",
+                    gmail_thread_id="g_new", gmail_internal_date=1, gmail_history_id="1",
+                    to_addr="me", from_addr="new@x.com", body_preview="new preview"),
+        InboxThread(id="t_arch", user_id="u1", gmail_id="g_arch", subject="archived",
+                   bucket_id=None, recent_message_id="m_arch", last_activity_at=999999,
+                   is_archived=True),
+        InboxMessage(id="m_arch", thread_id="t_arch", user_id="u1", gmail_id="g_m_arch",
+                    gmail_thread_id="g_arch", gmail_internal_date=1, gmail_history_id="1",
+                    to_addr="me", from_addr="arch@x.com", body_preview="archived preview"),
+    ])
+    db.commit()
+
+    out = tasks._read_candidates(db, user_id="u1", exclude=set(), limit=100)
+
+    ids = [c["thread_id"] for c in out]
+    assert "t_arch" not in ids, "archived threads must be excluded from candidates"
+    assert ids == ["t_new", "t_old"], \
+        "must order by InboxThread.last_activity_at desc, not the joined message's date"
