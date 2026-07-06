@@ -66,7 +66,10 @@ function _open() {
       // queueMicrotask(_open) reopen meant an expired session turned every
       // 401 into a network-paced hammer with no backoff at all.
       const delay = Math.min(30_000, 1000 * 2 ** (_consecutiveErrors - 1))
-      _reconnectTimer = setTimeout(_open, delay)
+      _reconnectTimer = setTimeout(() => {
+        _reconnectTimer = null
+        _open()
+      }, delay)
     }
   }
 }

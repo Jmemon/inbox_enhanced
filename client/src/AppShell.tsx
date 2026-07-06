@@ -8,9 +8,13 @@ import { subscribeSse } from './lib/sse'
 // makes every SSE reconnect fail with a fresh 401 forever, since nothing
 // about the stream itself tells the app the *session* — not just the
 // connection — is dead. Count consecutive '_error' events (reset by any
-// '_open'); once 3 land in a row, re-validate via useAuth().refresh(). If
-// the cookie really is dead, refresh() flips auth state to 'anon', which
-// unmounts <AppShell> (and with it InboxProvider's SSE subscription),
+// '_open'); once 3 land in a row, re-validate via useAuth().recheckSession().
+// Connection-dead is NOT session-dead: a backend outage fails both the SSE
+// stream and this re-check's /auth/me call for reasons that have nothing to
+// do with the cookie, so recheckSession() only flips auth state to 'anon' on
+// a definitive 401 — any other failure leaves state alone and the SSE
+// backoff keeps retrying. Only on a real 401 does state flip to 'anon',
+// which unmounts <AppShell> (and with it InboxProvider's SSE subscription),
 // ending the error loop and landing the user back on the login screen.
 // Throttled to at most once per 30s so a merely-flaky connection can't
 // hammer /auth/me either.
@@ -24,7 +28,7 @@ const navStyle = ({ isActive }: { isActive: boolean }) => ({
 })
 
 export function AppShell() {
-  const { state, signOut, refresh } = useAuth()
+  const { state, signOut, recheckSession } = useAuth()
 
   const consecutiveErrorsRef = useRef(0)
   const lastRecheckAtRef = useRef(0)
@@ -40,8 +44,8 @@ export function AppShell() {
     const now = Date.now()
     if (now - lastRecheckAtRef.current < AUTH_RECHECK_THROTTLE_MS) return
     lastRecheckAtRef.current = now
-    void refresh()
-  }), [refresh])
+    void recheckSession()
+  }), [recheckSession])
 
   if (state.status !== 'authed') return null
   return (
