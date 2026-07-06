@@ -173,7 +173,12 @@ def test_triage_preserves_order_and_handles_no_fit_stability(monkeypatch):
     )
     assert out == [("b1", [("tk1", 80)]), ("b1", []), ("b1", [])]
     assert all(s == "classify" for s in seen_stages)
-    assert all(m == "anthropic/claude-haiku-4-5" for m in seen_models)
+    # Assert against the resolved setting, not the default literal: a local
+    # .env may override LLM_CLASSIFY_MODEL (worktrees have no .env, so a
+    # hardcoded default passes there but fails in the main checkout). The
+    # intent is "triage uses the classify model, not the extract model".
+    from app.config import get_settings
+    assert all(m == get_settings().llm_classify_model for m in seen_models)
 
 
 def test_triage_empty_threads_returns_empty():
