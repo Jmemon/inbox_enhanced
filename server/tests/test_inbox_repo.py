@@ -113,6 +113,37 @@ def test_upsert_message_persists_body_labels_unread_and_activity(db):
     assert thread.last_activity_at == 111
 
 
+def test_upsert_message_update_with_none_preserves_body_and_labels(db):
+    """Passing body_text=None or label_ids=None on the update path means
+    'leave it alone' — important so the worker can call upsert_message with
+    partial updates that may not have the full body or label info yet."""
+    user = _mk_user(db)
+    inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id="gt", subject="s", bucket_id=None)
+
+    # Initial upsert with body_text and labels
+    msg = inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="gt", gmail_message_id="gm",
+        gmail_internal_date=100, gmail_history_id="10",
+        to_addr="me@x.com", from_addr="alice@x.com", body_preview="preview",
+        body_text="original body", label_ids=["INBOX", "UNREAD"],
+    )
+    assert msg.body_text == "original body"
+    assert msg.labels == ["INBOX", "UNREAD"]
+    assert msg.is_unread is True
+
+    # Update with None values should preserve existing body_text and labels
+    updated = inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="gt", gmail_message_id="gm",
+        gmail_internal_date=200, gmail_history_id="11",
+        to_addr=None, from_addr=None, body_preview=None,
+        body_text=None, label_ids=None,
+    )
+    assert updated.body_text == "original body"
+    assert updated.labels == ["INBOX", "UNREAD"]
+    assert updated.is_unread is True
+    assert updated.gmail_internal_date == 200
+
+
 def test_recompute_thread_pointers_skips_deleted_messages(db):
     user = _mk_user(db)
     inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id="gt2",
