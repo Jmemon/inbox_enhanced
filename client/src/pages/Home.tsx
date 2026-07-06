@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAuth } from '../auth/useAuth'
 import { useInbox } from './inbox/useInbox'
 import { useInboxSse } from './inbox/useInboxSse'
@@ -23,17 +23,26 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<InboxThread[] | null>(null)
   const [searchError, setSearchError] = useState<string | null>(null)
+  // Monotonic request token: guards against an older in-flight search
+  // response resolving after a newer one and clobbering its results.
+  const searchSeq = useRef(0)
 
   // Debounced server search: /api/search (Postgres FTS). Empty query exits
   // search mode and restores the normal inbox list.
   useEffect(() => {
     const q = searchQuery.trim()
-    if (!q) { setSearchResults(null); setSearchError(null); return }
+    if (!q) {
+      searchSeq.current += 1
+      setSearchResults(null); setSearchError(null); return
+    }
+    const seq = ++searchSeq.current
     const t = setTimeout(async () => {
       try {
         const r = await searchInbox(q)
+        if (seq !== searchSeq.current) return
         setSearchResults(r.threads); setSearchError(null)
       } catch (e: any) {
+        if (seq !== searchSeq.current) return
         setSearchError(String(e?.message ?? e))
       }
     }, 300)
