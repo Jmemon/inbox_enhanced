@@ -61,6 +61,8 @@ def upsert_message(
     to_addr: str | None,
     from_addr: str | None,
     body_preview: str | None,
+    body_text: str | None = None,
+    label_ids: list[str] | None = None,
 ) -> InboxMessage:
     # Thread must already exist (caller is expected to upsert_thread first).
     thread = db.execute(
@@ -87,6 +89,9 @@ def upsert_message(
             to_addr=to_addr,
             from_addr=from_addr,
             body_preview=body_preview,
+            body_text=body_text,
+            labels=list(label_ids or []),
+            is_unread="UNREAD" in (label_ids or []),
         )
         db.add(existing)
         db.flush()
@@ -96,19 +101,40 @@ def upsert_message(
         existing.to_addr = to_addr
         existing.from_addr = from_addr
         existing.body_preview = body_preview
+        existing.body_text = body_text if body_text is not None else existing.body_text
+        if label_ids is not None:
+            existing.labels = list(label_ids)
+            existing.is_unread = "UNREAD" in label_ids
 
-    # Use a single indexed lookup instead of loading all thread messages.
-    # inbox_messages.gmail_internal_date is indexed, so ORDER BY + LIMIT 1 is O(log N).
-    most_recent_id = db.execute(
-        select(InboxMessage.id)
-        .where(InboxMessage.thread_id == thread.id)
+    recompute_thread_pointers(db, thread=thread)
+    return existing
+
+
+def recompute_thread_pointers(db: Session, *, thread: InboxThread) -> None:
+    """Recompute recent_message_id + last_activity_at from the thread's
+    non-deleted messages. Single indexed lookup (gmail_internal_date is
+    indexed). Soft-deleted messages are invisible to both pointers so a
+    Gmail deletion demotes the thread's sort position instead of pinning it.
+
+    Flushes first: sessions here run with autoflush=False (see db/session.py),
+    and callers are expected to mutate InboxMessage.is_deleted on an
+    already-loaded ORM object (e.g. a future soft-delete task) then call this
+    helper directly — without an explicit flush the SELECT below would still
+    see the pre-mutation row."""
+    db.flush()
+    row = db.execute(
+        select(InboxMessage.id, InboxMessage.gmail_internal_date)
+        .where(InboxMessage.thread_id == thread.id,
+               InboxMessage.is_deleted == False)  # noqa: E712
         .order_by(InboxMessage.gmail_internal_date.desc())
         .limit(1)
-    ).scalar_one_or_none()
-    if most_recent_id is not None:
-        thread.recent_message_id = most_recent_id
-
-    return existing
+    ).first()
+    if row is None:
+        thread.recent_message_id = None
+        thread.last_activity_at = None
+    else:
+        thread.recent_message_id = row[0]
+        thread.last_activity_at = row[1]
 
 
 def list_threads(

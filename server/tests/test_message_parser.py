@@ -165,3 +165,16 @@ def test_thread_to_string_includes_full_bodies_for_classifier():
     thread = message_parser.assemble_thread(thread_id="t1", raw_messages=msgs)
     text = message_parser.thread_to_string(thread)
     assert "UNIQUE_TAIL" in text
+
+
+def test_parse_message_captures_label_ids():
+    raw = {
+        "id": "m1", "threadId": "t1", "internalDate": "1000", "historyId": "5",
+        "labelIds": ["INBOX", "UNREAD"],
+        "payload": {"headers": [], "mimeType": "text/plain",
+                    "body": {"data": "aGVsbG8="}},  # "hello"
+    }
+    from app.gmail.parser import parse_message
+    m = parse_message(raw)
+    assert m.label_ids == ["INBOX", "UNREAD"]
+    assert m.body_text == "hello"

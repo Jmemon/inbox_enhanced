@@ -62,6 +62,7 @@ def _upsert_thread_with_messages(
             gmail_internal_date=m.gmail_internal_date,
             gmail_history_id=m.gmail_history_id,
             to_addr=m.to_addr, from_addr=m.from_addr, body_preview=m.body_preview,
+            body_text=m.body_text, label_ids=m.label_ids,
         )
     return thread.id
 

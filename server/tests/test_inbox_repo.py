@@ -1,11 +1,21 @@
 from datetime import datetime, timezone
-from app.db.models import User
+from sqlalchemy import select
+from app.db.models import InboxThread, User
 from app.inbox import inbox_repo
 
 
 def _seed_user(db, uid="u1"):
     db.add(User(id=uid, email=f"{uid}@x.com", created_at=datetime.now(timezone.utc)))
     db.commit()
+
+
+def _mk_user(db, uid="u1"):
+    """Like _seed_user, but returns the created row (needed by tests that read
+    user.id back, e.g. to seed threads/messages for a specific user)."""
+    user = User(id=uid, email=f"{uid}@x.com", created_at=datetime.now(timezone.utc))
+    db.add(user)
+    db.commit()
+    return user
 
 
 def test_upsert_thread_and_message_creates_rows(db):
@@ -83,3 +93,48 @@ def test_upsert_thread_update_with_none_preserves_existing_values(db):
     threads = inbox_repo.list_threads(db, user_id="u1", limit=10, offset=0)
     assert threads[0].subject == "set"
     assert threads[0].bucket_id == "default-important"
+
+
+def test_upsert_message_persists_body_labels_unread_and_activity(db):
+    user = _mk_user(db)  # use the file's existing user-seeding helper/fixture
+    inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id="gt1",
+                             subject="s", bucket_id=None)
+    msg = inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="gt1", gmail_message_id="gm1",
+        gmail_internal_date=111, gmail_history_id="7",
+        to_addr="a@b.c", from_addr="x@y.z", body_preview="p",
+        body_text="full body text", label_ids=["INBOX", "UNREAD"],
+    )
+    assert msg.body_text == "full body text"
+    assert msg.labels == ["INBOX", "UNREAD"]
+    assert msg.is_unread is True
+    thread = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "gt1")).scalar_one()
+    assert thread.last_activity_at == 111
+
+
+def test_recompute_thread_pointers_skips_deleted_messages(db):
+    user = _mk_user(db)
+    inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id="gt2",
+                             subject="s", bucket_id=None)
+    old = inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="gt2", gmail_message_id="gm-old",
+        gmail_internal_date=100, gmail_history_id="1",
+        to_addr=None, from_addr=None, body_preview=None)
+    new = inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="gt2", gmail_message_id="gm-new",
+        gmail_internal_date=200, gmail_history_id="2",
+        to_addr=None, from_addr=None, body_preview=None)
+    thread = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "gt2")).scalar_one()
+    assert thread.recent_message_id == new.id
+
+    new.is_deleted = True
+    inbox_repo.recompute_thread_pointers(db, thread=thread)
+    assert thread.recent_message_id == old.id
+    assert thread.last_activity_at == 100
+
+    old.is_deleted = True
+    inbox_repo.recompute_thread_pointers(db, thread=thread)
+    assert thread.recent_message_id is None
+    assert thread.last_activity_at is None

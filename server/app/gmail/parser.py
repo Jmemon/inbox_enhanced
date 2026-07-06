@@ -20,7 +20,7 @@ References:
 
 import base64
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
@@ -34,8 +34,11 @@ class ParsedMessage:
     subject: str | None
     from_addr: str | None
     to_addr: str | None
-    body_text: str    # full decoded body (used by classifier; not persisted)
+    body_text: str    # full decoded body (used by classifier; also persisted as of Task 2)
     body_preview: str # first 150 chars (persisted; what UI renders)
+    # Gmail labelIds snapshot (INBOX/UNREAD interpreted at persist time).
+    # default_factory so existing ParsedMessage(...) constructions stay valid.
+    label_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -107,6 +110,7 @@ def parse_message(raw: dict) -> ParsedMessage:
         to_addr=_header(payload, "To"),
         body_text=body_text,
         body_preview=body_text[:150],
+        label_ids=list(raw.get("labelIds", []) or []),
     )
 
 
