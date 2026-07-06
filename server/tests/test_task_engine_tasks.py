@@ -101,12 +101,16 @@ def _seed_user_thread_message(
     db.close()
 
 
-def _seed_tracker(session_factory, *, user_id=USER_ID, status="active"):
-    schema = _singleton_schema()
+def _seed_tracker(session_factory, *, user_id=USER_ID, status="active", state_schema=None):
+    """Create a tracker task. `state_schema` defaults to the valid singleton
+    schema; pass a deliberately-broken dict (e.g. `{"garbage": True}`) to
+    seed a tracker that will blow up in `schema.validate_schema` at
+    extraction time — used by the batch-isolation regression test below."""
+    schema = state_schema if state_schema is not None else _singleton_schema().model_dump()
     db = session_factory()
     task = task_repo.create_task(
         db, user_id=user_id, name="Job tracker", goal="Land the job",
-        criteria="", state_schema=schema.model_dump(), kind="tracker",
+        criteria="", state_schema=schema, kind="tracker",
     )
     task.status = status
     db.commit()
@@ -319,6 +323,75 @@ def test_process_task_updates_rerun_is_idempotent_no_dup_events_no_noise_publish
 
 
 # ---------------------------------------------------------------------------
+# Batch isolation: one corrupted tracker must not starve its siblings
+# ---------------------------------------------------------------------------
+
+
+def test_process_task_updates_isolates_task_with_corrupted_schema(
+    session_factory, fake_redis, monkeypatch,
+):
+    """Reviewer repro: extract_for_pair's `validate_schema(task.state_schema)`
+    call raises uncaught for a tracker with a corrupted schema. Without a
+    per-task try/except, that exception propagates out of the `for task in
+    list_active_trackers(...)` loop entirely — a healthy tracker scheduled
+    after the corrupted one in the same run never even gets its LLM call.
+    This asserts the healthy tracker's event still applies, its publish
+    still fires, and no exception escapes `process_task_updates` itself."""
+    _seed_user_thread_message(session_factory)
+
+    bad_task_id = _seed_tracker(session_factory, state_schema={"garbage": True})
+    healthy_task_id = _seed_tracker(session_factory)
+
+    # list_active_trackers iterates in (created_at, id) order — pin the bad
+    # tracker's created_at strictly before the healthy one's so the bad
+    # tracker is guaranteed to be visited FIRST, which is what reproduces the
+    # starvation bug (a later sibling never even gets its LLM call).
+    db = session_factory()
+    bad_task = task_repo.get_owned_task(db, user_id=USER_ID, task_id=bad_task_id)
+    healthy_task = task_repo.get_owned_task(db, user_id=USER_ID, task_id=healthy_task_id)
+    bad_task.created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    healthy_task.created_at = datetime(2020, 1, 2, tzinfo=timezone.utc)
+    db.commit()
+    db.close()
+
+    _attach(session_factory, task_id=bad_task_id, thread_id=THREAD_ID)
+    _attach(session_factory, task_id=healthy_task_id, thread_id=THREAD_ID)
+    captured = _capture_publish(monkeypatch)
+
+    settings = get_settings()
+    high_confidence = min(100, settings.task_apply_confidence + 10)
+    call_count = 0
+
+    async def _fake(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _extraction_response(confidence=high_confidence)
+
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
+
+    result = task_engine_tasks.process_task_updates.apply(args=[USER_ID, [THREAD_ID]])
+    assert result.successful()  # the corrupted tracker's exception must not escape the task
+
+    # Only the healthy tracker ever reached the LLM — the bad one blew up in
+    # validate_schema before its extraction call.
+    assert call_count == 1
+
+    db = session_factory()
+    healthy_events = task_repo.list_events(db, task_id=healthy_task_id, status="applied")
+    assert len(healthy_events) == 1
+    assert healthy_events[0].new_value == "in_progress"
+
+    bad_events = task_repo.list_events(db, task_id=bad_task_id)
+    assert bad_events == []  # corrupted tracker produced nothing, no partial writes
+
+    assert len(captured) == 1  # only the healthy tracker's publish fired
+    user_id, event, payload = captured[0]
+    assert user_id == USER_ID
+    assert event == "task_updated"
+    assert payload["task_id"] == healthy_task_id
+
+
+# ---------------------------------------------------------------------------
 # extract_for_thread: single-pair variant (Task 10's future attach flow)
 # ---------------------------------------------------------------------------
 
@@ -351,6 +424,37 @@ def test_extract_for_thread_applies_and_publishes(session_factory, fake_redis, m
 def test_extract_for_thread_skips_paused_task(session_factory, fake_redis, monkeypatch):
     _seed_user_thread_message(session_factory)
     task_id = _seed_tracker(session_factory, status="paused")
+    captured = _capture_publish(monkeypatch)
+
+    call_count = 0
+
+    async def _fake(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        return _extraction_response(confidence=90)
+
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
+
+    task_engine_tasks.extract_for_thread.apply(args=[USER_ID, task_id, THREAD_ID])
+
+    assert call_count == 0
+    assert captured == []
+
+
+def test_extract_for_thread_skips_non_tracker_kind(session_factory, fake_redis, monkeypatch):
+    """Matches the batch path's implicit filter: list_active_trackers only
+    ever selects kind='tracker' tasks, so this single-pair entrypoint must
+    apply the same guard rather than happily extracting against a
+    bucket-kind task."""
+    _seed_user_thread_message(session_factory)
+    db = session_factory()
+    task = task_repo.create_task(
+        db, user_id=USER_ID, name="Bucket", goal="", criteria="",
+        state_schema=_singleton_schema().model_dump(), kind="bucket",
+    )
+    task_id = task.id
+    db.commit()
+    db.close()
     captured = _capture_publish(monkeypatch)
 
     call_count = 0

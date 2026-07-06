@@ -69,6 +69,17 @@ def process_task_updates(user_id: str, thread_ids: list[str]) -> None:
     the validator's own idempotency check (step 7) means a repeat run stages
     nothing new, `any_pending` stays False, and the version is unchanged, so
     no second publish fires.
+
+    One bad tracker must not poison the whole batch: the entire per-task body
+    below is wrapped in its own try/except. `extract_for_pair` calls
+    `schema.validate_schema(task.state_schema)` uncaught, so a tracker whose
+    `state_schema` is corrupted (e.g. hand-edited or written by a buggy
+    migration) raises there — without isolation, that exception would
+    propagate out of this `for task in ...` loop entirely and starve every
+    sibling tracker for this user of its extraction run. On catch we
+    `db.rollback()` (a failed flush mid-pair must not poison the session for
+    the next task — per-pair commits mean only the failed pair's uncommitted
+    work rolls back) and move on to the next task.
     """
     touched = set(thread_ids)
     if not touched:
@@ -76,31 +87,38 @@ def process_task_updates(user_id: str, thread_ids: list[str]) -> None:
     db = SessionLocal()
     try:
         for task in task_repo.list_active_trackers(db, user_id=user_id):
-            attached = task_repo.list_attached_thread_ids(db, task_id=task.id)
-            pairs = sorted(attached & touched)
-            if not pairs:
-                continue
-
-            version_before = task.version
-            any_pending = False
-            for thread_id in pairs:
-                staged = extract_for_pair(
-                    db, task=task, thread_internal_id=thread_id, user_id=user_id,
-                )
-                if staged is None:
+            try:
+                attached = task_repo.list_attached_thread_ids(db, task_id=task.id)
+                pairs = sorted(attached & touched)
+                if not pairs:
                     continue
-                if staged.pending:
-                    any_pending = True
-                db.commit()
 
-            if not any_pending and task.version == version_before:
-                log.info(
-                    "process_task_updates: task=%s pairs=%d no change, skipping publish",
-                    task.id, len(pairs),
+                version_before = task.version
+                any_pending = False
+                for thread_id in pairs:
+                    staged = extract_for_pair(
+                        db, task=task, thread_internal_id=thread_id, user_id=user_id,
+                    )
+                    if staged is None:
+                        continue
+                    if staged.pending:
+                        any_pending = True
+                    db.commit()
+
+                if not any_pending and task.version == version_before:
+                    log.info(
+                        "process_task_updates: task=%s pairs=%d no change, skipping publish",
+                        task.id, len(pairs),
+                    )
+                    continue
+
+                _publish_task_updated(db, user_id=user_id, task=task)
+            except Exception:
+                log.exception(
+                    "process_task_updates: task %s failed; continuing", task.id,
                 )
+                db.rollback()
                 continue
-
-            _publish_task_updated(db, user_id=user_id, task=task)
     finally:
         db.close()
 
@@ -115,9 +133,19 @@ def extract_for_thread(user_id: str, task_id: str, thread_id: str) -> None:
     db = SessionLocal()
     try:
         task = task_repo.get_owned_task(db, user_id=user_id, task_id=task_id)
-        if task is None or task.status != "active" or task.state_schema is None:
+        # kind != "tracker" guard matches list_active_trackers' implicit
+        # filter on the batch path (Task 7 review fix) — this single-pair
+        # entrypoint has no such filter of its own otherwise, so a bucket-
+        # kind task passed in here would silently run tracker extraction
+        # against it.
+        if (
+            task is None
+            or task.kind != "tracker"
+            or task.status != "active"
+            or task.state_schema is None
+        ):
             log.info(
-                "extract_for_thread: task=%s not an active schema-bearing task, skipping",
+                "extract_for_thread: task=%s not an active schema-bearing tracker, skipping",
                 task_id,
             )
             return

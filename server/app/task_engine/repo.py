@@ -101,13 +101,24 @@ def list_tasks(db: Session, *, user_id: str, kind: str | None = None) -> list[Ta
 def list_active_trackers(db: Session, *, user_id: str) -> list[Task]:
     """Active, non-deleted, schema-bearing tracker tasks — the set the
     extraction pipeline (Task 6+) runs against. A tracker with no
-    state_schema yet (schema still being proposed) is excluded."""
-    stmt = select(Task).where(
-        Task.user_id == user_id,
-        Task.is_deleted == False,  # noqa: E712
-        Task.kind == "tracker",
-        Task.status == "active",
-        Task.state_schema.is_not(None),
+    state_schema yet (schema still being proposed) is excluded.
+
+    Ordered by (created_at, id) ascending for deterministic iteration —
+    `process_task_updates` iterates this list and now isolates a per-task
+    failure (Task 7 review fix), but the run-to-run order those failures are
+    encountered in should still be stable rather than left to the database's
+    unspecified default ordering.
+    """
+    stmt = (
+        select(Task)
+        .where(
+            Task.user_id == user_id,
+            Task.is_deleted == False,  # noqa: E712
+            Task.kind == "tracker",
+            Task.status == "active",
+            Task.state_schema.is_not(None),
+        )
+        .order_by(Task.created_at.asc(), Task.id.asc())
     )
     return list(db.execute(stmt).scalars().all())
 
