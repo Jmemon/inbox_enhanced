@@ -1,4 +1,4 @@
-<!-- stamp: 13a07e5 (main) | 2026-05-29 -->
+<!-- stamp: 00d736e (feature/phase0-data-floor) | 2026-07-05 -->
 
 # Reference Manifest
 
