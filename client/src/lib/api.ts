@@ -225,3 +225,11 @@ export async function postInboxExtend(beforeInternalDate: number): Promise<void>
   })
   if (r.status !== 202) throw new Error(`extend: ${r.status}`)
 }
+
+// --- Sync status ---
+
+export type SyncStatus = { last_synced_at: number | null; has_cursor: boolean }
+
+export function getSyncStatus(): Promise<SyncStatus> {
+  return getJSON<SyncStatus>('/api/sync/status')
+}
