@@ -24,6 +24,15 @@ export default function HudPage() {
   const [, forceTick] = useState(0)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  const refreshStatus = useCallback(async () => {
+    try {
+      const st = await getSyncStatus()
+      setStatus(st)
+    } catch (e) {
+      console.error('[hud] refreshStatus failed', e)
+    }
+  }, [])
+
   const refresh = useCallback(async () => {
     try {
       const [inbox, st] = await Promise.all([getInbox({ limit: 200 }), getSyncStatus()])
@@ -43,11 +52,14 @@ export default function HudPage() {
       refreshTimer.current = setTimeout(() => { void refresh() }, 2000)
     })
     const tick = setInterval(() => forceTick(n => n + 1), 5000)
+    // Empty polls mark last_sync server-side without publishing an SSE event, so status must
+    // be polled independently (every 30s, matching beat cadence) to stay truthful on quiet inboxes.
+    const statusPoll = setInterval(() => { void refreshStatus() }, 30_000)
     return () => {
-      unsub(); clearInterval(tick)
+      unsub(); clearInterval(tick); clearInterval(statusPoll)
       if (refreshTimer.current) clearTimeout(refreshTimer.current)
     }
-  }, [refresh])
+  }, [refresh, refreshStatus])
 
   const bucketCounts = useMemo(() => {
     const counts: Record<string, number> = {}
