@@ -31,9 +31,12 @@ def _seed(session_factory):
     db.add(User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc)))
     db.add(InboxThread(id="t1", user_id="u1", gmail_id="gT1", subject="bk",
                        bucket_id=None, recent_message_id=None))
+    # body_text is what _score_all (Task 7) now reads via inbox_repo.load_parsed_threads
+    # instead of refetching from Gmail — body_preview stays for the pre-migration fallback.
     db.add(InboxMessage(id="m1", thread_id="t1", user_id="u1", gmail_id="gM1",
                         gmail_thread_id="gT1", gmail_internal_date=1, gmail_history_id="1",
-                        to_addr="me", from_addr="club@b.com", body_preview="march pick"))
+                        to_addr="me", from_addr="club@b.com", body_preview="march pick",
+                        body_text="march pick — full body"))
     db.commit(); db.close()
 
 
@@ -43,15 +46,14 @@ def test_draft_preview_publishes_typed_event(fake_redis, session_factory, monkey
 
     ps = fake_redis.pubsub(); ps.subscribe("user:u1"); ps.get_message(timeout=0.1)
 
+    # Task 7: draft_preview_bucket's scoring path (_score_all) reads Postgres
+    # bodies and must never touch Gmail. A gmail client whose .users() raises
+    # proves that — if the fake ever fires this test fails loudly instead of
+    # silently swallowing a regression.
+    def _raise_if_called(*a, **kw):
+        raise AssertionError("get_gmail_client must not be called by the scoring path")
     gmail = MagicMock()
-    gmail.users().threads().get().execute.return_value = {
-        "id": "gT1", "messages": [{
-            "id": "gM1", "threadId": "gT1", "internalDate": "1", "historyId": "1",
-            "payload": {"mimeType": "text/plain",
-                        "headers": [{"name": "Subject", "value": "march pick"},
-                                    {"name": "From", "value": "club@b.com"}],
-                        "body": {"data": ""}},
-        }]}
+    gmail.users.side_effect = _raise_if_called
 
     # Stub the LLM scoring path so tests don't hit the real Anthropic API.
     async def _fake_call(**kw):
@@ -70,3 +72,4 @@ def test_draft_preview_publishes_typed_event(fake_redis, session_factory, monkey
     body = json.loads(msg["data"])
     assert body["event"] == "bucket_draft_preview" and body["draft_id"] == "draft-x"
     assert len(body["positives"]) == 1 and body["positives"][0]["score"] == 9
+    gmail.users.assert_not_called()

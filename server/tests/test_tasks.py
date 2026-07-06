@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.db.models import Base, User
+from app.inbox import inbox_repo
 from app.workers import tasks, gmail_sync
 
 
@@ -154,3 +155,38 @@ def test_enqueue_polls_purges_and_fans_out(fake_redis, monkeypatch):
     tasks.enqueue_polls.apply()
 
     assert sorted(enqueued) == ["u1", "u2"]
+
+
+def test_reclassify_all_reads_postgres_no_gmail(session_factory):
+    """Task 7: _reclassify_all rebuilds ParsedThreads from stored Postgres
+    rows via inbox_repo.load_parsed_threads — it must never refetch Gmail.
+    A get_gmail_client stub that raises if called proves the path is
+    Gmail-free; body_text is seeded straight into Postgres via
+    upsert_message, mirroring what sync would have persisted."""
+    db = session_factory()
+    user = User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc))
+    db.add(user)
+    db.commit()
+
+    thread = inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="gT1",
+                                      subject="hi", bucket_id="old-bucket")
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="gT1", gmail_message_id="gM1",
+        gmail_internal_date=1, gmail_history_id="1",
+        to_addr=None, from_addr="a@b.com", body_preview="prev",
+        body_text="full body text",
+    )
+    db.commit()
+
+    def _raise_if_called(*a, **kw):
+        raise AssertionError("get_gmail_client must not be called by _reclassify_all")
+
+    with patch("app.workers.tasks.get_gmail_client", side_effect=_raise_if_called), \
+         patch("app.workers.tasks.bucket_repo.list_active", return_value=[]) as mock_buckets, \
+         patch("app.workers.tasks.classify", return_value=["new-bucket"]) as mock_classify:
+        changed = tasks._reclassify_all(db, user=user)
+
+    mock_buckets.assert_called_once()
+    mock_classify.assert_called_once()
+    assert changed == [thread.id]
+    assert thread.bucket_id == "new-bucket"

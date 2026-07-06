@@ -23,8 +23,8 @@ from app.db.models import User, InboxThread, InboxMessage
 from app.realtime import active_users, sync_lock
 from app.realtime import redis_client as _redis_client
 from app.gmail.client import get_gmail_client
-from app.gmail.parser import ParsedThread, assemble_thread, thread_to_string
-from app.inbox import bucket_repo, preview_cache
+from app.gmail.parser import thread_to_string
+from app.inbox import bucket_repo, inbox_repo, preview_cache
 from app.llm import client as llm_client
 from app.llm.classify import classify
 from app.llm.prompts import score_thread
@@ -179,9 +179,10 @@ def draft_preview_bucket(user_id: str, draft_id: str, name: str, description: st
     """Score inbox threads against a prospective bucket and publish a preview.
 
     Reads up to CANDIDATE_LIMIT inbox threads, inline-extends history if the
-    pool is too small, refetches full bodies from Gmail, scores each thread
-    0-10 via the LLM in parallel, then publishes a bucket_draft_preview event
-    containing top-3 positives (>=7) and top-3 near-misses (4-6).
+    pool is too small, rebuilds full bodies from Postgres (0006+ persisted
+    body_text; no Gmail refetch), scores each thread 0-10 via the LLM in
+    parallel, then publishes a bucket_draft_preview event containing top-3
+    positives (>=7) and top-3 near-misses (4-6).
     """
     log.info("draft_preview_bucket: user=%s draft=%s", user_id, draft_id)
     exclude = set(exclude_thread_ids or [])
@@ -197,8 +198,8 @@ def draft_preview_bucket(user_id: str, draft_id: str, name: str, description: st
             _extend_inline(db, user=user)
             candidates = _read_candidates(db, user_id=user_id, exclude=exclude, limit=CANDIDATE_LIMIT)
 
-        gmail = get_gmail_client(db, user)
-        scored = _score_all(gmail, candidates=candidates, name=name, description=description)
+        scored = _score_all(db, user_id=user_id, candidates=candidates,
+                            name=name, description=description)
 
         positives = sorted([s for s in scored if s["score"] >= POSITIVE_THRESHOLD],
                            key=lambda s: -s["score"])[:TOP_POSITIVES]
@@ -302,26 +303,14 @@ def extend_inbox_history_task(user_id: str, before_internal_date_ms: int) -> Non
         sync_lock.release(user_id)
 
 
-def _score_all(gmail, *, candidates: list[dict], name: str, description: str) -> list[dict]:
-    """Refetch full thread bodies from Gmail sequentially, then score in parallel.
-
-    Sequential Gmail fetches (~200ms each) are unavoidable because the DB only
-    stores a 150-char body_preview; we need the full body for accurate scoring.
-    LLM scoring runs concurrently under the shared LLM-client semaphore.
-    """
-    parsed_threads = []
-    for c in candidates:
-        try:
-            resp = gmail.users().threads().get(
-                userId="me", id=c["gmail_thread_id"], format="full"
-            ).execute()
-            parsed = assemble_thread(
-                thread_id=c["gmail_thread_id"],
-                raw_messages=resp.get("messages", []) or [],
-            )
-            parsed_threads.append((c, parsed))
-        except Exception:
-            log.exception("draft_preview: gmail.threads.get failed for %s", c["gmail_thread_id"])
+def _score_all(db, *, user_id: str, candidates: list[dict], name: str, description: str) -> list[dict]:
+    """Score candidates from Postgres bodies (0006+) in parallel under the
+    shared LLM semaphore. The sequential gmail refetch is gone."""
+    triples = inbox_repo.load_parsed_threads(
+        db, user_id=user_id, internal_ids=[c["thread_id"] for c in candidates])
+    parsed_by_id = {internal_id: parsed for internal_id, _, parsed in triples}
+    pairs = [(c, parsed_by_id[c["thread_id"]]) for c in candidates
+             if c["thread_id"] in parsed_by_id]
 
     s = get_settings()
 
@@ -335,12 +324,12 @@ def _score_all(gmail, *, candidates: list[dict], name: str, description: str) ->
         return score_thread.parse_response(text)
 
     async def _all():
-        return await asyncio.gather(*[_score_one(p) for _, p in parsed_threads])
+        return await asyncio.gather(*[_score_one(p) for _, p in pairs])
 
     parsed_results = llm_client.run_in_loop(_all())
 
     out = []
-    for (c, parsed), result in zip(parsed_threads, parsed_results):
+    for (c, _), result in zip(pairs, parsed_results):
         if not result:
             continue
         out.append({
@@ -420,53 +409,23 @@ def _inline_reload(db, *, user) -> list[str]:
 
 
 def _reclassify_all(db, *, user) -> list[str]:
-    """Refetch every thread from Gmail, run classify() against the user's
-    full bucket set with existing bucket_ids as stability hints, write back
-    only the rows whose pick changed. Returns internal ids of changed rows.
-
-    Why refetch from Gmail: the DB stores a 150-char body_preview which is
-    not enough for accurate classification (same constraint the draft
-    preview pipeline faces). Sequential fetches at ~200ms each + parallel
-    LLM calls under the shared semaphore.
-    """
-    rows = db.execute(
-        select(InboxThread.id, InboxThread.gmail_id, InboxThread.bucket_id)
-        .where(InboxThread.user_id == user.id)
-    ).all()
-    if not rows:
+    """Reclassify every stored thread from Postgres bodies (0006+). The old
+    per-thread gmail.threads.get loop (~200ms each) is gone — reclassify of a
+    200-thread inbox is now LLM-bound."""
+    triples = inbox_repo.load_parsed_threads(db, user_id=user.id)
+    if not triples:
         log.info("reclassify._reclassify_all: user=%s no threads", user.id)
         return []
 
-    log.info("reclassify._reclassify_all: user=%s fetching %d threads from gmail",
-             user.id, len(rows))
-    gmail = get_gmail_client(db, user)
-    parsed_triples: list[tuple[str, str | None, ParsedThread]] = []
-    for internal_id, gmail_thread_id, current_bucket in rows:
-        try:
-            resp = gmail.users().threads().get(
-                userId="me", id=gmail_thread_id, format="full",
-            ).execute()
-            parsed = assemble_thread(
-                thread_id=gmail_thread_id,
-                raw_messages=resp.get("messages", []) or [],
-            )
-            parsed_triples.append((internal_id, current_bucket, parsed))
-        except Exception:
-            log.exception("reclassify: gmail.threads.get failed for %s; skipping",
-                          gmail_thread_id)
-
-    if not parsed_triples:
-        return []
-
     buckets = bucket_repo.list_active(db, user_id=user.id)
-    threads = [p for _, _, p in parsed_triples]
-    current = [c for _, c, _ in parsed_triples]
+    threads = [p for _, _, p in triples]
+    current = [b for _, b, _ in triples]
     log.info("reclassify._reclassify_all: user=%s classifying %d threads against %d buckets",
              user.id, len(threads), len(buckets))
-    new_bucket_ids = classify(threads, buckets, current)
+    new_bucket_ids = classify(threads, buckets, current)  # Task 8 adds user_id=
 
     changed: list[str] = []
-    for (internal_id, old_bucket, _), new_bucket in zip(parsed_triples, new_bucket_ids):
+    for (internal_id, old_bucket, _), new_bucket in zip(triples, new_bucket_ids):
         if new_bucket == old_bucket:
             continue
         thread_row = db.get(InboxThread, internal_id)

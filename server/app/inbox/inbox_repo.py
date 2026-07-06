@@ -10,6 +10,7 @@ import uuid
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 from app.db.models import InboxMessage, InboxThread, User
+from app.gmail.parser import ParsedMessage, ParsedThread
 
 
 def upsert_thread(
@@ -216,3 +217,46 @@ def clear_user_inbox(db: Session, *, user_id: str) -> None:
     """
     db.execute(delete(InboxMessage).where(InboxMessage.user_id == user_id))
     db.execute(delete(InboxThread).where(InboxThread.user_id == user_id))
+
+
+def load_parsed_threads(
+    db: Session, *, user_id: str, internal_ids: list[str] | None = None,
+) -> list[tuple[str, str | None, ParsedThread]]:
+    """Rebuild ParsedThreads from stored rows so LLM paths never refetch
+    Gmail (chosen-architecture §5.1 self-sufficiency). Returns
+    (internal_id, bucket_id, parsed) triples; soft-deleted messages are
+    excluded; body_text falls back to body_preview for pre-0006 rows that
+    haven't been re-touched by sync yet. Threads with no usable messages
+    are skipped."""
+    stmt = select(InboxThread).where(InboxThread.user_id == user_id)
+    if internal_ids is not None:
+        if not internal_ids:
+            return []
+        stmt = stmt.where(InboxThread.id.in_(internal_ids))
+    out: list[tuple[str, str | None, ParsedThread]] = []
+    for t in db.execute(stmt).scalars().all():
+        msgs = db.execute(
+            select(InboxMessage)
+            .where(InboxMessage.thread_id == t.id,
+                   InboxMessage.is_deleted == False)  # noqa: E712
+            .order_by(InboxMessage.gmail_internal_date.asc())
+        ).scalars().all()
+        parsed_msgs = [
+            ParsedMessage(
+                gmail_message_id=m.gmail_id, gmail_thread_id=m.gmail_thread_id,
+                gmail_internal_date=m.gmail_internal_date,
+                gmail_history_id=m.gmail_history_id,
+                subject=t.subject, from_addr=m.from_addr, to_addr=m.to_addr,
+                body_text=m.body_text or m.body_preview or "",
+                body_preview=m.body_preview or "",
+                label_ids=list(m.labels or []),
+            )
+            for m in msgs
+        ]
+        if not parsed_msgs:
+            continue
+        out.append((t.id, t.bucket_id, ParsedThread(
+            gmail_thread_id=t.gmail_id, subject=t.subject,
+            recent_internal_date=parsed_msgs[-1].gmail_internal_date,
+            messages=parsed_msgs)))
+    return out

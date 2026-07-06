@@ -191,3 +191,27 @@ def test_list_threads_excludes_archived_by_default_and_sorts_by_activity(db):
     with_arch = inbox_repo.list_threads(db, user_id=user.id, limit=10, offset=0,
                                         include_archived=True)
     assert [t.gmail_id for t in with_arch] == ["g-new", "g-arch", "g-old"]
+
+
+def test_load_parsed_threads_reconstructs_from_rows(db):
+    user = _mk_user(db)
+    inbox_repo.upsert_thread(db, user_id=user.id, gmail_thread_id="glp",
+                             subject="subj", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id=user.id, gmail_thread_id="glp", gmail_message_id="m-a",
+        gmail_internal_date=200, gmail_history_id="1", to_addr=None,
+        from_addr="x@y.z", body_preview="prev", body_text="full body")
+    inbox_repo.upsert_message(  # pre-migration shape: no body_text
+        db, user_id=user.id, gmail_thread_id="glp", gmail_message_id="m-b",
+        gmail_internal_date=100, gmail_history_id="1", to_addr=None,
+        from_addr="x@y.z", body_preview="only preview")
+
+    triples = inbox_repo.load_parsed_threads(db, user_id=user.id)
+    assert len(triples) == 1
+    internal_id, bucket_id, parsed = triples[0]
+    assert bucket_id is None
+    assert parsed.gmail_thread_id == "glp"
+    assert [m.gmail_message_id for m in parsed.messages] == ["m-b", "m-a"]  # ascending
+    assert parsed.messages[1].body_text == "full body"
+    assert parsed.messages[0].body_text == "only preview"  # fallback
+    assert parsed.recent_internal_date == 200
