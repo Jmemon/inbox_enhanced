@@ -207,7 +207,10 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
     """Bootstrap / 404-recovery sync.
 
     Reconciling upsert, NOT a wipe: repopulates from the 200 most-recently-
-    active gmail threads, upserting each (never deleting). Stored,
+    active gmail threads, upserting each (never deleting). The listing
+    (labelIds=["INBOX"]) is authoritative in both directions within the
+    window it covers: listed threads that were previously is_archived=True
+    are cleared back to False (they reappeared in the inbox), and stored,
     non-archived threads whose last activity falls inside the window we just
     listed but which gmail no longer returns are marked is_archived=True —
     they left the inbox while our cursor was dead. Threads outside that
@@ -250,28 +253,57 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
         for p, b in zip(parsed_list, bucket_ids)
     ]
 
-    # Reconcile: a stored, non-archived thread whose activity falls inside the
-    # window we just listed but which Gmail no longer returns has left the
-    # inbox while our cursor was dead (archived/deleted remotely). Mark it
-    # archived — never delete; task evidence may reference it. Threads older
-    # than the listed window are out of scope for this listing and untouched.
+    # Reconcile: full sync's labelIds=["INBOX"] listing is authoritative in
+    # BOTH directions within the window it just observed — a thread it lists
+    # IS in the inbox right now (even if a stale is_archived=True flag says
+    # otherwise), and a stored, non-archived thread whose activity falls
+    # inside the window but which the listing no longer returns has left the
+    # inbox while our cursor was dead. Never delete rows either way; task
+    # evidence may reference them.
     if parsed_list:
         listed_gmail_ids = {p.gmail_thread_id for p in parsed_list}
-        window_min = min(p.recent_internal_date for p in parsed_list)
-        stale = db.execute(
+
+        # Un-archive: nothing else in the sync path ever clears is_archived,
+        # so a thread that reappears in an INBOX listing must be cleared here.
+        # Its internal id is already in internal_ids via the upsert loop
+        # above (every parsed thread — listed thread — was upserted there),
+        # so no extra appends are needed.
+        reappeared = db.execute(
             select(InboxThread).where(
                 InboxThread.user_id == user.id,
-                InboxThread.is_archived == False,  # noqa: E712
-                InboxThread.gmail_id.not_in(listed_gmail_ids),
-                InboxThread.last_activity_at >= window_min,
+                InboxThread.gmail_id.in_(listed_gmail_ids),
+                InboxThread.is_archived == True,  # noqa: E712
             )
         ).scalars().all()
-        for t in stale:
-            t.is_archived = True
-            internal_ids.append(t.id)
-        if stale:
-            log.info("full_sync_inbox: user=%s archived %d threads absent from listing",
-                     user.id, len(stale))
+        for t in reappeared:
+            t.is_archived = False
+
+        # Archive: only trust the window's floor when at least one listed
+        # thread has a real timestamp. parser.assemble_thread returns
+        # recent_internal_date=0 for a thread whose raw_messages came back
+        # empty (a malformed/edge-case listing entry); if that 0 leaked into
+        # window_min, the filter below (last_activity_at >= window_min) would
+        # become last_activity_at >= 0 and match nearly every stored thread,
+        # mass-archiving them in one sync. listed_gmail_ids above is still
+        # built from ALL parsed threads (including messageless ones), so a
+        # messageless listed thread itself is still never archived.
+        window_dates = [p.recent_internal_date for p in parsed_list if p.recent_internal_date > 0]
+        if window_dates:
+            window_min = min(window_dates)
+            stale = db.execute(
+                select(InboxThread).where(
+                    InboxThread.user_id == user.id,
+                    InboxThread.is_archived == False,  # noqa: E712
+                    InboxThread.gmail_id.not_in(listed_gmail_ids),
+                    InboxThread.last_activity_at >= window_min,
+                )
+            ).scalars().all()
+            for t in stale:
+                t.is_archived = True
+                internal_ids.append(t.id)
+            if stale:
+                log.info("full_sync_inbox: user=%s archived %d threads absent from listing",
+                         user.id, len(stale))
 
     # Walk parsed_list once after upserting to find the max history_id across all
     # ingested messages — used to advance the user's gmail cursor.

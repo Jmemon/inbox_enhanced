@@ -295,3 +295,106 @@ def test_full_sync_reconciles_instead_of_wiping(db):
     # no rows were deleted
     assert db.execute(select(func.count(InboxThread.id)).where(
         InboxThread.user_id == u.id)).scalar_one() >= 4
+
+
+def test_full_sync_window_ignores_messageless_threads(db):
+    """A malformed listed thread with zero messages must not collapse the
+    reconcile window to 0. parser.assemble_thread returns recent_internal_date=0
+    for a thread whose raw_messages is empty; if window_min trusted that value,
+    the reconcile filter `last_activity_at >= 0` would match almost every
+    stored thread, causing mass false-archival in a single sync."""
+    u = _seed_user(db, history_id=None)
+
+    # Stored thread with real (if old) activity. Its last_activity_at (100) is
+    # still >= 0, so under the bug (window_min collapsed to 0 by the
+    # messageless thread below) it would be incorrectly swept into the
+    # archive filter even though it's nowhere near the listed window (5000).
+    inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="g-old", subject="old", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="g-old", gmail_message_id="m-old",
+        gmail_internal_date=100, gmail_history_id="50",
+        to_addr=None, from_addr=None, body_preview="old",
+    )
+    db.commit()
+
+    listing = {"threads": [{"id": "gT_NORMAL"}, {"id": "gT_EMPTY"}]}
+
+    def _fake_threads_get(*, userId, id, format):
+        inner = MagicMock()
+        if id == "gT_NORMAL":
+            inner.execute.return_value = {
+                "id": "gT_NORMAL",
+                "messages": [{
+                    "id": "m_normal", "threadId": "gT_NORMAL",
+                    "internalDate": "5000", "historyId": "999",
+                    "payload": {
+                        "mimeType": "text/plain",
+                        "headers": [{"name": "Subject", "value": "normal"}],
+                        "body": {"data": ""},
+                    },
+                }],
+            }
+        else:
+            # Malformed listing entry: gmail returned zero messages for this
+            # thread id, so assemble_thread yields recent_internal_date=0.
+            inner.execute.return_value = {"id": "gT_EMPTY", "messages": []}
+        return inner
+
+    gmail = MagicMock()
+    gmail.users().threads().list().execute.return_value = listing
+    gmail.users().threads().get.side_effect = _fake_threads_get
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        gmail_sync.full_sync_inbox(db, user=u)
+
+    old = db.execute(select(InboxThread).where(
+        InboxThread.user_id == "u1", InboxThread.gmail_id == "g-old")).scalar_one()
+    assert old.is_archived is False, \
+        "messageless listed thread must not collapse window_min to 0 and mass-archive"
+
+
+def test_full_sync_unarchives_reappearing_thread(db):
+    """Full sync's labelIds=["INBOX"] listing is authoritative in both
+    directions: any thread it lists IS in the inbox right now, even if a
+    stale is_archived=True flag says otherwise (e.g. the thread was archived,
+    then un-archived in gmail before our cursor caught up). Nothing else in
+    the sync path ever clears is_archived, so full sync must."""
+    u = _seed_user(db, history_id=None)
+
+    inbox_repo.upsert_thread(db, user_id="u1", gmail_thread_id="g-reappear", subject="back", bucket_id=None)
+    inbox_repo.upsert_message(
+        db, user_id="u1", gmail_thread_id="g-reappear", gmail_message_id="m-reappear",
+        gmail_internal_date=1000, gmail_history_id="10",
+        to_addr=None, from_addr=None, body_preview="back",
+    )
+    thread = db.execute(select(InboxThread).where(
+        InboxThread.user_id == "u1", InboxThread.gmail_id == "g-reappear")).scalar_one()
+    thread.is_archived = True
+    db.flush()  # tests must flush explicitly; production read helpers never do
+    db.commit()
+
+    listing = {"threads": [{"id": "g-reappear"}]}
+    fixture = {
+        "id": "g-reappear",
+        "messages": [{
+            "id": "m-reappear2", "threadId": "g-reappear",
+            "internalDate": "6000", "historyId": "999",
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [{"name": "Subject", "value": "back again"}],
+                "body": {"data": ""},
+            },
+        }],
+    }
+
+    gmail = MagicMock()
+    gmail.users().threads().list().execute.return_value = listing
+    gmail.users().threads().get().execute.return_value = fixture
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail):
+        ids = gmail_sync.full_sync_inbox(db, user=u)
+
+    row = db.execute(select(InboxThread).where(
+        InboxThread.user_id == "u1", InboxThread.gmail_id == "g-reappear")).scalar_one()
+    assert row.is_archived is False
+    assert row.id in ids
