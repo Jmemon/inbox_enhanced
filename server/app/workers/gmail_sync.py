@@ -362,11 +362,21 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
 
     # Parse all threads first, then classify in one batch call, then upsert.
     # This lets classify() parallelize LLM calls across all threads in a single gather().
+    # Per-thread try/except (matching partial_sync_inbox/extend_inbox_history below):
+    # one flaky threads.get() must not 500 the whole bootstrap/recovery sync. Failed
+    # stub ids are remembered so the reconcile step below can tell "gmail didn't list
+    # it" apart from "we couldn't fetch it this round" — see failed_gmail_ids use.
     parsed_list: list[ParsedThread] = []
+    failed_gmail_ids: set[str] = set()
     for stub in thread_stubs:
         tid = stub["id"]
         log.info("full_sync_inbox: fetching thread %s for user=%s", tid, user.id)
-        thread_resp = gmail.users().threads().get(userId="me", id=tid, format="full").execute()
+        try:
+            thread_resp = gmail.users().threads().get(userId="me", id=tid, format="full").execute()
+        except Exception:
+            log.exception("full_sync_inbox: threads.get failed for %s; skipping", tid)
+            failed_gmail_ids.add(tid)
+            continue
         parsed_list.append(assemble_thread(thread_id=tid, raw_messages=thread_resp.get("messages", []) or []))
 
     bucket_ids = _classify_batch(db, user_id=user.id, parsed_list=parsed_list)
@@ -412,11 +422,17 @@ def full_sync_inbox(db: Session, *, user: User) -> list[str]:
         window_dates = [p.recent_internal_date for p in parsed_list if p.recent_internal_date > 0]
         if window_dates:
             window_min = min(window_dates)
+            # Exclude failed_gmail_ids alongside listed_gmail_ids: a threads.get()
+            # failure means "we don't know this thread's current state this round,"
+            # not "gmail no longer lists it." Without this, a transient per-thread
+            # fetch error (see the try/except above) would make a still-live, merely
+            # unfetchable thread look identical to one that actually left the inbox,
+            # and the reconcile step below would wrongly archive it.
             stale = db.execute(
                 select(InboxThread).where(
                     InboxThread.user_id == user.id,
                     InboxThread.is_archived == False,  # noqa: E712
-                    InboxThread.gmail_id.not_in(listed_gmail_ids),
+                    InboxThread.gmail_id.not_in(listed_gmail_ids | failed_gmail_ids),
                     InboxThread.last_activity_at >= window_min,
                 )
             ).scalars().all()
