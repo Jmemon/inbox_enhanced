@@ -85,6 +85,13 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
                 extra_body={"usage": {"include": True}},
             )
             duration_ms = int((time.monotonic() - t0) * 1000)
+            # Extract content BEFORE recording metrics: a malformed 200 (empty
+            # `choices`, or `message` None — a real OpenRouter edge case for
+            # content-filtered completions) must raise here and fall through
+            # to the `except` below, not after a success row is already
+            # recorded — otherwise one real call double-counts as both a
+            # success and an error row in llm_calls.
+            content = resp.choices[0].message.content or ""
             usage = getattr(resp, "usage", None)
             details = getattr(usage, "prompt_tokens_details", None) if usage else None
             await asyncio.to_thread(
@@ -96,7 +103,7 @@ async def call_messages(*, model: str, system: str, user: str, max_tokens: int =
                 cost_usd=getattr(usage, "cost", None) if usage else None,
                 duration_ms=duration_ms, outcome="success",
             )
-            return resp.choices[0].message.content or ""
+            return content
         except Exception:
             duration_ms = int((time.monotonic() - t0) * 1000)
             log.exception("openrouter chat.completions.create failed")

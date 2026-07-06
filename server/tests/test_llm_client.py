@@ -55,6 +55,36 @@ def test_call_messages_records_success_metrics(monkeypatch):
     assert calls[0]["duration_ms"] >= 0
 
 
+def test_call_messages_malformed_response_records_single_error_row(monkeypatch):
+    """A 200 response with empty `choices` (OpenRouter content-filter edge
+    case) raises on `resp.choices[0]` when accessed after the success-path
+    record_call. That must not produce a success row AND an error row —
+    exactly one error row, and call_messages degrades to ""."""
+    client._ensure_initialized()
+    calls: list[dict] = []
+    from app.llm import metrics
+    monkeypatch.setattr(metrics, "record_call", lambda **kw: calls.append(kw))
+
+    class _Usage:
+        prompt_tokens = 100
+        completion_tokens = 0
+        prompt_tokens_details = None
+        cost = 0.0001
+    class _Resp:
+        choices: list = []
+        usage = _Usage()
+    class _Create:
+        async def create(self, **kw): return _Resp()
+    class _Chat: completions = _Create()
+    class _C: chat = _Chat()
+    client._state["client"] = _C()
+
+    out = client.run_in_loop(client.call_messages(model="m", system="s", user="u"))
+    assert out == ""
+    assert len(calls) == 1
+    assert calls[0]["outcome"] == "error"
+
+
 def test_call_messages_records_error_metrics(monkeypatch):
     client._ensure_initialized()
     calls: list[dict] = []
