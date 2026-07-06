@@ -63,7 +63,7 @@ export default function HudPage() {
       {search.results !== null ? (
         <main>
           {search.error && <div style={{ color: '#8a1c25', padding: 16 }}>search error: {search.error}</div>}
-          <InboxList threads={search.results} bucketsById={buckets.byId} />
+          <InboxList threads={search.results} bucketsById={buckets.byId} emptyLabel="no results" />
         </main>
       ) : (
         <main style={{ padding: '16px 24px', display: 'grid', gap: 24 }}>

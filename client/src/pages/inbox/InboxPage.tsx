@@ -54,7 +54,7 @@ export default function InboxPage() {
         {search.results !== null ? (
           <>
             {search.error && <div style={{ color: '#8a1c25', padding: 16 }}>search error: {search.error}</div>}
-            <InboxList threads={search.results} bucketsById={buckets.byId} />
+            <InboxList threads={search.results} bucketsById={buckets.byId} emptyLabel="no results" />
           </>
         ) : (
           <>
