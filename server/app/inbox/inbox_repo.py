@@ -145,11 +145,12 @@ def list_threads(
     last_activity_at sort — no join). Archived threads are hidden unless
     asked for; they remain queryable because tasks may reference them.
 
-    Flushes first: sessions here run with autoflush=False (see db/session.py),
-    so a caller that just mutated thread.is_archived (or upserted a message)
-    on an already-loaded ORM object needs that write visible to this SELECT
-    without an explicit commit — same rationale as recompute_thread_pointers."""
-    db.flush()
+    Read-only: this is a pure SELECT and must not flush. Sessions here run
+    with autoflush=False (see db/session.py); callers that mutate an
+    already-loaded ORM object (e.g. thread.is_archived) and need that write
+    visible to this SELECT are responsible for flushing/committing before
+    calling list_threads — see recompute_thread_pointers for the analogous
+    write-side helper that does flush."""
     stmt = (
         select(InboxThread)
         .where(InboxThread.user_id == user_id)

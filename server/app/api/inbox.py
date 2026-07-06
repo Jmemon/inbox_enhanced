@@ -1,7 +1,8 @@
 """Inbox HTTP API.
 
 Four routes:
- - GET  /api/inbox?limit=200&page=N  → paginated thread list with as_of cursor
+ - GET  /api/inbox?limit=200&page=N&include_archived=false → paginated thread
+        list with as_of cursor; include_archived=true also returns archived threads
  - GET  /api/threads/{id}            → single thread fetch (rare; mostly a fallback)
  - POST /api/threads/batch           → fetch many threads in one call (SSE replay path)
  - POST /api/inbox/refresh           → on-demand poll (the Reload button); 202

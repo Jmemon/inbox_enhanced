@@ -183,6 +183,7 @@ def test_list_threads_excludes_archived_by_default_and_sorts_by_activity(db):
     arch = db.execute(select(InboxThread).where(
         InboxThread.user_id == user.id, InboxThread.gmail_id == "g-arch")).scalar_one()
     arch.is_archived = True
+    db.flush()  # session runs autoflush=False; make the mutation visible to list_threads' SELECT
 
     listed = inbox_repo.list_threads(db, user_id=user.id, limit=10, offset=0)
     assert [t.gmail_id for t in listed] == ["g-new", "g-old"]

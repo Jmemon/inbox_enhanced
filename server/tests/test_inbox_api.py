@@ -2,10 +2,10 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from app.main import app
-from app.db.models import Base, User
+from app.db.models import Base, InboxThread, User
 from app.db.session import get_db
 from app.auth import sessions
 from app.inbox import inbox_repo
@@ -140,3 +140,27 @@ def test_inbox_serializer_carries_flags(authed):
     t = r.json()["threads"][0]
     assert t["is_archived"] is False
     assert "is_unread" in t["recent_message"]
+
+
+def test_get_inbox_include_archived_query_param(authed):
+    """Archived threads are hidden by default and included with ?include_archived=true —
+    exercises the pass-through from the route down to inbox_repo.list_threads."""
+    c, TestSession = authed
+    _seed_thread(TestSession, gmail_thread_id="gA", internal_date=1)
+    _seed_thread(TestSession, gmail_thread_id="gB", internal_date=2)
+
+    db = TestSession()
+    thread = db.execute(
+        select(InboxThread).where(InboxThread.user_id == "u1", InboxThread.gmail_id == "gB")
+    ).scalar_one()
+    thread.is_archived = True
+    db.commit()
+    db.close()
+
+    r = c.get("/api/inbox")
+    assert r.status_code == 200
+    assert [t["gmail_thread_id"] for t in r.json()["threads"]] == ["gA"]
+
+    r = c.get("/api/inbox?include_archived=true")
+    assert r.status_code == 200
+    assert {t["gmail_thread_id"] for t in r.json()["threads"]} == {"gA", "gB"}
