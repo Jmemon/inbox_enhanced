@@ -307,7 +307,21 @@ export async function createTask(body: {
     method: 'POST', credentials: 'same-origin',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   })
-  if (!r.ok) throw new Error(`create task: ${r.status}`)
+  if (!r.ok) {
+    // The EPS schema validator (task_engine/schema.py) surfaces a single
+    // actionable string in `detail` on 422 — surface that instead of the bare
+    // status code so the wizard's inline banner is useful. Guard the parse: a
+    // non-JSON error body (e.g. a proxy error page) falls back to the generic
+    // message rather than throwing from inside the catch.
+    let message = `create task: ${r.status}`
+    try {
+      const errBody = await r.json()
+      if (errBody?.detail) message = errBody.detail
+    } catch {
+      // not JSON — keep the generic message
+    }
+    throw new Error(message)
+  }
   return r.json()
 }
 
