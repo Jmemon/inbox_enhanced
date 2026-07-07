@@ -233,3 +233,187 @@ export type SyncStatus = { last_synced_at: number | null; has_cursor: boolean }
 export function getSyncStatus(): Promise<SyncStatus> {
   return getJSON<SyncStatus>('/api/sync/status')
 }
+
+// --- Task types ---
+// Mirrors server/app/api/tasks.py's `_serialize_*` helpers field-for-field —
+// see that module's docstring for the extraction pipeline these feed.
+
+export type TaskSummary = { entities: number; pending_reviews: number; last_event_at: string | null }
+export type Task = { id: string; name: string; goal: string; kind: string; status: 'active' | 'paused'; version: number; summary: TaskSummary }
+export type TaskStateSchema = {
+  version: number
+  entity: { noun: string; identity_hint: string; attributes: { key: string; type: string; values?: string[] | null }[] } | null
+  pipeline: { stages: string[]; terminal: string[] }
+}
+export type TaskDetail = Task & { state_schema: TaskStateSchema | null }
+export type TaskEntity = { id: string; entity_key: string; display_name: string; state: Record<string, string | null>; updated_at: string }
+export type TaskEvent = {
+  id: string; field: string | null; old_value: string | null; new_value: string | null
+  evidence_quote: string | null; confidence: number | null; origin: 'llm' | 'user'
+  status: 'applied' | 'pending_review' | 'rejected' | 'reverted'
+  pending_reason: string | null; proposed_entity: string | null
+  thread_id: string | null; message_id: string | null; gmail_message_id: string | null
+  entity_id: string | null; created_at: string
+}
+export type TaskDraftProposal = { name: string; description: string; state_schema: TaskStateSchema; keyword_probes: string[] }
+export type TaskDraftPoll =
+  | { status: 'pending' } | { status: 'gone' }
+  | { status: 'ready'; proposal: TaskDraftProposal; positives: PreviewExample[]; near_misses: PreviewExample[] }
+
+// --- Task calls ---
+
+export async function postTaskDraft(goal: string): Promise<{ draft_id: string }> {
+  const r = await fetch('/api/tasks/draft', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ goal }),
+  })
+  if (r.status !== 202) throw new Error(`task draft: ${r.status}`)
+  return r.json()
+}
+
+// Polling fallback for the SSE-pushed task_draft_ready event — same
+// 200/202/404 mapping as getBucketDraftPreview (GET /api/tasks/draft/{id}
+// can also 403 "not your draft" like its bucket counterpart; that falls
+// through to the generic throw below, same as getBucketDraftPreview does).
+export async function getTaskDraft(draftId: string): Promise<TaskDraftPoll> {
+  const url = `/api/tasks/draft/${encodeURIComponent(draftId)}`
+  const t0 = performance.now()
+  const r = await fetch(url, { credentials: 'same-origin' })
+  const ms = Math.round(performance.now() - t0)
+  if (r.status === 202) {
+    console.log('[api] poll', url, '→ pending', ms, 'ms')
+    return { status: 'pending' }
+  }
+  if (r.status === 200) {
+    const body = (await r.json()) as TaskDraftPoll
+    console.log('[api] poll', url, '→ ready in', ms, 'ms')
+    return body
+  }
+  if (r.status === 404) {
+    console.warn('[api] poll', url, '→ 404 (gone) in', ms, 'ms')
+    return { status: 'gone' }
+  }
+  console.error('[api] poll', url, '→', r.status, ms, 'ms')
+  throw new Error(`task draft poll: ${r.status}`)
+}
+
+export async function createTask(body: {
+  name: string; goal: string; description: string; state_schema: TaskStateSchema;
+  keyword_probes: string[]; confirmed_positives: BucketExampleIn[]; confirmed_negatives: BucketExampleIn[];
+}): Promise<TaskDetail> {
+  // POST /api/tasks 201s with the full task-detail body (_serialize_task_detail
+  // — state_schema + summary included), not the bare Task shape.
+  const r = await fetch('/api/tasks', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(`create task: ${r.status}`)
+  return r.json()
+}
+
+export function getTasks(): Promise<{ tasks: Task[] }> {
+  return getJSON<{ tasks: Task[] }>('/api/tasks')
+}
+
+export function getTask(id: string): Promise<TaskDetail> {
+  return getJSON<TaskDetail>(`/api/tasks/${encodeURIComponent(id)}`)
+}
+
+export async function patchTask(id: string, body: {
+  name?: string; status?: 'active' | 'paused'; state_schema?: TaskStateSchema;
+}): Promise<TaskDetail> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: 'PATCH', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  if (!r.ok) throw new Error(`patch task: ${r.status}`)
+  return r.json()
+}
+
+export async function deleteTask(id: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}`, {
+    method: 'DELETE', credentials: 'same-origin',
+  })
+  if (r.status !== 204) throw new Error(`delete task: ${r.status}`)
+}
+
+export function getTaskBoard(id: string): Promise<{ entities: TaskEntity[] }> {
+  return getJSON<{ entities: TaskEntity[] }>(`/api/tasks/${encodeURIComponent(id)}/board`)
+}
+
+export function getTaskEvents(id: string, opts: {
+  status?: TaskEvent['status']; entity_id?: string; page?: number; limit?: number;
+} = {}): Promise<{ events: TaskEvent[] }> {
+  const params = new URLSearchParams()
+  if (opts.status) params.set('status', opts.status)
+  if (opts.entity_id) params.set('entity_id', opts.entity_id)
+  if (opts.page) params.set('page', String(opts.page))
+  if (opts.limit) params.set('limit', String(opts.limit))
+  const qs = params.toString()
+  return getJSON<{ events: TaskEvent[] }>(`/api/tasks/${encodeURIComponent(id)}/events${qs ? `?${qs}` : ''}`)
+}
+
+export function getTaskThreads(id: string): Promise<{ threads: InboxThread[] }> {
+  return getJSON<{ threads: InboxThread[] }>(`/api/tasks/${encodeURIComponent(id)}/threads`)
+}
+
+// POST /api/tasks/{id}/threads 201s with the attached thread's serialized
+// InboxThread body — discarded here (fire-and-forget; callers already hold
+// the thread client-side and get the fresh state via task_updated + refetch).
+export async function attachThread(id: string, threadId: string, addExample: boolean): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}/threads`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ thread_id: threadId, add_example: addExample }),
+  })
+  if (r.status !== 201) throw new Error(`attach thread: ${r.status}`)
+}
+
+export async function detachThread(id: string, threadId: string, addExample: boolean): Promise<void> {
+  const params = new URLSearchParams({ add_example: String(addExample) })
+  const r = await fetch(
+    `/api/tasks/${encodeURIComponent(id)}/threads/${encodeURIComponent(threadId)}?${params.toString()}`,
+    { method: 'DELETE', credentials: 'same-origin' },
+  )
+  if (r.status !== 204) throw new Error(`detach thread: ${r.status}`)
+}
+
+// approve/reject/revert all return 200 (no status_code override) with the
+// serialized TaskEvent body — discarded here, same rationale as attachThread;
+// the review tray refetches events off the task_updated SSE push.
+export async function approveEvent(id: string, eventId: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}/events/${encodeURIComponent(eventId)}/approve`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (!r.ok) throw new Error(`approve event: ${r.status}`)
+}
+
+export async function rejectEvent(id: string, eventId: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}/events/${encodeURIComponent(eventId)}/reject`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (!r.ok) throw new Error(`reject event: ${r.status}`)
+}
+
+export async function revertEvent(id: string, eventId: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}/events/${encodeURIComponent(eventId)}/revert`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (!r.ok) throw new Error(`revert event: ${r.status}`)
+}
+
+export async function setEntityState(id: string, entityId: string, field: string, value: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}/entities/${encodeURIComponent(entityId)}/state`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ field, value }),
+  })
+  if (!r.ok) throw new Error(`set entity state: ${r.status}`)
+}
+
+export async function mergeEntity(id: string, entityId: string, intoEntityId: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(id)}/entities/${encodeURIComponent(entityId)}/merge`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ into_entity_id: intoEntityId }),
+  })
+  if (r.status !== 204) throw new Error(`merge entity: ${r.status}`)
+}

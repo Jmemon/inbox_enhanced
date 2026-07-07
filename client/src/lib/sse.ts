@@ -11,6 +11,9 @@ export type SseDataEvent =
   | { event: 'threads_updated'; thread_ids: string[] }
   | { event: 'bucket_draft_preview'; draft_id: string; positives: PreviewExample[]; near_misses: PreviewExample[] }
   | { event: 'extend_complete'; thread_ids: string[]; more: boolean }
+  | { event: 'task_draft_ready'; draft_id: string }
+  | { event: 'task_updated'; task_id: string; version: number; pending_count: number }
+  | { event: 'task_backfill_progress'; task_id: string; scanned: number; matched: number; done: boolean }
 
 export type SseConnEvent = { event: '_open' } | { event: '_error' }
 export type SseEvent = SseDataEvent | SseConnEvent
