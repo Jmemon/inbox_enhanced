@@ -882,6 +882,74 @@ def test_revert_non_applied_409(authed):
     assert r.status_code == 409
 
 
+def test_approve_redates_event_so_approval_survives_a_later_refold(authed):
+    """2C ledger Fix 1: task_events fold ascending by created_at
+    (repo.refold_entity) — approving an OLD pending event (its created_at
+    stuck in the past) without re-dating it would let ANY later refold
+    (revert/detach/merge touching this same entity) silently re-fold a
+    newer-but-since-superseded applied event's value back on top of the
+    user's explicit approval. The approve route must re-date the event to
+    now() immediately before apply_event so the user's decision — happening
+    right now — always sorts last on any future fold."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+
+    # An OLD pending event on `stage` (t1, far in the past).
+    old_pending = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="approved_value", evidence_quote="quote",
+    )
+    old_pending.created_at = datetime.fromtimestamp(1000, tz=timezone.utc)
+    db.commit()
+
+    # A NEWER applied event on the SAME field (t2 > t1, but still long before
+    # "now") — an un-redated fold would sort this one last, clobbering the
+    # approval below.
+    newer_applied = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="applied",
+        field="stage", new_value="stale_value",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=newer_applied)
+    newer_applied.created_at = datetime.fromtimestamp(2000, tz=timezone.utc)
+    db.commit()
+
+    # A third, unrelated applied event on the SAME entity — its later revert
+    # is what forces the refold that would otherwise undo the approval.
+    third = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="applied",
+        field="notes", new_value="whatever",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=third)
+    db.commit()
+    old_pending_id, third_id, entity_id = old_pending.id, third.id, entity.id
+    db.close()
+
+    r = c.post(f"/api/tasks/{task_id}/events/{old_pending_id}/approve")
+    assert r.status_code == 200
+
+    db2 = TS()
+    entity2 = task_repo.get_entity(db2, task_id=task_id, entity_id=entity_id)
+    assert entity2.state["stage"] == "approved_value"
+    db2.close()
+
+    # Force a refold via an unrelated revert on the SAME entity — this is
+    # exactly the "later refold" (revert/detach/merge) the coordinator-pinned
+    # semantics must survive.
+    r2 = c.post(f"/api/tasks/{task_id}/events/{third_id}/revert")
+    assert r2.status_code == 200
+
+    db3 = TS()
+    entity3 = task_repo.get_entity(db3, task_id=task_id, entity_id=entity_id)
+    assert entity3.state["stage"] == "approved_value"  # survives the refold
+
+
 def test_events_other_user_task_404(authed):
     c, TS = authed
     other_id = _mk_task(TS, uid="u2")

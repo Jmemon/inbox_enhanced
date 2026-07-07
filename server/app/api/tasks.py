@@ -18,6 +18,7 @@ own `_publish_task_updated` helper of the same shape.
 
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
@@ -539,6 +540,17 @@ def approve_event(task_id: str, event_id: str, user: User = Depends(get_current_
         raise HTTPException(409, f"event is '{event.status}', not pending_review")
     entity = _require_event_entity(db, task=task, event=event)
 
+    # repo.refold_entity's fold key is created_at ("assertion time") — an
+    # approved event may be much OLDER than events applied since it was
+    # staged pending. Without re-dating it here, a LATER refold (revert/
+    # detach/merge touching this same entity) would silently re-sort this
+    # event back to its original position and let a newer-but-since-
+    # superseded applied event's value win the fold again, contradicting the
+    # user's explicit approval just made. Re-dating to now() means "the user
+    # approved this NOW" always outranks anything earlier on every future
+    # fold. Gmail provenance (message_id/gmail_message_id/evidence_quote) is
+    # untouched — only the fold-ordering key moves.
+    event.created_at = datetime.now(timezone.utc)
     task_repo.apply_event(db, task=task, entity=entity, event=event)
     db.commit()
     _publish_task_updated(db, user_id=user.id, task=task)
