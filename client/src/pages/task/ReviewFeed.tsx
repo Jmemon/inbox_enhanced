@@ -1,30 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { TaskEntity, TaskEvent } from '../../lib/api'
+import { pendingReasonCopy } from './pendingReasons'
 
 const BUSY_TIMEOUT_MS = 10_000
-
-// Maps the task engine's five machine-readable pending_reason enum values
-// (server/app/task_engine's correction gate) to user-facing copy.
-// near_duplicate_entity interpolates the LLM's raw proposal; the rest are
-// static. Any other value — including null, e.g. events that never hit a
-// gate — omits the reason line entirely rather than leaking a raw enum
-// string into the UI.
-function pendingReasonCopy(event: TaskEvent): string | null {
-  switch (event.pending_reason) {
-    case 'near_duplicate_entity':
-      return `LLM proposed '${event.proposed_entity ?? '?'}' — close to an existing entity`
-    case 'backward_move':
-      return 'moves the pipeline backward — confirm it'
-    case 'terminal_locked':
-      return 'entity is in a terminal stage — only you can move it'
-    case 'fence_blocked':
-      return 'an older email tried to change something you corrected'
-    case 'low_confidence':
-      return 'low confidence — needs your call'
-    default:
-      return null
-  }
-}
 
 // Entity name for a card/row: prefer the resolved entity (its current
 // display_name, post any merge/rename), fall back to the LLM's raw
