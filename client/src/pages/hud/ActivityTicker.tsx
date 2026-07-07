@@ -80,8 +80,18 @@ export function ActivityTicker() {
     [tasks],
   )
 
+  // Cross-task signal for pending-count-only changes: reject actions never
+  // bump task.version (server publishes pending_count change only by design),
+  // so we need a second signal to catch rejects that are version-exempt. Sum
+  // per-task pending_reviews (same shape as ReviewTray's existing signal) so
+  // any task's pending count moving is a single scalar to key the effect on.
+  const totalPending = useMemo(
+    () => tasks.reduce((sum, t) => sum + t.summary.pending_reviews, 0),
+    [tasks],
+  )
+
   // Skip the initial mount: the effect above already fetches once on mount,
-  // and totalVersion's first render is not a "change" worth a second fetch.
+  // and totalVersion/totalPending's first render is not a "change" worth a second fetch.
   const mountedRef = useRef(false)
   useEffect(() => {
     if (!mountedRef.current) {
@@ -89,11 +99,15 @@ export function ActivityTicker() {
       return
     }
     void refetch()
-    // Deliberately keyed on totalVersion alone (not `refetch`, stable via
-    // useCallback's `[]` deps anyway) — this must fire only when the summed
-    // version actually moves, not on every render, to avoid a refetch loop.
+    // Keyed on both totalVersion and totalPending as separate dependencies.
+    // totalVersion catches applies/edits/approves (they bump version). totalPending
+    // catches rejects (version-exempt by design — see reject route's comment in
+    // server/app/api/tasks.py). Separate deps ensure neither cancels the other
+    // (if combined as arithmetic sum, approve bumps +1 and drops −1, netting to
+    // zero, missing the refetch). Not keyed on `refetch` (stable via useCallback's
+    // `[]` deps anyway) — must fire only when the summed signals move.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [totalVersion])
+  }, [totalVersion, totalPending])
 
   if (items.length === 0) {
     return (
