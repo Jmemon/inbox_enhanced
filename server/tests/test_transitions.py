@@ -12,6 +12,8 @@ InboxMessage rows are needed at all.
 
 from datetime import datetime, timezone
 
+import pytest
+
 from app.db.models import Task, User
 from app.gmail.parser import ParsedMessage, ParsedThread
 from app.task_engine import repo
@@ -701,3 +703,172 @@ def test_mixed_batch_invariant_applied_plus_pending_plus_dropped_equals_total(db
     )
     total_accounted = len(result.applied) + len(result.pending) + result.dropped
     assert total_accounted == len(proposals)
+
+
+# ---------------------------------------------------------------------------
+# Pending provenance: pending_reason + proposed_entity (task 1, phase 2B)
+#
+# Every pending_review event must carry the reason for the FIRST guard that
+# forced it to pending — steps 2 (near_duplicate_entity), 3 (backward_move /
+# terminal_locked), 5 (fence_blocked), or, when nothing earlier forced it,
+# step 8's confidence gate (low_confidence). Each scenario below is one of
+# these five reasons in isolation, built from the same fixtures used above.
+# ---------------------------------------------------------------------------
+
+
+def _near_duplicate_case(db):
+    """Step 2: 'Stripewise Corp' lands in [0.4, 0.6) similarity to 'stripe' —
+    routes to pending on the closest existing entity."""
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+    proposals = [_proposal(entity="Stripewise Corp", is_new=True)]
+    return task, schema, DEFAULT_THREAD, proposals, DEFAULT_MAP
+
+
+def _backward_move_case(db):
+    """Step 3: a stage move earlier in the pipeline than the entity's
+    current stage, despite high confidence."""
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    entity = repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    entity.state = {"stage": "onsite"}
+    db.commit()
+    proposals = [_proposal(entity="stripe", field="stage", new_value="applied", confidence=95,
+                            evidence="received your application to Stripe, Inc.", message_id="gm1")]
+    return task, schema, DEFAULT_THREAD, proposals, DEFAULT_MAP
+
+
+def _terminal_locked_case(db):
+    """Step 3: the entity is already in a terminal stage — only a user may
+    move it further."""
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    entity = repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    entity.state = {"stage": "offer"}
+    db.commit()
+    proposals = [_proposal(entity="stripe", field="stage", new_value="rejected", confidence=95)]
+    return task, schema, DEFAULT_THREAD, proposals, DEFAULT_MAP
+
+
+def _fence_blocked_case(db):
+    """Step 5: a prior user correction fences this entity; the proposal's
+    evidence message is not strictly newer than it."""
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    entity = repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+    fence_event = repo.append_event(
+        db, task=task, entity=entity, origin="user", status="applied",
+        field="stage", new_value="applied",
+    )
+    fence_event.created_at = datetime.fromtimestamp(1500, tz=timezone.utc)  # between M1 and M2
+    db.commit()
+    proposals = [_proposal(
+        entity="stripe", field="stage", new_value="interview", confidence=95,
+        evidence="received your application to Stripe, Inc.", message_id="gm1",
+    )]
+    return task, schema, DEFAULT_THREAD, proposals, DEFAULT_MAP
+
+
+def _low_confidence_case(db):
+    """Step 8: nothing earlier forced pending; confidence alone is below
+    the apply threshold."""
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+    proposals = [_proposal(entity="stripe", field="stage", new_value="interview", confidence=50,
+                            evidence="moving to the interview stage", message_id="gm2")]
+    return task, schema, DEFAULT_THREAD, proposals, DEFAULT_MAP
+
+
+@pytest.mark.parametrize("build_case,expected_reason", [
+    (_near_duplicate_case, "near_duplicate_entity"),
+    (_backward_move_case, "backward_move"),
+    (_terminal_locked_case, "terminal_locked"),
+    (_fence_blocked_case, "fence_blocked"),
+    (_low_confidence_case, "low_confidence"),
+])
+def test_pending_event_carries_reason_for_first_forcing_guard(db, build_case, expected_reason):
+    _mk_user(db)
+    task, schema, thread, proposals, message_id_map = build_case(db)
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=thread, thread_row_id=THREAD_ROW_ID,
+        proposals=proposals, message_id_map=message_id_map,
+    )
+
+    assert result.applied == []
+    assert len(result.pending) == 1
+    assert result.pending[0].pending_reason == expected_reason
+
+
+def test_near_duplicate_pending_carries_llms_verbatim_proposed_entity(db):
+    _mk_user(db)
+    task, schema, thread, proposals, message_id_map = _near_duplicate_case(db)
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=thread, thread_row_id=THREAD_ROW_ID,
+        proposals=proposals, message_id_map=message_id_map,
+    )
+
+    assert result.pending[0].proposed_entity == "Stripewise Corp"
+
+
+@pytest.mark.parametrize("build_case", [
+    _backward_move_case, _terminal_locked_case, _fence_blocked_case, _low_confidence_case,
+])
+def test_non_near_duplicate_pendings_have_no_proposed_entity(db, build_case):
+    _mk_user(db)
+    task, schema, thread, proposals, message_id_map = build_case(db)
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=thread, thread_row_id=THREAD_ROW_ID,
+        proposals=proposals, message_id_map=message_id_map,
+    )
+
+    assert result.pending[0].proposed_entity is None
+
+
+def test_applied_events_carry_no_pending_reason_or_proposed_entity(db):
+    """A cleanly-applied event (no guard forced it, confidence clears the
+    threshold) leaves both new columns None."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    db.commit()
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=DEFAULT_THREAD, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(entity="stripe", field="stage", new_value="interview", confidence=90,
+                              evidence="moving to the interview stage", message_id="gm2")],
+        message_id_map=DEFAULT_MAP,
+    )
+    assert len(result.applied) == 1
+    assert result.applied[0].pending_reason is None
+    assert result.applied[0].proposed_entity is None
+
+
+def test_backward_move_beats_low_confidence_first_guard_wins(db):
+    """A backward stage move (step 3) at LOW confidence must still report
+    'backward_move', not 'low_confidence' — step 3 runs before step 8, so
+    it claims the reason first regardless of what the confidence gate would
+    have said on its own."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    entity = repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    entity.state = {"stage": "onsite"}
+    db.commit()
+
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=DEFAULT_THREAD, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(entity="stripe", field="stage", new_value="applied", confidence=10,
+                              evidence="received your application to Stripe, Inc.", message_id="gm1")],
+        message_id_map=DEFAULT_MAP,
+    )
+    assert len(result.pending) == 1
+    assert result.pending[0].pending_reason == "backward_move"

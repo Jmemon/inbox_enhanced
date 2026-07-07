@@ -197,9 +197,12 @@ def validate_and_stage(
 def _resolve_entity(
     db: Session, *, task: Task, schema: TaskStateSchema,
     entity_name: str, is_new_entity: bool, known_entities: dict[str, TaskStateEntity],
-) -> tuple[TaskStateEntity | PendingCreate | None, bool]:
-    """Step 2. Returns (entity, forced_pending); entity is None for a hard
-    drop (no match, and the LLM didn't flag it as new).
+) -> tuple[TaskStateEntity | PendingCreate | None, str | None]:
+    """Step 2. Returns (entity, pending_reason); entity is None for a hard
+    drop (no match, and the LLM didn't flag it as new). pending_reason is
+    "near_duplicate_entity" when this routes to pending on the closest
+    existing entity, else None (this is the FIRST guard in the chain, so
+    there is nothing earlier for it to defer to).
 
     The create-new branch returns a `PendingCreate` sentinel rather than
     minting the entity row immediately: a proposal that reaches this branch
@@ -215,12 +218,12 @@ def _resolve_entity(
                 entity_key=SINGLETON_KEY, display_name=task.name,
             )
             known_entities[SINGLETON_KEY] = entity
-        return entity, False
+        return entity, None
 
     normalized = normalize_key(entity_name)
     exact = known_entities.get(normalized)
     if exact is not None:
-        return exact, False
+        return exact, None
 
     best_key: str | None = None
     best_score = -1.0
@@ -230,15 +233,15 @@ def _resolve_entity(
             best_key, best_score = key, score
 
     if best_key is not None and best_score >= ENTITY_MATCH_THRESHOLD:
-        return known_entities[best_key], False
+        return known_entities[best_key], None
     if best_key is not None and best_score >= ENTITY_PENDING_THRESHOLD:
         # A near-duplicate needs a human — stage on the closest existing
         # entity as pending_review rather than auto-matching or minting a
         # duplicate, regardless of what the LLM's is_new_entity flag says.
-        return known_entities[best_key], True
+        return known_entities[best_key], "near_duplicate_entity"
     if is_new_entity:
-        return PendingCreate(entity_key=normalized, display_name=entity_name), False
-    return None, False
+        return PendingCreate(entity_key=normalized, display_name=entity_name), None
+    return None, None
 
 
 def _process_one(
@@ -290,7 +293,14 @@ def _process_one(
         return
 
     # --- Step 2: entity resolution ------------------------------------------
-    entity, forced_pending = _resolve_entity(
+    # `pending_reason` tracks the reason for the FIRST guard (this one, or
+    # step 3, or step 5) that forces this proposal to pending_review — once
+    # set, later guards below leave it alone (first-forced-reason wins);
+    # step 8's low-confidence branch only ever writes its own reason when
+    # nothing earlier claimed it. `proposed_entity` is the LLM's verbatim
+    # entity string, recorded only for the near_duplicate_entity reason (the
+    # review tray's "LLM said X, closest match Y" affordance).
+    entity, pending_reason = _resolve_entity(
         db, task=task, schema=schema, entity_name=entity_name,
         is_new_entity=is_new_entity, known_entities=known_entities,
     )
@@ -298,18 +308,19 @@ def _process_one(
         log.info("transitions: dropped task=%s (no entity match for %r)", task.id, entity_name)
         result.dropped += 1
         return
+    proposed_entity = entity_name if pending_reason == "near_duplicate_entity" else None
 
     # --- Step 3: stage legality ----------------------------------------------
     # Only users move terminal entities; LLM backward moves always go to review.
-    if field_name == "stage":
+    if field_name == "stage" and pending_reason is None:
         current_stage = entity.state.get("stage")
         if current_stage in schema.pipeline.terminal:
-            forced_pending = True
+            pending_reason = "terminal_locked"
         elif (
             current_stage in all_stages and new_value in all_stages
             and all_stages.index(new_value) < all_stages.index(current_stage)
         ):
-            forced_pending = True
+            pending_reason = "backward_move"
 
     # --- Step 4: evidence ------------------------------------------------------
     # Fail closed: no verbatim quote in the thread, no write at all (not even
@@ -334,7 +345,8 @@ def _process_one(
         message = message_by_gmail_id.get(gmail_message_id)
         fence_ms = _to_ms_epoch(fence_event.created_at)
         if message is None or not (message.gmail_internal_date > fence_ms):
-            forced_pending = True
+            if pending_reason is None:
+                pending_reason = "fence_blocked"
 
     # --- Step 6: no-op ----------------------------------------------------------
     if entity.state.get(field_name) == new_value:
@@ -374,7 +386,7 @@ def _process_one(
         thread_id=thread_row_id, message_id=internal_message_id,
         gmail_message_id=gmail_message_id,
     )
-    if not forced_pending and confidence >= settings.task_apply_confidence:
+    if not pending_reason and confidence >= settings.task_apply_confidence:
         event = _append_event_guarded(db, status="applied", **event_kwargs)
         if event is None:
             result.dropped += 1
@@ -382,7 +394,14 @@ def _process_one(
         repo.apply_event(db, task=task, entity=entity, event=event)
         result.applied.append(event)
     else:
-        event = _append_event_guarded(db, status="pending_review", **event_kwargs)
+        # Nothing earlier forced pending -> this is purely a confidence-gate
+        # deferral.
+        if pending_reason is None:
+            pending_reason = "low_confidence"
+        event = _append_event_guarded(
+            db, status="pending_review", pending_reason=pending_reason,
+            proposed_entity=proposed_entity, **event_kwargs,
+        )
         if event is None:
             result.dropped += 1
             return

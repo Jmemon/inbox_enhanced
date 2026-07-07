@@ -122,7 +122,18 @@ def _parse_one(item: object) -> dict | None:
         return None
     # bool is an int subclass in Python; exclude it explicitly so a stray
     # true/false doesn't silently pass as confidence 1/0.
-    if not isinstance(confidence, int) or isinstance(confidence, bool) or not 0 <= confidence <= 100:
+    if isinstance(confidence, bool):
+        return None
+    if isinstance(confidence, int):
+        if not 0 <= confidence <= 100:
+            return None
+    elif isinstance(confidence, float):
+        # A model response occasionally emits a float ("82.5") where the
+        # contract asks for an int — parity with triage_thread.parse_response's
+        # clamping: round + clamp to 0-100 rather than discarding an
+        # otherwise-real transition over a formatting quirk.
+        confidence = max(0, min(100, int(round(confidence))))
+    else:
         return None
 
     return {

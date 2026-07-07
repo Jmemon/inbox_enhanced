@@ -427,8 +427,37 @@ def test_events_feed_newest_first_with_status_filter_and_provenance_fields(authe
     event_body = filtered.json()["events"][0]
     for key in ("field", "old_value", "new_value", "evidence_quote", "confidence",
                "origin", "status", "thread_id", "message_id", "gmail_message_id",
-               "entity_id", "created_at"):
+               "entity_id", "pending_reason", "proposed_entity", "created_at"):
         assert key in event_body
+
+
+def test_events_feed_serializes_pending_reason_and_proposed_entity(authed):
+    """A near_duplicate_entity pending event's provenance round-trips over
+    the wire; a plain applied event carries both fields as null."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    applied = task_repo.append_event(db, task=task, entity=entity, origin="llm",
+                                     status="applied", field="stage", new_value="todo")
+    pending = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="in_progress", pending_reason="near_duplicate_entity",
+        proposed_entity="Stripewise Corp",
+    )
+    db.commit()
+    applied_id, pending_id = applied.id, pending.id
+    db.close()
+
+    body = {e["id"]: e for e in c.get(f"/api/tasks/{task_id}/events").json()["events"]}
+    assert body[pending_id]["pending_reason"] == "near_duplicate_entity"
+    assert body[pending_id]["proposed_entity"] == "Stripewise Corp"
+    assert body[applied_id]["pending_reason"] is None
+    assert body[applied_id]["proposed_entity"] is None
 
 
 def test_events_feed_pagination(authed):
@@ -526,6 +555,48 @@ def test_detach_thread_reverts_applied_events_and_refolds_entity(authed):
     assert entity2.state == {"stage": None}
     link = task_repo.get_link(db2, task_id=task_id, thread_id=thread_id)
     assert link.state == "detached"
+
+
+def test_detach_thread_rejects_that_threads_pending_events_but_not_others(authed):
+    """A detached thread's not-yet-reviewed proposals must not remain
+    approvable later — DELETE flips this thread's pending_review events to
+    rejected, but a pending event seeded off a DIFFERENT (still-attached)
+    thread survives untouched."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    detached_thread_id = _seed_thread(TS, gmail_thread_id="gF")
+    other_thread_id = _seed_thread(TS, gmail_thread_id="gG")
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    task_repo.upsert_link(db, task_id=task_id, thread_id=detached_thread_id, user_id="u1",
+                         origin="llm", state="attached")
+    task_repo.upsert_link(db, task_id=task_id, thread_id=other_thread_id, user_id="u1",
+                         origin="llm", state="attached")
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    pending_on_detached = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="in_progress", thread_id=detached_thread_id,
+        pending_reason="low_confidence",
+    )
+    pending_on_other = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="notes", new_value="keep me", thread_id=other_thread_id,
+        pending_reason="low_confidence",
+    )
+    db.commit()
+    detached_ev_id, other_ev_id = pending_on_detached.id, pending_on_other.id
+    db.close()
+
+    r = c.delete(f"/api/tasks/{task_id}/threads/{detached_thread_id}")
+    assert r.status_code == 204
+
+    db2 = TS()
+    assert task_repo.get_event(db2, task_id=task_id, event_id=detached_ev_id).status == "rejected"
+    assert task_repo.get_event(db2, task_id=task_id, event_id=other_ev_id).status == "pending_review"
 
 
 def test_detach_other_users_thread_404(authed):

@@ -214,3 +214,13 @@ class TaskEvent(Base):
     origin: Mapped[str] = mapped_column(String(8), nullable=False)         # 'llm' | 'user'
     status: Mapped[str] = mapped_column(String(16), nullable=False)        # applied|pending_review|rejected|reverted
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    # Set only on pending_review events, recording which of the validator's
+    # guard clauses (transitions.py steps 2/3/5/8) forced the deferral —
+    # vocabulary: near_duplicate_entity | backward_move | terminal_locked |
+    # fence_blocked | low_confidence. The FIRST guard that forces pending
+    # wins; None for applied/rejected/reverted events.
+    pending_reason: Mapped[str | None] = mapped_column(String(32))
+    # Only set alongside pending_reason='near_duplicate_entity' — the LLM's
+    # verbatim entity string (not the normalized key), so the review tray can
+    # render "LLM said 'Stripewise Corp', closest match 'stripe'".
+    proposed_entity: Mapped[str | None] = mapped_column(String(255))

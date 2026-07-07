@@ -90,7 +90,11 @@ def _serialize_entity(entity) -> dict:
 
 def _serialize_event(event) -> dict:
     """All provenance fields — the audit trail the review queue and
-    per-entity history view render straight off of."""
+    per-entity history view render straight off of. pending_reason/
+    proposed_entity are the pending-provenance fields the review tray reads
+    to explain WHY a pending_review event is sitting there (near-duplicate,
+    backward move, terminal lock, correction fence, or plain low confidence)
+    — both None for applied/rejected/reverted events."""
     return {
         "id": event.id,
         "field": event.field,
@@ -104,6 +108,8 @@ def _serialize_event(event) -> dict:
         "message_id": event.message_id,
         "gmail_message_id": event.gmail_message_id,
         "entity_id": event.entity_id,
+        "pending_reason": event.pending_reason,
+        "proposed_entity": event.proposed_entity,
         "created_at": event.created_at,
     }
 
@@ -393,6 +399,16 @@ def detach_thread(task_id: str, thread_id: str, user: User = Depends(get_current
         db, task_id=task.id, thread_id=thread.id, user_id=user.id,
         origin="user", state="detached",
     )
+    # A detached thread's not-yet-reviewed proposals must not remain
+    # approvable later (the thread they cite is gone from this task) — flip
+    # them to 'rejected' before the refold logic below. These were never
+    # folded into any entity.state (pending_review events never are), so
+    # there's nothing to refold for them specifically.
+    for event in task_repo.list_pending_events_for_thread(
+        db, task_id=task.id, thread_id=thread.id,
+    ):
+        event.status = "rejected"
+
     # Revert every event this task applied off of this thread, then refold
     # each entity those events touched so the board reflects the reversal
     # in the same request (no waiting for the next extraction run).

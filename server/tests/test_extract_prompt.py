@@ -138,6 +138,26 @@ def test_parse_response_rejects_bool_confidence():
     assert extract_transition.parse_response(json.dumps([_valid_item(confidence=True)])) == []
 
 
+def test_parse_response_clamps_float_confidence_instead_of_dropping():
+    """Parity with triage_thread.parse_response's clamping: a float
+    confidence (e.g. a Sonnet '82.5') must round + clamp to an int, not
+    discard an otherwise-real transition over a formatting quirk."""
+    item = _valid_item(confidence=82.5)
+    parsed = extract_transition.parse_response(json.dumps([item]))
+    assert len(parsed) == 1
+    assert isinstance(parsed[0]["confidence"], int)
+    assert parsed[0]["confidence"] == int(round(82.5))
+    assert parsed[0]["confidence"] >= 75  # applies under the default task_apply_confidence gate
+
+
+def test_parse_response_clamps_out_of_range_float_confidence():
+    over = extract_transition.parse_response(json.dumps([_valid_item(confidence=150.0)]))
+    assert over[0]["confidence"] == 100
+
+    under = extract_transition.parse_response(json.dumps([_valid_item(confidence=-25.0)]))
+    assert under[0]["confidence"] == 0
+
+
 def test_parse_response_rejects_non_string_new_value():
     assert extract_transition.parse_response(json.dumps([_valid_item(new_value=42)])) == []
 

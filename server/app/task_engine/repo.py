@@ -300,10 +300,17 @@ def append_event(
     thread_id: str | None = None,
     message_id: str | None = None,
     gmail_message_id: str | None = None,
+    pending_reason: str | None = None,
+    proposed_entity: str | None = None,
 ) -> TaskEvent:
     """Append one row to the audit log. Flushes so event.id materializes
     (callers key later revert/reject calls off it) — does NOT apply the
-    change to entity.state; call apply_event separately for that."""
+    change to entity.state; call apply_event separately for that.
+
+    pending_reason/proposed_entity are the pending-provenance fields written
+    by transitions.py's guard chain (spec §4.4) — optional and None for
+    every non-pending caller (applied events, api/tasks.py's manual state
+    edit, etc.)."""
     row = TaskEvent(
         id=uuid.uuid4().hex,
         task_id=task.id,
@@ -319,6 +326,8 @@ def append_event(
         confidence=confidence,
         origin=origin,
         status=status,
+        pending_reason=pending_reason,
+        proposed_entity=proposed_entity,
         created_at=datetime.now(timezone.utc),
     )
     db.add(row)
@@ -385,6 +394,21 @@ def list_applied_events_for_thread(db: Session, *, task_id: str, thread_id: str)
         TaskEvent.task_id == task_id,
         TaskEvent.thread_id == thread_id,
         TaskEvent.status == "applied",
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def list_pending_events_for_thread(db: Session, *, task_id: str, thread_id: str) -> list[TaskEvent]:
+    """Every currently-'pending_review' event this task recorded with
+    provenance pointing at one thread — the companion query to
+    list_applied_events_for_thread, for the same user-detach correction: a
+    detached thread's not-yet-reviewed proposals must not remain approvable,
+    even though (unlike applied events) there's no entity.state to refold
+    since a pending event was never folded in."""
+    stmt = select(TaskEvent).where(
+        TaskEvent.task_id == task_id,
+        TaskEvent.thread_id == thread_id,
+        TaskEvent.status == "pending_review",
     )
     return list(db.execute(stmt).scalars().all())
 
