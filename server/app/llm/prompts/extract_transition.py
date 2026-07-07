@@ -142,9 +142,11 @@ def _parse_one(item: object) -> dict | None:
             return None
     elif isinstance(confidence, float):
         # A model response occasionally emits a float ("82.5") where the
-        # contract asks for an int — parity with triage_thread.parse_response's
-        # clamping: round + clamp to 0-100 rather than discarding an
-        # otherwise-real transition over a formatting quirk.
+        # contract asks for an int — round + clamp to 0-100 rather than
+        # discarding an otherwise-real transition over a formatting quirk.
+        # Only partial parity with triage_thread.parse_response's clamping
+        # (float branch only; out-of-range ints still rejected, unlike
+        # triage which clamps them).
         confidence = max(0, min(100, int(round(confidence))))
     else:
         return None
