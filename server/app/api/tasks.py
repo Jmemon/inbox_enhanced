@@ -706,6 +706,78 @@ class _MergeBody(BaseModel):
     into_entity_id: str = Field(min_length=1)
 
 
+# ---------------------------------------------------------------------------
+# Aggregate feeds: reviews + activity (Task 3, Phase 3 HUD inversion)
+#
+# Cross-task reads for the HUD's unified review tray and activity ticker.
+# Both are user-scoped joins on Task (repo.list_pending_events_for_user /
+# list_recent_events_for_user) — a cross-user leak here would expose other
+# people's email-derived text, so this is a security boundary, not just a
+# convenience query; treat it with the same care as any other ownership
+# check in this file.
+# ---------------------------------------------------------------------------
+
+
+_REVIEWS_LIMIT_MIN, _REVIEWS_LIMIT_MAX, _REVIEWS_LIMIT_DEFAULT = 1, 200, 50
+_ACTIVITY_LIMIT_MIN, _ACTIVITY_LIMIT_MAX, _ACTIVITY_LIMIT_DEFAULT = 1, 100, 20
+
+
+def _entity_display_names_for(db: Session, pairs: list[tuple]) -> dict[str, str]:
+    entity_ids = {event.entity_id for event, _task in pairs if event.entity_id is not None}
+    return task_repo.get_entity_display_names(db, entity_ids=entity_ids)
+
+
+def _serialize_feed_event(event, *, task, display_names: dict[str, str]) -> dict:
+    """_serialize_event's fields plus the cross-task fields the aggregate
+    feeds need: task_id/task_name so the HUD can route back to the owning
+    task, and entity_display_name resolved via a fallback chain — the
+    batch-resolved TaskStateEntity.display_name (absent if the entity's
+    since been hard-deleted, e.g. reject's orphan cleanup on a since-
+    rejected event), else the LLM's verbatim proposed_entity string
+    recorded at proposal time, else null."""
+    entity_display_name = (
+        display_names.get(event.entity_id) if event.entity_id is not None else None
+    )
+    if entity_display_name is None:
+        entity_display_name = event.proposed_entity
+    return {
+        **_serialize_event(event),
+        "task_id": task.id,
+        "task_name": task.name,
+        "entity_display_name": entity_display_name,
+    }
+
+
+@router.get("/reviews")
+def get_reviews(limit: int = Query(default=_REVIEWS_LIMIT_DEFAULT),
+                user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    """Unified review tray: every still-pending_review event across all of
+    this user's non-deleted tasks, newest first, regardless of task.
+    limit is clamped (never 422'd) to [1, 200]."""
+    limit = max(_REVIEWS_LIMIT_MIN, min(_REVIEWS_LIMIT_MAX, limit))
+    pairs = task_repo.list_pending_events_for_user(db, user_id=user.id, limit=limit)
+    display_names = _entity_display_names_for(db, pairs)
+    return {
+        "reviews": [_serialize_feed_event(event, task=task, display_names=display_names)
+                   for event, task in pairs],
+    }
+
+
+@router.get("/activity")
+def get_activity(limit: int = Query(default=_ACTIVITY_LIMIT_DEFAULT),
+                 user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    """Activity ticker: every non-pending_review event (applied/rejected/
+    reverted) across this user's non-deleted tasks, newest first. limit is
+    clamped (never 422'd) to [1, 100]."""
+    limit = max(_ACTIVITY_LIMIT_MIN, min(_ACTIVITY_LIMIT_MAX, limit))
+    pairs = task_repo.list_recent_events_for_user(db, user_id=user.id, limit=limit)
+    display_names = _entity_display_names_for(db, pairs)
+    return {
+        "activity": [_serialize_feed_event(event, task=task, display_names=display_names)
+                     for event, task in pairs],
+    }
+
+
 @router.post("/tasks/{task_id}/entities/{entity_id}/merge", status_code=204)
 def merge_entity(task_id: str, entity_id: str, body: _MergeBody,
                  user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> None:

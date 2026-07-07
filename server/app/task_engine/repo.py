@@ -423,6 +423,75 @@ def pending_count(db: Session, *, task_id: str) -> int:
     return db.execute(stmt).scalar_one()
 
 
+# ---------------------------------------------------------------------------
+# Aggregate feeds (Task 3, Phase 3 HUD inversion): cross-task reads for the
+# unified review tray (GET /api/reviews) and activity ticker (GET /api/
+# activity). TaskEvent does carry its own user_id column, but scoping here
+# goes through the join on Task instead — Task.is_deleted must gate these
+# feeds too (a soft-deleted task's events disappear from both the instant
+# the task does), and routing every user-scoped read through the one column
+# (Task.user_id) that every other ownership check in this module already
+# trusts keeps this security-sensitive query auditable against the same
+# pattern as get_owned_task/list_tasks, rather than a second, independently
+# reasoned-about scoping path.
+# ---------------------------------------------------------------------------
+
+
+def list_pending_events_for_user(
+    db: Session, *, user_id: str, limit: int = 50,
+) -> list[tuple[TaskEvent, Task]]:
+    """Every 'pending_review' event across this user's non-deleted tasks,
+    newest first, paired with its owning task — the review-tray feed."""
+    stmt = (
+        select(TaskEvent, Task)
+        .join(Task, TaskEvent.task_id == Task.id)
+        .where(
+            Task.user_id == user_id,
+            Task.is_deleted == False,  # noqa: E712
+            TaskEvent.status == "pending_review",
+        )
+        .order_by(TaskEvent.created_at.desc())
+        .limit(limit)
+    )
+    return [(event, task) for event, task in db.execute(stmt).all()]
+
+
+def list_recent_events_for_user(
+    db: Session, *, user_id: str, limit: int = 20,
+) -> list[tuple[TaskEvent, Task]]:
+    """Every non-pending event (applied/rejected/reverted) across this
+    user's non-deleted tasks, newest first, paired with its owning task —
+    the activity-ticker feed. Companion query to
+    list_pending_events_for_user, same Task-join scoping."""
+    stmt = (
+        select(TaskEvent, Task)
+        .join(Task, TaskEvent.task_id == Task.id)
+        .where(
+            Task.user_id == user_id,
+            Task.is_deleted == False,  # noqa: E712
+            TaskEvent.status != "pending_review",
+        )
+        .order_by(TaskEvent.created_at.desc())
+        .limit(limit)
+    )
+    return [(event, task) for event, task in db.execute(stmt).all()]
+
+
+def get_entity_display_names(db: Session, *, entity_ids: set[str]) -> dict[str, str]:
+    """Batch-resolve entity_id -> display_name in ONE query (no N+1) — the
+    aggregate feeds' entity_display_name field is derived from this plus a
+    fallback to TaskEvent.proposed_entity (see api/tasks.py's
+    _serialize_feed_event). Unknown ids (e.g. an entity hard-deleted by
+    delete_entity_if_orphaned after its one event was rejected) are simply
+    absent from the returned dict rather than mapped to None."""
+    if not entity_ids:
+        return {}
+    stmt = select(TaskStateEntity.id, TaskStateEntity.display_name).where(
+        TaskStateEntity.id.in_(entity_ids)
+    )
+    return dict(db.execute(stmt).all())
+
+
 def refold_entity(db: Session, *, task: Task, entity: TaskStateEntity) -> None:
     """Rebuild entity.state from scratch as a fold over this entity's
     APPLIED events, ascending by (created_at, origin) where 'llm' sorts

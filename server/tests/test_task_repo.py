@@ -598,6 +598,209 @@ def test_delete_entity_if_orphaned_treats_stage_none_only_state_as_empty(two_use
 
 
 # ---------------------------------------------------------------------------
+# Aggregate feeds (Task 3, Phase 3 HUD inversion): list_pending_events_for_user
+# / list_recent_events_for_user / get_entity_display_names — the cross-task
+# substrate for GET /api/reviews and GET /api/activity. Both event queries
+# join on Task for user scoping (never TaskEvent.user_id directly) so a
+# soft-deleted task's events vanish from these feeds the instant the task
+# does — the same is_deleted discipline every other user-scoped query here
+# already follows.
+# ---------------------------------------------------------------------------
+
+
+def _mk_entity(db, task, *, entity_key="_self", display_name="Self"):
+    entity = repo.get_or_create_entity(
+        db, task_id=task.id, user_id=task.user_id, entity_key=entity_key, display_name=display_name,
+    )
+    db.commit()
+    return entity
+
+
+def test_list_pending_events_for_user_returns_only_pending_newest_first(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+
+    t0 = datetime.now(timezone.utc)
+    applied = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="applied", field="stage", new_value="todo")
+    applied.created_at = t0
+    pending1 = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                  status="pending_review", field="stage", new_value="in_progress")
+    pending1.created_at = t0 + timedelta(seconds=1)
+    pending2 = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                  status="pending_review", field="stage", new_value="done")
+    pending2.created_at = t0 + timedelta(seconds=2)
+    two_users.commit()
+
+    pairs = repo.list_pending_events_for_user(two_users, user_id="u1")
+    assert [(e.id, t.id) for e, t in pairs] == [(pending2.id, task.id), (pending1.id, task.id)]
+
+
+def test_list_pending_events_for_user_spans_multiple_tasks_newest_first(two_users):
+    task_a = _mk_task(two_users, uid="u1", name="A")
+    task_b = _mk_task(two_users, uid="u1", name="B")
+    two_users.commit()
+    entity_a = _mk_entity(two_users, task_a)
+    entity_b = _mk_entity(two_users, task_b)
+
+    t0 = datetime.now(timezone.utc)
+    ev_a = repo.append_event(two_users, task=task_a, entity=entity_a, origin="llm",
+                              status="pending_review", field="stage", new_value="x")
+    ev_a.created_at = t0
+    ev_b = repo.append_event(two_users, task=task_b, entity=entity_b, origin="llm",
+                              status="pending_review", field="stage", new_value="y")
+    ev_b.created_at = t0 + timedelta(seconds=1)
+    two_users.commit()
+
+    pairs = repo.list_pending_events_for_user(two_users, user_id="u1")
+    assert [(e.id, t.id) for e, t in pairs] == [(ev_b.id, task_b.id), (ev_a.id, task_a.id)]
+
+
+def test_list_pending_events_for_user_excludes_other_users_events(two_users):
+    """The security probe: user B's pending events must never appear in
+    user A's feed. Scoping is via the join on Task, not TaskEvent.user_id."""
+    mine = _mk_task(two_users, uid="u1")
+    theirs = _mk_task(two_users, uid="u2")
+    two_users.commit()
+    my_entity = _mk_entity(two_users, mine)
+    their_entity = _mk_entity(two_users, theirs)
+
+    repo.append_event(two_users, task=mine, entity=my_entity, origin="llm",
+                       status="pending_review", field="stage", new_value="x")
+    repo.append_event(two_users, task=theirs, entity=their_entity, origin="llm",
+                       status="pending_review", field="stage", new_value="y")
+    two_users.commit()
+
+    pairs = repo.list_pending_events_for_user(two_users, user_id="u1")
+    assert all(t.user_id == "u1" for _, t in pairs)
+    assert len(pairs) == 1
+
+
+def test_list_pending_events_for_user_excludes_deleted_tasks(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+    repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                       status="pending_review", field="stage", new_value="x")
+    two_users.commit()
+    task.is_deleted = True
+    two_users.commit()
+
+    assert repo.list_pending_events_for_user(two_users, user_id="u1") == []
+
+
+def test_list_pending_events_for_user_respects_limit(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+    t0 = datetime.now(timezone.utc)
+    ids = []
+    for i in range(5):
+        ev = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                status="pending_review", field="stage", new_value=str(i))
+        ev.created_at = t0 + timedelta(seconds=i)
+        ids.append(ev.id)
+    two_users.commit()
+
+    pairs = repo.list_pending_events_for_user(two_users, user_id="u1", limit=2)
+    assert [e.id for e, _ in pairs] == list(reversed(ids))[:2]
+
+
+def test_list_recent_events_for_user_returns_only_non_pending_newest_first(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+
+    t0 = datetime.now(timezone.utc)
+    pending = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="pending_review", field="stage", new_value="x")
+    pending.created_at = t0
+    applied = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="applied", field="stage", new_value="todo")
+    applied.created_at = t0 + timedelta(seconds=1)
+    rejected = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                  status="rejected", field="stage", new_value="nope")
+    rejected.created_at = t0 + timedelta(seconds=2)
+    two_users.commit()
+
+    pairs = repo.list_recent_events_for_user(two_users, user_id="u1")
+    assert [e.id for e, _ in pairs] == [rejected.id, applied.id]
+
+
+def test_list_recent_events_for_user_excludes_other_users_events(two_users):
+    """Same security probe as the pending feed, for the activity feed."""
+    mine = _mk_task(two_users, uid="u1")
+    theirs = _mk_task(two_users, uid="u2")
+    two_users.commit()
+    my_entity = _mk_entity(two_users, mine)
+    their_entity = _mk_entity(two_users, theirs)
+
+    repo.append_event(two_users, task=mine, entity=my_entity, origin="llm",
+                       status="applied", field="stage", new_value="x")
+    repo.append_event(two_users, task=theirs, entity=their_entity, origin="llm",
+                       status="applied", field="stage", new_value="y")
+    two_users.commit()
+
+    pairs = repo.list_recent_events_for_user(two_users, user_id="u1")
+    assert all(t.user_id == "u1" for _, t in pairs)
+    assert len(pairs) == 1
+
+
+def test_list_recent_events_for_user_excludes_deleted_tasks(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+    repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                       status="applied", field="stage", new_value="x")
+    two_users.commit()
+    task.is_deleted = True
+    two_users.commit()
+
+    assert repo.list_recent_events_for_user(two_users, user_id="u1") == []
+
+
+def test_list_recent_events_for_user_respects_limit(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+    t0 = datetime.now(timezone.utc)
+    ids = []
+    for i in range(5):
+        ev = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                status="applied", field="stage", new_value=str(i))
+        ev.created_at = t0 + timedelta(seconds=i)
+        ids.append(ev.id)
+    two_users.commit()
+
+    pairs = repo.list_recent_events_for_user(two_users, user_id="u1", limit=2)
+    assert [e.id for e, _ in pairs] == list(reversed(ids))[:2]
+
+
+def test_get_entity_display_names_batch_resolves(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity1 = _mk_entity(two_users, task, entity_key="acme", display_name="Acme")
+    entity2 = _mk_entity(two_users, task, entity_key="globex", display_name="Globex")
+
+    names = repo.get_entity_display_names(two_users, entity_ids={entity1.id, entity2.id})
+    assert names == {entity1.id: "Acme", entity2.id: "Globex"}
+
+
+def test_get_entity_display_names_empty_input_returns_empty_dict(two_users):
+    assert repo.get_entity_display_names(two_users, entity_ids=set()) == {}
+
+
+def test_get_entity_display_names_omits_unknown_ids(two_users):
+    task = _mk_task(two_users, uid="u1")
+    two_users.commit()
+    entity = _mk_entity(two_users, task)
+
+    names = repo.get_entity_display_names(two_users, entity_ids={entity.id, "nonexistent"})
+    assert names == {entity.id: entity.display_name}
+
+
+# ---------------------------------------------------------------------------
 # criteria relocation
 # ---------------------------------------------------------------------------
 

@@ -11,7 +11,7 @@ captured the same way test_task_engine_tasks.py does, since api/tasks.py
 calls it via the same late-bound `tasks` module reference.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -1308,3 +1308,244 @@ def test_every_mutation_publishes_task_updated(authed, monkeypatch):
     c.delete(f"/api/tasks/{task_id}")
     assert len(captured) == 3
     assert all(evt[1] == "task_updated" for evt in captured)
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (Phase 3 HUD inversion): aggregated cross-task reviews + activity
+# feeds. GET /api/reviews = pending_review events across every non-deleted
+# task; GET /api/activity = everything else (applied/rejected/reverted).
+# Both are user-scoped joins on Task, not TaskEvent.user_id directly — the
+# cross-user probe below is the security-critical case per the plan.
+# ---------------------------------------------------------------------------
+
+
+def _seed_event(
+    TS, task_id, *, uid="u1", status="pending_review", field="stage",
+    new_value="in_progress", entity_key="_self", display_name="Self",
+    pending_reason=None, proposed_entity=None, created_at=None, with_entity=True,
+):
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id=uid, task_id=task_id)
+    entity = None
+    if with_entity:
+        entity = task_repo.get_or_create_entity(
+            db, task_id=task_id, user_id=uid, entity_key=entity_key, display_name=display_name,
+        )
+        db.commit()
+    event = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status=status,
+        field=field, new_value=new_value, evidence_quote="quote",
+        pending_reason=pending_reason, proposed_entity=proposed_entity,
+    )
+    if created_at is not None:
+        event.created_at = created_at
+    db.commit()
+    event_id = event.id
+    entity_id = entity.id if entity is not None else None
+    db.close()
+    return event_id, entity_id
+
+
+def test_reviews_and_activity_require_auth():
+    c = TestClient(app)
+    assert c.get("/api/reviews").status_code == 401
+    assert c.get("/api/activity").status_code == 401
+
+
+def test_reviews_returns_pending_events_across_tasks_newest_first(authed):
+    c, TS = authed
+    t0 = datetime.now(timezone.utc)
+    task1 = _mk_task(TS, name="T1")
+    task2 = _mk_task(TS, name="T2")
+    ev1, _ = _seed_event(TS, task1, created_at=t0)
+    ev2, _ = _seed_event(TS, task2, created_at=t0 + timedelta(seconds=1))
+
+    r = c.get("/api/reviews")
+    assert r.status_code == 200
+    ids = [item["id"] for item in r.json()["reviews"]]
+    assert ids == [ev2, ev1]  # newest first, spanning both tasks
+
+
+def test_reviews_includes_task_id_task_name_and_serialize_event_fields(authed):
+    c, TS = authed
+    task_id = _mk_task(TS, name="My Tracker")
+    ev_id, _ = _seed_event(TS, task_id)
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i["id"] == ev_id)
+    assert item["task_id"] == task_id
+    assert item["task_name"] == "My Tracker"
+    for key in ("field", "old_value", "new_value", "evidence_quote", "confidence",
+               "origin", "status", "thread_id", "message_id", "gmail_message_id",
+               "entity_id", "pending_reason", "proposed_entity", "created_at",
+               "entity_display_name"):
+        assert key in item
+
+
+def test_reviews_excludes_other_users_events(authed):
+    """The cross-user security probe: user B's pending events must never
+    appear in user A's reviews feed."""
+    c, TS = authed
+    mine = _mk_task(TS, uid="u1")
+    theirs = _mk_task(TS, uid="u2")
+    my_ev, _ = _seed_event(TS, mine, uid="u1")
+    their_ev, _ = _seed_event(TS, theirs, uid="u2")
+
+    r = c.get("/api/reviews")
+    ids = [i["id"] for i in r.json()["reviews"]]
+    assert my_ev in ids
+    assert their_ev not in ids
+    assert len(ids) == 1
+
+
+def test_reviews_excludes_deleted_tasks(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id)
+    c.delete(f"/api/tasks/{task_id}")
+
+    r = c.get("/api/reviews")
+    assert ev_id not in [i["id"] for i in r.json()["reviews"]]
+
+
+def test_reviews_limit_clamps_low_and_high_instead_of_422ing(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    t0 = datetime.now(timezone.utc)
+    for i in range(3):
+        _seed_event(TS, task_id, entity_key=f"e{i}", new_value=str(i),
+                    created_at=t0 + timedelta(seconds=i))
+
+    low = c.get("/api/reviews?limit=0")
+    assert low.status_code == 200
+    assert len(low.json()["reviews"]) == 1
+
+    high = c.get("/api/reviews?limit=100000")
+    assert high.status_code == 200
+    assert len(high.json()["reviews"]) == 3
+
+
+def test_activity_returns_non_pending_events_across_tasks_newest_first(authed):
+    c, TS = authed
+    t0 = datetime.now(timezone.utc)
+    task1 = _mk_task(TS, name="T1")
+    task2 = _mk_task(TS, name="T2")
+    pending, _ = _seed_event(TS, task1, status="pending_review", created_at=t0)
+    applied, _ = _seed_event(TS, task1, status="applied",
+                             created_at=t0 + timedelta(seconds=1))
+    rejected, _ = _seed_event(TS, task2, status="rejected",
+                              created_at=t0 + timedelta(seconds=2))
+
+    r = c.get("/api/activity")
+    assert r.status_code == 200
+    ids = [i["id"] for i in r.json()["activity"]]
+    assert ids == [rejected, applied]
+    assert pending not in ids
+
+
+def test_activity_excludes_other_users_events(authed):
+    """Same cross-user security probe as reviews, for the activity feed."""
+    c, TS = authed
+    mine = _mk_task(TS, uid="u1")
+    theirs = _mk_task(TS, uid="u2")
+    my_ev, _ = _seed_event(TS, mine, uid="u1", status="applied")
+    their_ev, _ = _seed_event(TS, theirs, uid="u2", status="applied")
+
+    r = c.get("/api/activity")
+    ids = [i["id"] for i in r.json()["activity"]]
+    assert my_ev in ids
+    assert their_ev not in ids
+    assert len(ids) == 1
+
+
+def test_activity_excludes_deleted_tasks(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id, status="applied")
+    c.delete(f"/api/tasks/{task_id}")
+
+    r = c.get("/api/activity")
+    assert ev_id not in [i["id"] for i in r.json()["activity"]]
+
+
+def test_activity_limit_clamps_low_and_high_instead_of_422ing(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    t0 = datetime.now(timezone.utc)
+    for i in range(3):
+        _seed_event(TS, task_id, status="applied", entity_key=f"e{i}", new_value=str(i),
+                    created_at=t0 + timedelta(seconds=i))
+
+    low = c.get("/api/activity?limit=0")
+    assert low.status_code == 200
+    assert len(low.json()["activity"]) == 1
+
+    high = c.get("/api/activity?limit=100000")
+    assert high.status_code == 200
+    assert len(high.json()["activity"]) == 3
+
+
+def test_activity_default_limit_is_20(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    t0 = datetime.now(timezone.utc)
+    for i in range(25):
+        _seed_event(TS, task_id, status="applied", entity_key=f"e{i}", new_value=str(i),
+                    created_at=t0 + timedelta(seconds=i))
+
+    r = c.get("/api/activity")
+    assert len(r.json()["activity"]) == 20
+
+
+def test_reviews_default_limit_is_50(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    t0 = datetime.now(timezone.utc)
+    for i in range(55):
+        _seed_event(TS, task_id, entity_key=f"e{i}", new_value=str(i),
+                    created_at=t0 + timedelta(seconds=i))
+
+    r = c.get("/api/reviews")
+    assert len(r.json()["reviews"]) == 50
+
+
+def test_reviews_entity_display_name_resolves_from_live_entity(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id, entity_key="acme", display_name="Acme Corp")
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i["id"] == ev_id)
+    assert item["entity_display_name"] == "Acme Corp"
+
+
+def test_reviews_entity_display_name_falls_back_to_proposed_entity_when_entity_gone(authed):
+    """Mirrors reject's orphan-entity cleanup path (delete_entity_if_orphaned):
+    an event's entity_id can point at a since-hard-deleted entity, so the
+    display name must fall back to the LLM's verbatim proposed_entity string
+    rather than resolving to nothing."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, entity_id = _seed_event(
+        TS, task_id, entity_key="acme", display_name="Acme",
+        pending_reason="near_duplicate_entity", proposed_entity="Stripewise Corp",
+    )
+    db = TS()
+    entity = task_repo.get_entity(db, task_id=task_id, entity_id=entity_id)
+    task_repo.delete_entity(db, entity=entity)
+    db.commit()
+    db.close()
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i["id"] == ev_id)
+    assert item["entity_display_name"] == "Stripewise Corp"
+
+
+def test_reviews_entity_display_name_null_when_neither_entity_nor_proposed(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id, with_entity=False)
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i["id"] == ev_id)
+    assert item["entity_display_name"] is None
