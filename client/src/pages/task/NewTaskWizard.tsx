@@ -32,6 +32,12 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   const [step, setStep] = useState<Step>('form')
   const [goal, setGoal] = useState('')
   const [draftId, setDraftId] = useState<string | null>(null)
+  // Set when the poll fallback observes `gone` (draft TTL expired in redis
+  // before a result arrived) while sitting on the `pending` step — otherwise
+  // that step just... sits there forever with no way out but closing the
+  // whole wizard. Rendered as an inline error with a Back button; cleared on
+  // the next startDraft() attempt.
+  const [draftError, setDraftError] = useState<string | null>(null)
 
   // Seeded from the draft's proposal once it lands; editable from there.
   const [name, setName] = useState('')
@@ -43,6 +49,11 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   const [submitting, setSubmitting] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [taskId, setTaskId] = useState<string | null>(null)
+
+  // startDraft's POST /api/tasks/draft failure (network/5xx/etc) — rendered
+  // inline on the form step, same error-banner style as createError on the
+  // review step, so a failed "start" doesn't just silently do nothing.
+  const [startError, setStartError] = useState<string | null>(null)
 
   // Idempotent apply: a result for a given draft_id can arrive via SSE OR via
   // the polling fallback (or both, in either order). appliedRef ensures we
@@ -115,8 +126,15 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
           return
         }
         if (r.status === 'gone') {
+          // The redis draft-preview cache TTL'd out before a result arrived.
+          // Previously this just console.warn'd and left the user stranded
+          // on the "pending" step forever with no way out but closing the
+          // whole wizard. Surface it inline instead — stay on `pending` (so
+          // the Back button below has somewhere to render) and let the user
+          // retry from the form step with their goal text intact.
           console.warn('[task draft] cache expired before result arrived')
-          return  // give up; user can close and start a new draft
+          setDraftError('The draft expired — go back and try again')
+          return  // give up polling; user drives the retry via Back
         }
       } catch (e) {
         console.error('[task draft] poll failed', e)
@@ -150,9 +168,27 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   }, [step, taskId, progress?.done, navigate, onClose])
 
   async function startDraft() {
-    const { draft_id } = await postTaskDraft(goal)
-    setDraftId(draft_id)
-    setStep('pending')
+    setStartError(null)
+    try {
+      const { draft_id } = await postTaskDraft(goal)
+      setDraftId(draft_id)
+      setStep('pending')
+    } catch (e) {
+      // Previously an unhandled rejection here left the user on the form
+      // step with no feedback at all (button just... didn't do anything).
+      // Render the failure inline instead, same as the review step's
+      // createError banner, and stay on `form` so goal text is preserved.
+      setStartError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // Return to the form step after a draft expiry (see the poll effect's
+  // `gone` handling above) — clears the stale draft/pending state but keeps
+  // `goal` untouched so the user doesn't have to retype it.
+  function backToForm() {
+    setDraftError(null)
+    setDraftId(null)
+    setStep('form')
   }
 
   function setChoice(threadId: string, choice: Choice) {
@@ -190,6 +226,7 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
 
         {step === 'form' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 16 }}>
+            {startError && <div style={errorBannerStyle}>{startError}</div>}
             <label style={fieldLabelStyle}>
               <span>what do you want to track?</span>
               <textarea
@@ -208,16 +245,24 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
         )}
 
         {step === 'pending' && (
-          <div style={{ marginTop: 16 }}>Reading your goal and scanning your inbox…</div>
+          <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {draftError ? (
+              <>
+                <div style={errorBannerStyle}>{draftError}</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={backToForm}>back</button>
+                  <button onClick={onClose}>cancel</button>
+                </div>
+              </>
+            ) : (
+              'Reading your goal and scanning your inbox…'
+            )}
+          </div>
         )}
 
         {step === 'review' && stateSchema && (
           <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 20 }}>
-            {createError && (
-              <div style={{ color: '#8a1c25', fontSize: 13, background: '#fdf0f1', padding: 8, borderRadius: 4 }}>
-                {createError}
-              </div>
-            )}
+            {createError && <div style={errorBannerStyle}>{createError}</div>}
             <label style={fieldLabelStyle}>
               <span>name</span>
               <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} />
@@ -329,6 +374,13 @@ const inputStyle: CSSProperties = {
 
 const textareaStyle: CSSProperties = {
   ...inputStyle, fontFamily: 'inherit', resize: 'vertical',
+}
+
+// Inline error banner — was inline-only on the review step (createError);
+// pulled into a shared constant so the form step (startError) and the
+// pending step (draftError) render it identically rather than drifting.
+const errorBannerStyle: CSSProperties = {
+  color: '#8a1c25', fontSize: 13, background: '#fdf0f1', padding: 8, borderRadius: 4,
 }
 
 function Backdrop({ children, onClose }: { children: ReactNode; onClose: () => void }) {
