@@ -7,6 +7,7 @@ import { useInboxSearch } from '../search/useInboxSearch'
 import { useInboxStore } from '../../state/InboxProvider'
 import { useTasksStore } from '../../state/TasksProvider'
 import { NewTaskWizard } from '../task/NewTaskWizard'
+import { ReviewTray } from './ReviewTray'
 
 const RECENT_COUNT = 10
 
@@ -189,6 +190,7 @@ export default function HudPage() {
               </button>
             </div>
           </section>
+          <ReviewTray />
           <section>
             <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Buckets</h2>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12 }}>
