@@ -7,6 +7,7 @@ import { useInboxSearch } from '../search/useInboxSearch'
 import { useInboxStore } from '../../state/InboxProvider'
 import { useTasksStore } from '../../state/TasksProvider'
 import { NewTaskWizard } from '../task/NewTaskWizard'
+import { ActivityTicker } from './ActivityTicker'
 import { ReviewTray } from './ReviewTray'
 
 const RECENT_COUNT = 10
@@ -120,10 +121,6 @@ export default function HudPage() {
               synced {agoLabel(status?.last_synced_at ?? null)}
               {status && !status.has_cursor && ' · first sync pending'}
             </div>
-            <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Recently processed</h2>
-            <div style={{ border: '1px solid #eee', borderRadius: 8, overflow: 'hidden' }}>
-              <InboxList threads={recent} bucketsById={buckets.byId} />
-            </div>
           </section>
           <section>
             <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Tasks</h2>
@@ -191,6 +188,13 @@ export default function HudPage() {
             </div>
           </section>
           <ReviewTray />
+          <ActivityTicker />
+          <section>
+            <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Recently active</h2>
+            <div style={{ border: '1px solid #eee', borderRadius: 8, overflow: 'hidden' }}>
+              <InboxList threads={recent} bucketsById={buckets.byId} />
+            </div>
+          </section>
           <section>
             <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Buckets</h2>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12 }}>
