@@ -846,8 +846,12 @@ def test_reject_pending_event(authed):
     assert r.json()["status"] == "rejected"
 
     db = TS()
-    entity = task_repo.get_entity(db, task_id=task_id, entity_id=entity_id)
-    assert entity.state == {}  # never applied, so no state change
+    # 2C ledger Fix 2: this seeded pending event was the entity's entire
+    # history, so rejecting it also cleans up the now-orphaned minted entity
+    # (dedicated coverage: test_reject_deletes_orphaned_minted_new_entity /
+    # test_reject_pending_on_entity_with_history_keeps_entity) — there's no
+    # longer a row to assert an unset state on.
+    assert task_repo.get_entity(db, task_id=task_id, entity_id=entity_id) is None
 
 
 def test_reject_non_pending_409(authed):
@@ -857,6 +861,55 @@ def test_reject_non_pending_409(authed):
     c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
     r2 = c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
     assert r2.status_code == 409
+
+
+def test_reject_deletes_orphaned_minted_new_entity(authed):
+    """2C ledger Fix 2: the validator mints an entity row at step 8 even for
+    a pending_review outcome (both branches need a real entity_id) — so
+    rejecting a pending event on a freshly-minted entity with no other
+    history must not strand an empty entity on the board forever."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, entity_id = _seed_pending_event(TS, task_id)
+
+    r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
+    assert r.status_code == 200
+
+    db = TS()
+    assert task_repo.get_entity(db, task_id=task_id, entity_id=entity_id) is None
+
+
+def test_reject_pending_on_entity_with_history_keeps_entity(authed):
+    """The same reject must NOT delete an entity that has other history — an
+    already-applied event's folded state is real signal, not an empty mint."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    applied = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="applied",
+        field="stage", new_value="todo",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=applied)
+    pending = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="in_progress", evidence_quote="quote",
+    )
+    db.commit()
+    ev_id, entity_id = pending.id, entity.id
+    db.close()
+
+    r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
+    assert r.status_code == 200
+
+    db2 = TS()
+    survivor = task_repo.get_entity(db2, task_id=task_id, entity_id=entity_id)
+    assert survivor is not None
+    assert survivor.state["stage"] == "todo"
 
 
 def test_revert_applied_event_refolds_entity(authed):
@@ -880,6 +933,74 @@ def test_revert_non_applied_409(authed):
     ev_id, _ = _seed_pending_event(TS, task_id)
     r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/revert")
     assert r.status_code == 409
+
+
+def test_approve_redates_event_so_approval_survives_a_later_refold(authed):
+    """2C ledger Fix 1: task_events fold ascending by created_at
+    (repo.refold_entity) — approving an OLD pending event (its created_at
+    stuck in the past) without re-dating it would let ANY later refold
+    (revert/detach/merge touching this same entity) silently re-fold a
+    newer-but-since-superseded applied event's value back on top of the
+    user's explicit approval. The approve route must re-date the event to
+    now() immediately before apply_event so the user's decision — happening
+    right now — always sorts last on any future fold."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+
+    # An OLD pending event on `stage` (t1, far in the past).
+    old_pending = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="approved_value", evidence_quote="quote",
+    )
+    old_pending.created_at = datetime.fromtimestamp(1000, tz=timezone.utc)
+    db.commit()
+
+    # A NEWER applied event on the SAME field (t2 > t1, but still long before
+    # "now") — an un-redated fold would sort this one last, clobbering the
+    # approval below.
+    newer_applied = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="applied",
+        field="stage", new_value="stale_value",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=newer_applied)
+    newer_applied.created_at = datetime.fromtimestamp(2000, tz=timezone.utc)
+    db.commit()
+
+    # A third, unrelated applied event on the SAME entity — its later revert
+    # is what forces the refold that would otherwise undo the approval.
+    third = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="applied",
+        field="notes", new_value="whatever",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=third)
+    db.commit()
+    old_pending_id, third_id, entity_id = old_pending.id, third.id, entity.id
+    db.close()
+
+    r = c.post(f"/api/tasks/{task_id}/events/{old_pending_id}/approve")
+    assert r.status_code == 200
+
+    db2 = TS()
+    entity2 = task_repo.get_entity(db2, task_id=task_id, entity_id=entity_id)
+    assert entity2.state["stage"] == "approved_value"
+    db2.close()
+
+    # Force a refold via an unrelated revert on the SAME entity — this is
+    # exactly the "later refold" (revert/detach/merge) the coordinator-pinned
+    # semantics must survive.
+    r2 = c.post(f"/api/tasks/{task_id}/events/{third_id}/revert")
+    assert r2.status_code == 200
+
+    db3 = TS()
+    entity3 = task_repo.get_entity(db3, task_id=task_id, entity_id=entity_id)
+    assert entity3.state["stage"] == "approved_value"  # survives the refold
 
 
 def test_events_other_user_task_404(authed):

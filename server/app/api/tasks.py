@@ -18,6 +18,7 @@ own `_publish_task_updated` helper of the same shape.
 
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
@@ -539,6 +540,17 @@ def approve_event(task_id: str, event_id: str, user: User = Depends(get_current_
         raise HTTPException(409, f"event is '{event.status}', not pending_review")
     entity = _require_event_entity(db, task=task, event=event)
 
+    # repo.refold_entity's fold key is created_at ("assertion time") — an
+    # approved event may be much OLDER than events applied since it was
+    # staged pending. Without re-dating it here, a LATER refold (revert/
+    # detach/merge touching this same entity) would silently re-sort this
+    # event back to its original position and let a newer-but-since-
+    # superseded applied event's value win the fold again, contradicting the
+    # user's explicit approval just made. Re-dating to now() means "the user
+    # approved this NOW" always outranks anything earlier on every future
+    # fold. Gmail provenance (message_id/gmail_message_id/evidence_quote) is
+    # untouched — only the fold-ordering key moves.
+    event.created_at = datetime.now(timezone.utc)
     task_repo.apply_event(db, task=task, entity=entity, event=event)
     db.commit()
     _publish_task_updated(db, user_id=user.id, task=task)
@@ -554,6 +566,21 @@ def reject_event(task_id: str, event_id: str, user: User = Depends(get_current_u
         raise HTTPException(409, f"event is '{event.status}', not pending_review")
 
     event.status = "rejected"
+    # The validator mints an entity row even for a pending_review outcome
+    # (step 8 needs a real entity_id for either branch) — if this reject was
+    # the entity's ONLY event and nothing was ever folded into its state,
+    # rejecting it just stranded an empty, permanently-visible board row
+    # with no way to remove it later. Clean that up here; an entity with
+    # other history (an applied event, another still-pending proposal, a
+    # manual state edit) is left untouched. This doesn't bump task.version
+    # or need its own SSE nudge beyond the pending_count change already
+    # carried by _publish_task_updated below — the client's TaskDetail
+    # already refetches the board on reject, so a vanished entity is picked
+    # up on that refetch.
+    if event.entity_id is not None:
+        task_repo.delete_entity_if_orphaned(
+            db, task_id=task.id, entity_id=event.entity_id, excluding_event_id=event.id,
+        )
     db.commit()
     _publish_task_updated(db, user_id=user.id, task=task)
     return _serialize_event(event)
