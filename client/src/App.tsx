@@ -5,6 +5,7 @@ import Login from './auth/Login'
 import { AppShell } from './AppShell'
 import HudPage from './pages/hud/HudPage'
 import InboxPage from './pages/inbox/InboxPage'
+import TaskDetail from './pages/task/TaskDetail'
 
 // Renamed from `Routes` — react-router-dom owns that name now.
 function Gate() {
@@ -17,6 +18,7 @@ function Gate() {
         <Route element={<AppShell />}>
           <Route path="/" element={<HudPage />} />
           <Route path="/inbox" element={<InboxPage />} />
+          <Route path="/tasks/:taskId" element={<TaskDetail />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>
