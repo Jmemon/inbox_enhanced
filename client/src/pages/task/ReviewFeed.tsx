@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { TaskEntity, TaskEvent } from '../../lib/api'
+
+const BUSY_TIMEOUT_MS = 10_000
 
 // Maps the task engine's five machine-readable pending_reason enum values
 // (server/app/task_engine's correction gate) to user-facing copy.
@@ -10,7 +12,7 @@ import type { TaskEntity, TaskEvent } from '../../lib/api'
 function pendingReasonCopy(event: TaskEvent): string | null {
   switch (event.pending_reason) {
     case 'near_duplicate_entity':
-      return `LLM proposed "${event.proposed_entity ?? '?'}" — close to an existing entity`
+      return `LLM proposed '${event.proposed_entity ?? '?'}' — close to an existing entity`
     case 'backward_move':
       return 'moves the pipeline backward — confirm it'
     case 'terminal_locked':
@@ -92,9 +94,12 @@ export function ReviewFeed({ events, entitiesById, onApprove, onReject, onRevert
   // the NEXT `events` snapshot arrives that no longer carries it as
   // pending_review — i.e. the refetch that follows a successful approve or
   // reject. A request that fails outright never refetches (TaskDetail just
-  // console.errors it), so its button would stay stuck disabled; there's no
-  // signal in this read-only prop contract to recover from that here.
+  // console.errors it), so its button would stay stuck disabled. The parent's
+  // handler swallows failures without a refetch, so a failed request would
+  // otherwise disable the button until unmount; we add a 10-second timeout
+  // fallback to recover from that.
   const [busy, setBusy] = useState<Set<string>>(new Set())
+  const busyTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
   useEffect(() => {
     const stillPending = new Set(pending.map((e) => e.id))
@@ -102,8 +107,17 @@ export function ReviewFeed({ events, entitiesById, onApprove, onReject, onRevert
       let changed = false
       const next = new Set<string>()
       for (const id of prev) {
-        if (stillPending.has(id)) next.add(id)
-        else changed = true
+        if (stillPending.has(id)) {
+          next.add(id)
+        } else {
+          // Event is no longer pending — clear any pending timeout for this id
+          const timer = busyTimersRef.current.get(id)
+          if (timer) {
+            clearTimeout(timer)
+            busyTimersRef.current.delete(id)
+          }
+          changed = true
+        }
       }
       return changed ? next : prev
     })
@@ -112,7 +126,32 @@ export function ReviewFeed({ events, entitiesById, onApprove, onReject, onRevert
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events])
 
-  const markBusy = (id: string) => setBusy((prev) => new Set(prev).add(id))
+  // On unmount, clear all pending busy timeouts
+  useEffect(() => {
+    return () => {
+      for (const timer of busyTimersRef.current.values()) {
+        clearTimeout(timer)
+      }
+      busyTimersRef.current.clear()
+    }
+  }, [])
+
+  const markBusy = (id: string) => {
+    setBusy((prev) => new Set(prev).add(id))
+    // Start a timeout that clears this id's busy state after BUSY_TIMEOUT_MS.
+    // If the event-driven clear (useEffect on [events]) fires first, it will
+    // clear this timer. If the request fails and no refetch occurs, this
+    // timeout will restore the button to enabled after 10 seconds.
+    const timer = setTimeout(() => {
+      setBusy((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next.size === prev.size ? prev : next
+      })
+      busyTimersRef.current.delete(id)
+    }, BUSY_TIMEOUT_MS)
+    busyTimersRef.current.set(id, timer)
+  }
 
   return (
     <div style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, display: 'grid', gap: 16, alignContent: 'start' }}>
@@ -134,7 +173,7 @@ export function ReviewFeed({ events, entitiesById, onApprove, onReject, onRevert
                 {e.evidence_quote && <EvidenceQuote quote={e.evidence_quote} />}
                 {e.confidence !== null && (
                   <div style={{ color: '#888', fontSize: 11, marginTop: 4 }}>
-                    confidence: {Math.round(e.confidence * 100)}%
+                    confidence: {e.confidence}%
                   </div>
                 )}
                 {reason && <div style={{ color: '#a06a00', fontSize: 11, marginTop: 2 }}>{reason}</div>}
