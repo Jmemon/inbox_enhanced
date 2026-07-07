@@ -477,6 +477,48 @@ def delete_entity(db: Session, *, entity: TaskStateEntity) -> None:
     db.delete(entity)
 
 
+def delete_entity_if_orphaned(
+    db: Session, *, task_id: str, entity_id: str, excluding_event_id: str,
+) -> bool:
+    """Delete a TaskStateEntity if it has zero history and zero observed
+    state beyond the one event currently being excluded — the substrate for
+    the reject route's minted-new-entity cleanup: the validator (step 8)
+    mints an entity row even for a pending_review outcome, since both the
+    applied and pending branches need a real entity_id. Rejecting that one
+    pending event would otherwise strand an empty entity on the board
+    forever with no way to ever remove it.
+
+    Deletes only when BOTH:
+      - zero OTHER events (any status) reference this entity_id, besides
+        `excluding_event_id` (the event the caller just rejected) — i.e.
+        this reject was the entity's entire history;
+      - entity.state carries no non-null values. An empty `{}` (never
+        folded) and `{"stage": None}` (refold_entity's own default for a
+        never-folded entity) both count as empty — neither is observed
+        signal a user would want to keep.
+
+    Returns True if the entity was deleted, False if it was left alone
+    (real history or observed state survives it).
+    """
+    other_event_count = db.execute(
+        select(func.count()).select_from(TaskEvent).where(
+            TaskEvent.entity_id == entity_id,
+            TaskEvent.id != excluding_event_id,
+        )
+    ).scalar_one()
+    if other_event_count > 0:
+        return False
+
+    entity = get_entity(db, task_id=task_id, entity_id=entity_id)
+    if entity is None:
+        return False
+    if any(v is not None for v in entity.state.values()):
+        return False
+
+    db.delete(entity)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Extraction validator support (Task 6, task_engine.transitions)
 # ---------------------------------------------------------------------------

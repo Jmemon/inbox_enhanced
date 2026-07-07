@@ -846,8 +846,12 @@ def test_reject_pending_event(authed):
     assert r.json()["status"] == "rejected"
 
     db = TS()
-    entity = task_repo.get_entity(db, task_id=task_id, entity_id=entity_id)
-    assert entity.state == {}  # never applied, so no state change
+    # 2C ledger Fix 2: this seeded pending event was the entity's entire
+    # history, so rejecting it also cleans up the now-orphaned minted entity
+    # (dedicated coverage: test_reject_deletes_orphaned_minted_new_entity /
+    # test_reject_pending_on_entity_with_history_keeps_entity) — there's no
+    # longer a row to assert an unset state on.
+    assert task_repo.get_entity(db, task_id=task_id, entity_id=entity_id) is None
 
 
 def test_reject_non_pending_409(authed):
@@ -857,6 +861,55 @@ def test_reject_non_pending_409(authed):
     c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
     r2 = c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
     assert r2.status_code == 409
+
+
+def test_reject_deletes_orphaned_minted_new_entity(authed):
+    """2C ledger Fix 2: the validator mints an entity row at step 8 even for
+    a pending_review outcome (both branches need a real entity_id) — so
+    rejecting a pending event on a freshly-minted entity with no other
+    history must not strand an empty entity on the board forever."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, entity_id = _seed_pending_event(TS, task_id)
+
+    r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
+    assert r.status_code == 200
+
+    db = TS()
+    assert task_repo.get_entity(db, task_id=task_id, entity_id=entity_id) is None
+
+
+def test_reject_pending_on_entity_with_history_keeps_entity(authed):
+    """The same reject must NOT delete an entity that has other history — an
+    already-applied event's folded state is real signal, not an empty mint."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    applied = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="applied",
+        field="stage", new_value="todo",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=applied)
+    pending = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="in_progress", evidence_quote="quote",
+    )
+    db.commit()
+    ev_id, entity_id = pending.id, entity.id
+    db.close()
+
+    r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/reject")
+    assert r.status_code == 200
+
+    db2 = TS()
+    survivor = task_repo.get_entity(db2, task_id=task_id, entity_id=entity_id)
+    assert survivor is not None
+    assert survivor.state["stage"] == "todo"
 
 
 def test_revert_applied_event_refolds_entity(authed):

@@ -503,6 +503,101 @@ def test_recent_user_events_empty_when_no_corrections(two_users):
 
 
 # ---------------------------------------------------------------------------
+# delete_entity_if_orphaned (2C ledger Fix 2)
+# ---------------------------------------------------------------------------
+
+
+def test_delete_entity_if_orphaned_deletes_a_freshly_minted_empty_entity(two_users):
+    """The validator mints an entity row at step 8 even for a pending_review
+    outcome (both branches need a real entity_id) — so an entity whose ONLY
+    event is the one being excluded (the just-rejected pending) and whose
+    state carries no observed values must be deleted, not stranded."""
+    task = _mk_task(two_users)
+    two_users.commit()
+    entity = repo.get_or_create_entity(two_users, task_id=task.id, user_id="u1",
+                                        entity_key="acme", display_name="Acme")
+    two_users.commit()
+    pending = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="pending_review", field="stage", new_value="applied")
+    two_users.commit()
+
+    deleted = repo.delete_entity_if_orphaned(
+        two_users, task_id=task.id, entity_id=entity.id, excluding_event_id=pending.id,
+    )
+    two_users.commit()
+
+    assert deleted is True
+    assert repo.get_entity(two_users, task_id=task.id, entity_id=entity.id) is None
+
+
+def test_delete_entity_if_orphaned_keeps_entity_with_other_events(two_users):
+    """An entity with a SECOND event (any status) beyond the one being
+    excluded has real history — it must survive."""
+    task = _mk_task(two_users)
+    two_users.commit()
+    entity = repo.get_or_create_entity(two_users, task_id=task.id, user_id="u1",
+                                        entity_key="acme", display_name="Acme")
+    two_users.commit()
+    applied = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="applied", field="stage", new_value="applied")
+    repo.apply_event(two_users, task=task, entity=entity, event=applied)
+    pending = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="pending_review", field="stage", new_value="interview")
+    two_users.commit()
+
+    deleted = repo.delete_entity_if_orphaned(
+        two_users, task_id=task.id, entity_id=entity.id, excluding_event_id=pending.id,
+    )
+    two_users.commit()
+
+    assert deleted is False
+    assert repo.get_entity(two_users, task_id=task.id, entity_id=entity.id) is not None
+
+
+def test_delete_entity_if_orphaned_keeps_entity_with_observed_state(two_users):
+    """No OTHER events, but the entity's own state already carries a
+    non-null value (e.g. it was folded before its one surviving event was
+    excluded/reverted elsewhere) — still not an empty mint, so it survives."""
+    task = _mk_task(two_users)
+    two_users.commit()
+    entity = repo.get_or_create_entity(two_users, task_id=task.id, user_id="u1",
+                                        entity_key="acme", display_name="Acme")
+    entity.state = {"stage": "applied"}
+    pending = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="pending_review", field="notes", new_value="called them")
+    two_users.commit()
+
+    deleted = repo.delete_entity_if_orphaned(
+        two_users, task_id=task.id, entity_id=entity.id, excluding_event_id=pending.id,
+    )
+    two_users.commit()
+
+    assert deleted is False
+    assert repo.get_entity(two_users, task_id=task.id, entity_id=entity.id) is not None
+
+
+def test_delete_entity_if_orphaned_treats_stage_none_only_state_as_empty(two_users):
+    """{'stage': None} is refold_entity's own default for a never-folded
+    entity — not observed state — so it must still count as empty/orphaned."""
+    task = _mk_task(two_users)
+    two_users.commit()
+    entity = repo.get_or_create_entity(two_users, task_id=task.id, user_id="u1",
+                                        entity_key="acme", display_name="Acme")
+    entity.state = {"stage": None}
+    pending = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                 status="pending_review", field="stage", new_value="applied")
+    two_users.commit()
+
+    deleted = repo.delete_entity_if_orphaned(
+        two_users, task_id=task.id, entity_id=entity.id, excluding_event_id=pending.id,
+    )
+    two_users.commit()
+
+    assert deleted is True
+    assert repo.get_entity(two_users, task_id=task.id, entity_id=entity.id) is None
+
+
+# ---------------------------------------------------------------------------
 # criteria relocation
 # ---------------------------------------------------------------------------
 

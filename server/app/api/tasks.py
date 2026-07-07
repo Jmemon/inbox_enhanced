@@ -566,6 +566,21 @@ def reject_event(task_id: str, event_id: str, user: User = Depends(get_current_u
         raise HTTPException(409, f"event is '{event.status}', not pending_review")
 
     event.status = "rejected"
+    # The validator mints an entity row even for a pending_review outcome
+    # (step 8 needs a real entity_id for either branch) — if this reject was
+    # the entity's ONLY event and nothing was ever folded into its state,
+    # rejecting it just stranded an empty, permanently-visible board row
+    # with no way to remove it later. Clean that up here; an entity with
+    # other history (an applied event, another still-pending proposal, a
+    # manual state edit) is left untouched. This doesn't bump task.version
+    # or need its own SSE nudge beyond the pending_count change already
+    # carried by _publish_task_updated below — the client's TaskDetail
+    # already refetches the board on reject, so a vanished entity is picked
+    # up on that refetch.
+    if event.entity_id is not None:
+        task_repo.delete_entity_if_orphaned(
+            db, task_id=task.id, entity_id=event.entity_id, excluding_event_id=event.id,
+        )
     db.commit()
     _publish_task_updated(db, user_id=user.id, task=task)
     return _serialize_event(event)
