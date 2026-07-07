@@ -872,3 +872,36 @@ def test_backward_move_beats_low_confidence_first_guard_wins(db):
     )
     assert len(result.pending) == 1
     assert result.pending[0].pending_reason == "backward_move"
+
+
+def test_near_duplicate_beats_backward_move_first_guard_wins_across_steps(db):
+    """2C ledger Fix 3 (cross-step regression): a proposal that is BOTH a
+    near-duplicate entity match (step 2) AND a backward stage move against
+    the matched entity's current stage (step 3) must report step 2's reason
+    — 'near_duplicate_entity' — not step 3's 'backward_move'. The test above
+    (test_backward_move_beats_low_confidence_first_guard_wins) only pins
+    'first guard wins' for step 3 vs step 8; this pins it ACROSS steps 2 and
+    3, since step 2 runs first and _process_one's step-3 guard is gated
+    `if pending_reason is None`."""
+    _mk_user(db)
+    schema = multi_entity_schema()
+    task = _mk_task(db, schema=schema)
+    entity = repo.get_or_create_entity(db, task_id=task.id, user_id="u1", entity_key="stripe", display_name="Stripe")
+    entity.state = {"stage": "onsite"}
+    db.commit()
+
+    # "Stripewise Corp" is a near-duplicate of "stripe" (step 2 routes to
+    # pending on the closest existing entity, 'stripe'); the proposed stage
+    # move ("applied", earlier than the resolved entity's current "onsite")
+    # is ALSO a backward move (step 3) against that same resolved entity.
+    result = validate_and_stage(
+        db, task=task, schema=schema, parsed=DEFAULT_THREAD, thread_row_id=THREAD_ROW_ID,
+        proposals=[_proposal(entity="Stripewise Corp", is_new=True, field="stage", new_value="applied",
+                              confidence=95, evidence="received your application to Stripe, Inc.",
+                              message_id="gm1")],
+        message_id_map=DEFAULT_MAP,
+    )
+    assert result.applied == []
+    assert len(result.pending) == 1
+    assert result.pending[0].pending_reason == "near_duplicate_entity"
+    assert result.pending[0].proposed_entity == "Stripewise Corp"
