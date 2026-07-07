@@ -30,6 +30,23 @@ EXAMPLE_CAP = 30
 # lines live inside — this only ever needs to find the outer tag pair.
 _BLOCK_RE = re.compile(r"<(positive|nearmiss)>.*?</\1>", re.DOTALL)
 
+# Any occurrence of a positive/nearmiss open or close tag token, tolerant of
+# case and interior whitespace (e.g. "</POSITIVE>", "< nearmiss >"). Used to
+# neutralize tag-shaped substrings inside untrusted example content BEFORE
+# it's interpolated into a rendered block, so it can never be mistaken for
+# real block-grammar markup by _BLOCK_RE (or by anything downstream that
+# re-parses the criteria text, including the classify prompt itself).
+_TAG_TOKEN_RE = re.compile(r"</?\s*(positive|nearmiss)\s*>", re.IGNORECASE)
+
+
+def _neutralize_tags(value: str) -> str:
+    """Email-borne text (sender/subject/snippet/rationale) can contain
+    literal block-tag tokens; left raw they truncate or forge example blocks
+    when cap_examples re-parses the criteria (and would flow verbatim into
+    the classify prompt). Swap their angle brackets for parens — content
+    stays readable, the grammar stays sound."""
+    return _TAG_TOKEN_RE.sub(lambda m: m.group(0).replace("<", "(").replace(">", ")"), value)
+
 
 def _render_block(example: dict, tag: str) -> str:
     """Render ONE <tag>...</tag> example block, byte-identical to the shape
@@ -38,19 +55,24 @@ def _render_block(example: dict, tag: str) -> str:
     both `formulate_criteria` (batch construction) and `append_example`
     (single-example incremental append) so neither can drift out of sync with
     the other's grammar.
+
+    Sender/subject/snippet/rationale are untrusted, email-borne strings —
+    each is run through `_neutralize_tags` before interpolation so they can't
+    be mistaken for real <positive>/<nearmiss> block markup by `cap_examples`
+    (or by the classify prompt, which consumes this text verbatim).
     """
     lines = [
         f"<{tag}>",
-        f"From: {example.get('sender', '')}",
+        f"From: {_neutralize_tags(example.get('sender', ''))}",
         "To: me",
-        f"Subject: {example.get('subject', '')}",
+        f"Subject: {_neutralize_tags(example.get('subject', ''))}",
         "",
-        example.get("snippet", ""),
+        _neutralize_tags(example.get("snippet", "")),
     ]
     rationale = example.get("rationale", "")
     if rationale:
         lines.append("")
-        lines.append(f"Why: {rationale}")
+        lines.append(f"Why: {_neutralize_tags(rationale)}")
     lines.append(f"</{tag}>")
     return "\n".join(lines)
 
