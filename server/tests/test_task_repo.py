@@ -442,6 +442,67 @@ def test_refold_entity_stage_falls_back_to_none_with_no_surviving_event(two_user
 
 
 # ---------------------------------------------------------------------------
+# recent_user_events (Task 2, spec §4.6 learning loop)
+# ---------------------------------------------------------------------------
+
+
+def test_recent_user_events_returns_only_user_applied_newest_first(two_users):
+    task = _mk_task(two_users)
+    two_users.commit()
+    entity = repo.get_or_create_entity(two_users, task_id=task.id, user_id="u1",
+                                        entity_key="_self", display_name="Self")
+    two_users.commit()
+
+    t0 = datetime.now(timezone.utc)
+
+    # Noise this query must exclude: llm-origin applied, and user-origin but
+    # not applied (pending_review / rejected).
+    llm_applied = repo.append_event(two_users, task=task, entity=entity, origin="llm",
+                                     status="applied", field="stage", new_value="applied")
+    llm_applied.created_at = t0
+    user_pending = repo.append_event(two_users, task=task, entity=entity, origin="user",
+                                      status="pending_review", field="stage", new_value="interview")
+    user_pending.created_at = t0 + timedelta(seconds=1)
+
+    user_ev1 = repo.append_event(two_users, task=task, entity=entity, origin="user",
+                                  status="applied", field="stage", new_value="interview")
+    user_ev1.created_at = t0 + timedelta(seconds=2)
+    user_ev2 = repo.append_event(two_users, task=task, entity=entity, origin="user",
+                                  status="applied", field="stage", new_value="offer")
+    user_ev2.created_at = t0 + timedelta(seconds=3)
+    two_users.commit()
+
+    events = repo.recent_user_events(two_users, task_id=task.id)
+    assert [e.id for e in events] == [user_ev2.id, user_ev1.id]  # newest first
+
+
+def test_recent_user_events_respects_limit(two_users):
+    task = _mk_task(two_users)
+    two_users.commit()
+    entity = repo.get_or_create_entity(two_users, task_id=task.id, user_id="u1",
+                                        entity_key="_self", display_name="Self")
+    two_users.commit()
+
+    t0 = datetime.now(timezone.utc)
+    ids = []
+    for i in range(7):
+        ev = repo.append_event(two_users, task=task, entity=entity, origin="user",
+                                status="applied", field="stage", new_value=str(i))
+        ev.created_at = t0 + timedelta(seconds=i)
+        ids.append(ev.id)
+    two_users.commit()
+
+    events = repo.recent_user_events(two_users, task_id=task.id, limit=3)
+    assert [e.id for e in events] == list(reversed(ids))[:3]
+
+
+def test_recent_user_events_empty_when_no_corrections(two_users):
+    task = _mk_task(two_users)
+    two_users.commit()
+    assert repo.recent_user_events(two_users, task_id=task.id) == []
+
+
+# ---------------------------------------------------------------------------
 # criteria relocation
 # ---------------------------------------------------------------------------
 

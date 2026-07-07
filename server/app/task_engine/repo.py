@@ -500,6 +500,31 @@ def latest_applied_user_event(db: Session, *, entity_id: str) -> TaskEvent | Non
     return db.execute(stmt).scalars().first()
 
 
+def recent_user_events(db: Session, *, task_id: str, limit: int = 5) -> list[TaskEvent]:
+    """This task's most recent human corrections — origin='user',
+    status='applied' events, newest first (spec §4.6's learning loop, Task 2).
+
+    These are exactly the events `edit_entity_state` (api/tasks.py's manual
+    state-edit endpoint) creates — the same events `latest_applied_user_event`
+    already uses as the extraction validator's correction fence. This query
+    feeds the OTHER half of that same signal into the extraction prompt
+    itself (task_engine.engine.extract_for_pair): rather than only fencing a
+    stale proposal out after the fact, recent corrections are surfaced to the
+    LLM up front so it's less likely to propose relitigating one at all.
+    """
+    stmt = (
+        select(TaskEvent)
+        .where(
+            TaskEvent.task_id == task_id,
+            TaskEvent.origin == "user",
+            TaskEvent.status == "applied",
+        )
+        .order_by(TaskEvent.created_at.desc())
+        .limit(limit)
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
 def find_event_for_message_field(
     db: Session, *, task_id: str, message_id: str | None, field: str | None
 ) -> TaskEvent | None:

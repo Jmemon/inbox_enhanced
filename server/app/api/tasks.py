@@ -352,6 +352,28 @@ def list_task_events(
 
 class _AttachThreadBody(BaseModel):
     thread_id: str = Field(min_length=1)
+    add_example: bool = True
+
+
+def _example_from_thread(db: Session, *, user_id: str, thread, rationale: str) -> dict | None:
+    """Build an `append_example()` input dict from a thread's most-recent
+    message (spec §4.6 learning loop, Task 2) — same recent-message
+    resolution `_serialize_thread`/`task_engine_tasks._candidate_from_thread`
+    already use elsewhere: `thread.recent_message_id` is a soft pointer, so
+    it's resolved via `inbox_repo.get_message` scoped to `user_id`. Returns
+    None (caller skips the append silently) when the thread has no usable
+    recent message yet to quote."""
+    if not thread.recent_message_id:
+        return None
+    msg = inbox_repo.get_message(db, user_id=user_id, message_id=thread.recent_message_id)
+    if msg is None:
+        return None
+    return {
+        "sender": msg.from_addr or "",
+        "subject": thread.subject or "",
+        "snippet": msg.body_preview or "",
+        "rationale": rationale,
+    }
 
 
 @router.get("/tasks/{task_id}/threads")
@@ -375,6 +397,16 @@ def attach_thread(task_id: str, body: _AttachThreadBody, user: User = Depends(ge
         db, task_id=task.id, thread_id=thread.id, user_id=user.id,
         origin="user", state="attached",
     )
+    if body.add_example:
+        # spec §4.6 learning loop (Task 2): an explicit attach is a positive
+        # signal the task's own classify criteria should learn from, same as
+        # a confirmed-positive example at task-creation time.
+        example = _example_from_thread(
+            db, user_id=user.id, thread=thread,
+            rationale="user attached this thread to the task",
+        )
+        if example is not None:
+            task.criteria = criteria_mod.append_example(task.criteria, example=example, tag="positive")
     db.commit()
     # Extract this one pair immediately rather than waiting for the next
     # sync-triggered process_task_updates run (see workers/task_engine_tasks
@@ -388,7 +420,8 @@ def attach_thread(task_id: str, body: _AttachThreadBody, user: User = Depends(ge
 
 
 @router.delete("/tasks/{task_id}/threads/{thread_id}", status_code=204)
-def detach_thread(task_id: str, thread_id: str, user: User = Depends(get_current_user),
+def detach_thread(task_id: str, thread_id: str, add_example: bool = Query(default=True),
+                  user: User = Depends(get_current_user),
                   db: Session = Depends(get_db)) -> None:
     task = _require_owned_task(db, user_id=user.id, task_id=task_id)
     thread = inbox_repo.get_thread(db, user_id=user.id, thread_id=thread_id)
@@ -399,6 +432,16 @@ def detach_thread(task_id: str, thread_id: str, user: User = Depends(get_current
         db, task_id=task.id, thread_id=thread.id, user_id=user.id,
         origin="user", state="detached",
     )
+    if add_example:
+        # spec §4.6 learning loop (Task 2): an explicit detach is a
+        # near-miss signal — the thread looked relevant enough to have been
+        # linked, but the user says it isn't.
+        example = _example_from_thread(
+            db, user_id=user.id, thread=thread,
+            rationale="user detached this thread from the task",
+        )
+        if example is not None:
+            task.criteria = criteria_mod.append_example(task.criteria, example=example, tag="nearmiss")
     # A detached thread's not-yet-reviewed proposals must not remain
     # approvable later (the thread they cite is gone from this task) — flip
     # them to 'rejected' before the refold logic below. These were never

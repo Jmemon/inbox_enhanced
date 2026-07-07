@@ -86,11 +86,24 @@ def _render_roster(schema: TaskStateSchema, entities: list[TaskStateEntity]) -> 
 
 def build_user_message(
     *, goal: str, schema: TaskStateSchema, entities: list[TaskStateEntity], thread_str_with_ids: str,
+    user_corrections: list | None = None,
 ) -> str:
+    """user_corrections (spec §4.6 learning loop, Task 2): pre-rendered
+    one-line strings, one per recent human correction, already resolved by
+    the caller (task_engine.engine.extract_for_pair) into the shape
+    '{entity display name}: user set {field} to "{new_value}"' — this module
+    stays free of db access, so it just prefixes each with "- " and renders
+    the section; empty/None omits the section entirely (byte-identical to
+    the pre-Task-2 prompt)."""
+    corrections_section = ""
+    if user_corrections:
+        rendered = "\n".join(f"- {line}" for line in user_corrections)
+        corrections_section = f"Corrections the user has made (respect these):\n{rendered}\n\n"
     return (
         f"Goal: {goal}\n\n"
         f"Schema:\n{_render_schema(schema)}\n\n"
         f"{_render_roster(schema, entities)}\n\n"
+        f"{corrections_section}"
         f"Thread:\n\n{thread_str_with_ids}"
     )
 

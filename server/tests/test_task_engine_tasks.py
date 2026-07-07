@@ -482,6 +482,74 @@ def test_extract_for_thread_skips_non_tracker_kind(session_factory, fake_redis, 
 
 
 # ---------------------------------------------------------------------------
+# Task 2 (spec §4.6 learning loop): recent user corrections thread into the
+# extraction prompt via engine.extract_for_pair -> extract_transition.
+# build_user_message
+# ---------------------------------------------------------------------------
+
+
+def test_extract_for_pair_threads_recent_user_corrections_into_prompt(
+    session_factory, fake_redis, monkeypatch,
+):
+    """A prior manual correction (origin='user', status='applied') on this
+    task's entity must show up, rendered, inside the actual `user` message
+    handed to the extraction LLM call — proving engine.extract_for_pair
+    fetches repo.recent_user_events and threads it through
+    extract_transition.build_user_message, not just that the plumbing
+    compiles."""
+    _seed_user_thread_message(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _attach(session_factory, task_id=task_id, thread_id=THREAD_ID)
+
+    db = session_factory()
+    task = task_repo.get_owned_task(db, user_id=USER_ID, task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id=USER_ID, entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    correction = task_repo.append_event(
+        db, task=task, entity=entity, origin="user", status="applied",
+        field="stage", old_value="todo", new_value="in_progress",
+    )
+    task_repo.apply_event(db, task=task, entity=entity, event=correction)
+    db.commit()
+    db.close()
+
+    captured_kwargs: dict = {}
+
+    async def _fake(**kwargs):
+        captured_kwargs.update(kwargs)
+        return _extraction_response(confidence=90)
+
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
+
+    task_engine_tasks.process_task_updates.apply(args=[USER_ID, [THREAD_ID]])
+
+    assert "Corrections the user has made (respect these):" in captured_kwargs["user"]
+    assert '- Self: user set stage to "in_progress"' in captured_kwargs["user"]
+
+
+def test_extract_for_pair_omits_corrections_section_with_no_prior_corrections(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user_thread_message(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _attach(session_factory, task_id=task_id, thread_id=THREAD_ID)
+
+    captured_kwargs: dict = {}
+
+    async def _fake(**kwargs):
+        captured_kwargs.update(kwargs)
+        return _extraction_response(confidence=90)
+
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
+
+    task_engine_tasks.process_task_updates.apply(args=[USER_ID, [THREAD_ID]])
+
+    assert "Corrections the user has made" not in captured_kwargs["user"]
+
+
+# ---------------------------------------------------------------------------
 # Task 9: backfill_task
 # ---------------------------------------------------------------------------
 

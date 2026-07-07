@@ -608,6 +608,120 @@ def test_detach_other_users_thread_404(authed):
 
 
 # ---------------------------------------------------------------------------
+# Task 2 (spec §4.6 learning loop): attach/detach feed corrections into
+# task.criteria as tagged examples
+# ---------------------------------------------------------------------------
+
+
+def _mk_task_with_criteria(TS, *, criteria: str, uid="u1") -> str:
+    db = TS()
+    task = task_repo.create_task(
+        db, user_id=uid, name="Tracker", goal="goal text", criteria=criteria,
+        state_schema=SINGLETON_SCHEMA, kind="tracker",
+    )
+    db.commit()
+    task_id = task.id
+    db.close()
+    return task_id
+
+
+def test_attach_thread_appends_positive_example_from_recent_message(authed):
+    c, TS = authed
+    task_id = _mk_task_with_criteria(TS, criteria="Base criteria.\n\nExample cases:\n")
+    thread_id = _seed_thread(TS, gmail_thread_id="gH", subject="quarterly report")
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"):
+        r = c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+    assert r.status_code == 201
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    assert "<positive>" in task.criteria
+    assert "quarterly report" in task.criteria
+    assert "alice@x.com" in task.criteria
+    assert "user attached this thread to the task" in task.criteria
+    assert "Base criteria." in task.criteria  # description preserved
+
+
+def test_attach_thread_add_example_false_leaves_criteria_untouched(authed):
+    c, TS = authed
+    original = "Base criteria.\n\nExample cases:\n"
+    task_id = _mk_task_with_criteria(TS, criteria=original)
+    thread_id = _seed_thread(TS, gmail_thread_id="gI")
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"):
+        r = c.post(
+            f"/api/tasks/{task_id}/threads",
+            json={"thread_id": thread_id, "add_example": False},
+        )
+    assert r.status_code == 201
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    assert task.criteria == original
+
+
+def test_attach_thread_with_no_recent_message_skips_example_silently(authed):
+    c, TS = authed
+    task_id = _mk_task_with_criteria(TS, criteria="Base criteria.\n\nExample cases:\n")
+    # A thread with no messages at all -> no recent_message_id to resolve.
+    db = TS()
+    thread = inbox_repo.upsert_thread(
+        db, user_id="u1", gmail_thread_id="gJ", subject="no messages yet", bucket_id=None,
+    )
+    db.commit()
+    thread_id = thread.id
+    db.close()
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"):
+        r = c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+    assert r.status_code == 201
+
+    db2 = TS()
+    task = task_repo.get_owned_task(db2, user_id="u1", task_id=task_id)
+    assert task.criteria == "Base criteria.\n\nExample cases:\n"
+
+
+def test_detach_thread_appends_nearmiss_example_from_recent_message(authed):
+    c, TS = authed
+    task_id = _mk_task_with_criteria(TS, criteria="Base criteria.\n\nExample cases:\n")
+    thread_id = _seed_thread(TS, gmail_thread_id="gK", subject="newsletter blast")
+    db = TS()
+    task_repo.upsert_link(db, task_id=task_id, thread_id=thread_id, user_id="u1",
+                         origin="llm", state="attached")
+    db.commit()
+    db.close()
+
+    r = c.delete(f"/api/tasks/{task_id}/threads/{thread_id}")
+    assert r.status_code == 204
+
+    db2 = TS()
+    task = task_repo.get_owned_task(db2, user_id="u1", task_id=task_id)
+    assert "<nearmiss>" in task.criteria
+    assert "newsletter blast" in task.criteria
+    assert "user detached this thread from the task" in task.criteria
+
+
+def test_detach_thread_add_example_false_leaves_criteria_untouched(authed):
+    c, TS = authed
+    original = "Base criteria.\n\nExample cases:\n"
+    task_id = _mk_task_with_criteria(TS, criteria=original)
+    thread_id = _seed_thread(TS, gmail_thread_id="gL")
+    db = TS()
+    task_repo.upsert_link(db, task_id=task_id, thread_id=thread_id, user_id="u1",
+                         origin="llm", state="attached")
+    db.commit()
+    db.close()
+
+    r = c.delete(f"/api/tasks/{task_id}/threads/{thread_id}?add_example=false")
+    assert r.status_code == 204
+
+    db2 = TS()
+    task = task_repo.get_owned_task(db2, user_id="u1", task_id=task_id)
+    assert task.criteria == original
+
+
+# ---------------------------------------------------------------------------
 # Event corrections: approve / reject / revert
 # ---------------------------------------------------------------------------
 

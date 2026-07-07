@@ -83,6 +83,54 @@ def test_build_user_message_singleton_uses_self_key_no_roster_listing():
 
 
 # ---------------------------------------------------------------------------
+# build_user_message: user_corrections section (spec §4.6 learning loop)
+# ---------------------------------------------------------------------------
+
+
+def test_build_user_message_omits_corrections_section_when_none():
+    msg = extract_transition.build_user_message(
+        goal="g", schema=singleton_schema(), entities=[], thread_str_with_ids="THREAD",
+    )
+    assert "Corrections the user has made" not in msg
+
+
+def test_build_user_message_omits_corrections_section_when_empty_list():
+    msg = extract_transition.build_user_message(
+        goal="g", schema=singleton_schema(), entities=[], thread_str_with_ids="THREAD",
+        user_corrections=[],
+    )
+    assert "Corrections the user has made" not in msg
+
+
+def test_build_user_message_with_no_corrections_is_byte_identical_to_pre_task2_shape():
+    """Guards against Task 2 accidentally changing the prompt shape for the
+    (still-default) no-corrections case."""
+    kwargs = dict(
+        goal="Track my job hunt", schema=multi_entity_schema(), entities=[_entity()],
+        thread_str_with_ids="[message gm1 | 2026-01-01T00:00:00+00:00]\nBODY TEXT",
+    )
+    without_param = extract_transition.build_user_message(**kwargs)
+    with_none = extract_transition.build_user_message(**kwargs, user_corrections=None)
+    with_empty = extract_transition.build_user_message(**kwargs, user_corrections=[])
+    assert without_param == with_none == with_empty
+
+
+def test_build_user_message_includes_corrections_section_when_present():
+    msg = extract_transition.build_user_message(
+        goal="g", schema=singleton_schema(), entities=[], thread_str_with_ids="THREAD",
+        user_corrections=[
+            'Self: user set stage to "in_review"',
+            'Widget Co: user set level to "senior"',
+        ],
+    )
+    assert "Corrections the user has made (respect these):" in msg
+    assert '- Self: user set stage to "in_review"' in msg
+    assert '- Widget Co: user set level to "senior"' in msg
+    # section appears before the thread, after the roster
+    assert msg.index("Corrections the user has made") < msg.index("THREAD")
+
+
+# ---------------------------------------------------------------------------
 # parse_response
 # ---------------------------------------------------------------------------
 

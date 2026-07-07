@@ -78,9 +78,26 @@ def extract_for_pair(
     entities = repo.list_entities(db, task_id=task.id)
     settings = get_settings()
     thread_str_with_ids = extract_transition.thread_to_string_with_ids(parsed)
+
+    # spec §4.6 learning loop (Task 2): surface the user's most recent
+    # explicit corrections (manual state edits — the same origin='user'/
+    # status='applied' events `latest_applied_user_event`'s fence already
+    # tracks) directly in the extraction prompt, so the model is discouraged
+    # from proposing a change that would relitigate one, not just fenced out
+    # after the fact. Entity display names are resolved here (from `entities`,
+    # already loaded above) rather than in the prompt module, which stays
+    # free of db access per its own docstring.
+    entity_display_by_id = {e.id: e.display_name for e in entities}
+    recent_events = repo.recent_user_events(db, task_id=task.id)
+    user_corrections = [
+        f'{entity_display_by_id.get(ev.entity_id, "unknown")}: user set {ev.field} to "{ev.new_value}"'
+        for ev in recent_events
+    ]
+
     user_message = extract_transition.build_user_message(
         goal=task.goal, schema=schema, entities=entities,
         thread_str_with_ids=thread_str_with_ids,
+        user_corrections=user_corrections,
     )
 
     text = llm_client.run_in_loop(
