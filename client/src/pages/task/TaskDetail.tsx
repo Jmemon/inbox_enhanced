@@ -71,10 +71,32 @@ export default function TaskDetail() {
       .catch((e) => console.error('[TaskDetail] board fetch failed', e))
   }, [taskId])
 
+  // Two parallel windows, merged: the recent-events window (newest 50, any
+  // status, as before) AND a wider pending-only window (newest 200
+  // pending_review events). Why: task.summary.pending_reviews (the review
+  // tray's badge count) is a live server-side COUNT with no window limit,
+  // but the tray itself only ever rendered whatever pending events happened
+  // to fall inside the recent-50 fetch — a pending event older than that
+  // window (e.g. a backfill run queuing many extractions at once) would be
+  // counted in the badge yet permanently invisible in the tray. Merge by id
+  // (pendings ∪ recent, deduped — the same event can appear in both windows)
+  // then re-sort newest-first, since list_task_events is itself newest-first
+  // per call but a straight concat of two independently-paged windows
+  // wouldn't preserve that across the merge. ReviewFeed needs no change: it
+  // just filters this same `events` state by status.
   const refetchEvents = useCallback(() => {
     if (!taskId) return Promise.resolve()
-    return getTaskEvents(taskId).then((r) => setEvents(r.events))
-      .catch((e) => console.error('[TaskDetail] events fetch failed', e))
+    return Promise.all([
+      getTaskEvents(taskId),
+      getTaskEvents(taskId, { status: 'pending_review', limit: 200 }),
+    ]).then(([recent, pending]) => {
+      const byId = new Map<string, TaskEvent>()
+      for (const e of recent.events) byId.set(e.id, e)
+      for (const e of pending.events) byId.set(e.id, e)
+      const merged = Array.from(byId.values())
+        .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      setEvents(merged)
+    }).catch((e) => console.error('[TaskDetail] events fetch failed', e))
   }, [taskId])
 
   const refetchThreads = useCallback(() => {
