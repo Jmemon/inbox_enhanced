@@ -56,6 +56,11 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   const unmountedRef = useRef(false)
   useEffect(() => () => { unmountedRef.current = true }, [])
 
+  // Guards the done-navigate effect below so it fires at most once — without
+  // this, a stray backfill progress update after the first navigate (e.g. a
+  // late SSE frame re-rendering `backfill`) would re-run navigate()/onClose().
+  const navigatedRef = useRef(false)
+
   function applyDraft(forDraftId: string, proposal: TaskDraftProposal,
                        positives: PreviewExample[], nearMisses: PreviewExample[]) {
     if (appliedRef.current.has(forDraftId)) return
@@ -130,14 +135,19 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   }, [draftId, step])
 
   // Once the task is created, watch its backfill progress for completion and
-  // hand off to the task's own page.
+  // hand off to the task's own page. Keyed on this task's own progress entry
+  // (not the whole `backfill` record) so unrelated tasks' progress updates
+  // don't re-run this effect, and guarded by navigatedRef so it fires at most
+  // once even if `progress` changes again after done=true.
+  const progress = taskId ? backfill[taskId] : undefined
   useEffect(() => {
-    if (step !== 'creating' || !taskId) return
-    if (backfill[taskId]?.done) {
+    if (step !== 'creating' || !taskId || navigatedRef.current) return
+    if (progress?.done) {
+      navigatedRef.current = true
       navigate(`/tasks/${taskId}`)
       onClose()
     }
-  }, [step, taskId, backfill, navigate, onClose])
+  }, [step, taskId, progress?.done, navigate, onClose])
 
   async function startDraft() {
     const { draft_id } = await postTaskDraft(goal)
@@ -157,8 +167,8 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
       const positives = examples.filter(e => e.choice === 'positive').map(toExampleIn)
       const negatives = examples.filter(e => e.choice === 'near_miss').map(toExampleIn)
       const task = await createTask({
-        name, goal, description, state_schema: stateSchema, keyword_probes: keywordProbes,
-        confirmed_positives: positives, confirmed_negatives: negatives,
+        name, goal: goal.trim(), description, state_schema: trimStateSchema(stateSchema),
+        keyword_probes: keywordProbes, confirmed_positives: positives, confirmed_negatives: negatives,
       })
       setTaskId(task.id)
       setStep('creating')
@@ -277,6 +287,27 @@ function ExampleRow({ ex, onChoice }: { ex: ExampleState; onChoice: (c: Choice) 
 
 function toExampleIn(ex: ExampleState) {
   return { sender: ex.sender, subject: ex.subject, snippet: ex.snippet, rationale: ex.rationale }
+}
+
+// Trims freeform text the SchemaEditor collects before it hits the wire:
+// pipeline stage/terminal chip names and entity noun/identity_hint/attribute
+// keys. Chips and attributes that are empty after trimming are dropped
+// rather than sent as blank strings — the server's EPS schema validator
+// (task_engine/schema.py) rejects those outright, so this avoids a
+// round-trip 422 for whitespace the user never meant to submit.
+function trimStateSchema(schema: TaskStateSchema): TaskStateSchema {
+  const stages = schema.pipeline.stages.map(s => s.trim()).filter(Boolean)
+  const terminal = schema.pipeline.terminal.map(s => s.trim()).filter(Boolean)
+  const entity = schema.entity
+    ? {
+        noun: schema.entity.noun.trim(),
+        identity_hint: schema.entity.identity_hint.trim(),
+        attributes: schema.entity.attributes
+          .map(a => ({ ...a, key: a.key.trim() }))
+          .filter(a => a.key !== ''),
+      }
+    : null
+  return { ...schema, pipeline: { stages, terminal }, entity }
 }
 
 
