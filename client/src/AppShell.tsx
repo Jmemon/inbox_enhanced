@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from './auth/useAuth'
 import { InboxProvider } from './state/InboxProvider'
+import { TasksProvider } from './state/TasksProvider'
 import { subscribeSse } from './lib/sse'
 
 // Auth-death escape (see lib/sse.ts backoff): an expired session cookie
@@ -66,8 +67,15 @@ export function AppShell() {
           <button onClick={signOut} style={{ fontSize: 13, padding: '6px 10px' }}>sign out</button>
         </div>
       </header>
+      {/* Hook-order note: InboxProvider outer, TasksProvider inner — both are
+          permanent, session-lifetime providers (mirroring their SSE
+          subscriptions), so nesting order has no remount implications; inner
+          just means TasksProvider's own state/effects run after InboxProvider's
+          on every render. */}
       <InboxProvider>
-        <Outlet />
+        <TasksProvider>
+          <Outlet />
+        </TasksProvider>
       </InboxProvider>
     </div>
   )
