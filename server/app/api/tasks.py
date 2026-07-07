@@ -301,6 +301,15 @@ def delete_task(task_id: str, user: User = Depends(get_current_user),
     task = task_repo.get_owned_task(db, user_id=user.id, task_id=task_id)
     if task is not None:
         task_repo.soft_delete_task(db, task=task)
+        # Bump version before the commit below so the publish carries the
+        # new version — a cross-session TaskDetail open on this task
+        # refetches on the version gap, and that refetch's GET
+        # /api/tasks/{id} 404s (get_owned_task excludes soft-deleted rows),
+        # which the provider treats as eviction. Without this bump, the
+        # publish would carry the task's pre-delete version, the other
+        # session's version-gap check would see no gap, and that TaskDetail
+        # would show a deleted task forever.
+        task_repo.bump_version(db, task=task)
         db.commit()
         _publish_task_updated(db, user_id=user.id, task=task)
         return
@@ -407,6 +416,13 @@ def attach_thread(task_id: str, body: _AttachThreadBody, user: User = Depends(ge
         )
         if example is not None:
             task.criteria = criteria_mod.append_example(task.criteria, example=example, tag="positive")
+    # Bump version unconditionally: attaching a thread changes what this
+    # task tracks even though it touches no entity/event state, and this
+    # route otherwise never bumps (see PATCH's own bump_version comment for
+    # the rationale — every other mutating route must too, or a cross-
+    # session TaskDetail's version-gap SSE refetch never fires and its
+    # threads panel silently misses the new attachment).
+    task_repo.bump_version(db, task=task)
     db.commit()
     # Extract this one pair immediately rather than waiting for the next
     # sync-triggered process_task_updates run (see workers/task_engine_tasks
@@ -471,6 +487,16 @@ def detach_thread(task_id: str, thread_id: str, add_example: bool = Query(defaul
         if entity is not None:
             task_repo.refold_entity(db, task=task, entity=entity)
 
+    # Bump version unconditionally. refold_entity above already bumps when it
+    # actually reverted >=1 applied event, but a detach with nothing to
+    # revert (no applied events on this thread) would otherwise leave
+    # version untouched even though the thread's attachment state changed
+    # and its still-pending events were just auto-rejected above — both
+    # invisible to a cross-session TaskDetail's version-gap SSE refetch
+    # without this. A second bump on top of refold's is harmless (one extra
+    # refetch, not incorrect data) — simpler than branching on whether
+    # refold actually ran.
+    task_repo.bump_version(db, task=task)
     db.commit()
     _publish_task_updated(db, user_id=user.id, task=task)
 

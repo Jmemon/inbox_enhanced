@@ -365,6 +365,29 @@ def test_delete_soft_deletes_and_is_idempotent(authed):
     assert c.delete(f"/api/tasks/{task_id}").status_code == 204
 
 
+def test_delete_bumps_version_before_publish(authed, monkeypatch):
+    """A soft-deleted task's version must bump so another session's open
+    TaskDetail — which refetches its cached detail only on a version gap or
+    a pending-count change — actually refetches, 404s (get_owned_task
+    excludes soft-deleted rows), and evicts. Without this, that other
+    session's TaskDetail would show a deleted task forever."""
+    c, TS = authed
+    captured = _capture_publish(monkeypatch)
+    task_id = _mk_task(TS)
+    db = TS()
+    pre_delete_version = task_repo.get_owned_task(db, user_id="u1", task_id=task_id).version
+    db.close()
+
+    assert c.delete(f"/api/tasks/{task_id}").status_code == 204
+
+    assert len(captured) == 1
+    assert captured[0][2]["version"] > pre_delete_version
+
+    db2 = TS()
+    task = task_repo.get_owned_task_any_status(db2, user_id="u1", task_id=task_id)
+    assert task.version > pre_delete_version
+
+
 def test_delete_other_user_404(authed):
     c, TS = authed
     other_id = _mk_task(TS, uid="u2")
@@ -517,6 +540,26 @@ def test_attach_thread_upserts_link_and_enqueues_extraction(authed, monkeypatch)
     assert len(captured) == 1
 
 
+def test_attach_thread_bumps_version(authed, monkeypatch):
+    """Attaching a thread must bump task.version — otherwise another
+    session's TasksProvider (version-gap-or-pending-count-gated refetch)
+    never learns this task now tracks a new thread, and an open TaskDetail
+    there never sees it in its threads panel."""
+    c, TS = authed
+    captured = _capture_publish(monkeypatch)
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gM")
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"):
+        r = c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+    assert r.status_code == 201
+
+    assert captured[-1][2]["version"] == 2
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    assert task.version == 2
+
+
 def test_attach_other_users_thread_404(authed):
     c, TS = authed
     task_id = _mk_task(TS)
@@ -597,6 +640,32 @@ def test_detach_thread_rejects_that_threads_pending_events_but_not_others(authed
     db2 = TS()
     assert task_repo.get_event(db2, task_id=task_id, event_id=detached_ev_id).status == "rejected"
     assert task_repo.get_event(db2, task_id=task_id, event_id=other_ev_id).status == "pending_review"
+
+
+def test_detach_thread_bumps_version_even_with_no_applied_events(authed, monkeypatch):
+    """A detach with nothing to revert (no applied events on this thread)
+    must still bump version unconditionally — refold_entity's own
+    conditional bump (see test_detach_thread_reverts_applied_events_and_
+    refolds_entity) doesn't fire when there's nothing to refold, but the
+    thread's attachment state still changed and other sessions' providers
+    need the version gap to learn about it."""
+    c, TS = authed
+    captured = _capture_publish(monkeypatch)
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gN")
+    db = TS()
+    task_repo.upsert_link(db, task_id=task_id, thread_id=thread_id, user_id="u1",
+                         origin="llm", state="attached")
+    db.commit()
+    db.close()
+
+    r = c.delete(f"/api/tasks/{task_id}/threads/{thread_id}")
+    assert r.status_code == 204
+
+    assert captured[-1][2]["version"] == 2
+    db2 = TS()
+    task = task_repo.get_owned_task(db2, user_id="u1", task_id=task_id)
+    assert task.version == 2
 
 
 def test_detach_other_users_thread_404(authed):
