@@ -4,9 +4,10 @@ import { useTasksStore } from '../../state/TasksProvider'
 import { useInboxStore } from '../../state/InboxProvider'
 import {
   approveEvent, attachThread, detachThread, getTaskBoard, getTaskEvents, getTaskThreads,
-  rejectEvent, revertEvent, setEntityState,
+  mergeEntity, rejectEvent, revertEvent, setEntityState,
   type InboxThread, type TaskEntity, type TaskEvent,
 } from '../../lib/api'
+import { EntityDrawer } from './EntityDrawer'
 import { PipelineBoard } from './PipelineBoard'
 import { ReviewFeed } from './ReviewFeed'
 import { ThreadsPanel } from './ThreadsPanel'
@@ -29,6 +30,12 @@ export default function TaskDetail() {
   const [entities, setEntities] = useState<TaskEntity[]>([])
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [threads, setThreads] = useState<InboxThread[]>([])
+  // Which entity's drawer (Task 7) is open, if any — owned here (not inside
+  // PipelineBoard) because the board's props are locked to
+  // {schema, entities, onMove, onOpenEntity} and have nowhere to hang drawer
+  // events off of; TaskDetail renders EntityDrawer as PipelineBoard's sibling
+  // instead, fed from state it already owns (entitiesById, events, schema).
+  const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null)
 
   // TasksProvider's cache, keyed by id — this is what the refetch effect
   // below watches for identity changes (see its comment).
@@ -46,6 +53,11 @@ export default function TaskDetail() {
     setEntities([])
     setEvents([])
     setThreads([])
+    // Also drop any selected entity — otherwise navigating straight from one
+    // task's page to another's (route param change, no unmount) could leave
+    // a stale selectedEntityId pointing at an id from the PREVIOUS task,
+    // opening a drawer for an entity that isn't even this task's.
+    setSelectedEntityId(null)
     void loadDetail(taskId).then((d) => { if (d === null) setNotFound(true) })
   }, [taskId, loadDetail])
 
@@ -108,18 +120,44 @@ export default function TaskDetail() {
     [threads],
   )
 
-  const handleMove = useCallback((entityId: string, stage: string) => {
+  // Generalizes the old handleMove's hardcoded 'stage' field: the drawer's
+  // per-attribute inline edits share this same setEntityState-then-refetch
+  // round trip for ANY field. Async and RE-THROWS (unlike this file's other
+  // handlers below, which swallow failures into console.error) because
+  // EntityDrawer awaits this promise itself and renders the rejection's
+  // message inline — the schema validator's 422 detail is meaningful there
+  // (e.g. "'x' is not a valid stage"), unlike a bare console.error.
+  const handleEditEntity = useCallback(async (entityId: string, field: string, value: string) => {
     if (!taskId) return
-    void setEntityState(taskId, entityId, 'stage', stage)
-      .then(() => Promise.all([refetchBoard(), refetchEvents()]))
-      .catch((e) => console.error('[TaskDetail] move failed', e))
+    await setEntityState(taskId, entityId, field, value)
+    await Promise.all([refetchBoard(), refetchEvents()])
   }, [taskId, refetchBoard, refetchEvents])
 
-  const handleOpenEntity = useCallback((entityId: string) => {
-    // Task 7 (PipelineBoard + EntityDrawer) owns opening/rendering the
-    // entity drawer itself — nothing further to wire from TaskDetail today.
-    console.log('[TaskDetail] open entity (drawer lands in Task 7)', entityId)
-  }, [])
+  // PipelineBoard's per-card "move to" select still wants a synchronous,
+  // fire-and-forget callback (its locked onMove prop shape) — just the
+  // 'stage' case of handleEditEntity above, with failures logged instead of
+  // propagated (nothing in the board is positioned to render an inline
+  // error for it, unlike the drawer).
+  const handleMove = useCallback((entityId: string, stage: string) => {
+    void handleEditEntity(entityId, 'stage', stage)
+      .catch((e) => console.error('[TaskDetail] move failed', e))
+  }, [handleEditEntity])
+
+  // window.confirm lives HERE (not inside EntityDrawer) — the drawer just
+  // calls onMerge for whatever target the user picked; TaskDetail owns the
+  // confirmation, the API call, closing the drawer, and the refetch.
+  const handleMergeEntity = useCallback((entityId: string, intoEntityId: string) => {
+    if (!taskId) return
+    const loserName = entitiesById[entityId]?.display_name ?? entityId
+    const winnerName = entitiesById[intoEntityId]?.display_name ?? intoEntityId
+    if (!window.confirm(`Merge "${loserName}" into "${winnerName}"? This cannot be undone.`)) return
+    void mergeEntity(taskId, entityId, intoEntityId)
+      .then(() => {
+        setSelectedEntityId(null)
+        return Promise.all([refetchBoard(), refetchEvents()])
+      })
+      .catch((e) => console.error('[TaskDetail] merge failed', e))
+  }, [taskId, entitiesById, refetchBoard, refetchEvents])
 
   const handleApprove = useCallback((eventId: string) => {
     if (!taskId) return
@@ -185,6 +223,15 @@ export default function TaskDetail() {
     return <main style={{ padding: '32px 24px', color: '#888' }}>loading…</main>
   }
 
+  // Plain consts (not hooks) computed after the early returns above — safe
+  // since they aren't hooks and don't need to run unconditionally. `schema`
+  // narrows detail.state_schema to non-null once for both the board and the
+  // drawer below; `selectedEntity` narrows selectedEntityId → an actual
+  // TaskEntity (or undefined if it no longer exists, e.g. right after a
+  // merge folded it away before the drawer's own onClose ran).
+  const schema = detail.state_schema
+  const selectedEntity = selectedEntityId ? entitiesById[selectedEntityId] : undefined
+
   return (
     <main style={{ padding: '16px 24px', display: 'grid', gap: 24 }}>
       <header style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -201,14 +248,31 @@ export default function TaskDetail() {
         </button>
       </header>
 
-      {/* Main two-column area: board (left, ~2fr) + review feed (right, ~1fr). */}
+      {/* Main two-column area: board (left, ~2fr) + review feed (right, ~1fr).
+          EntityDrawer renders as PipelineBoard's SIBLING here (not nested
+          inside it — the board's locked props have nowhere to hang drawer
+          events off of); it's a fixed-position overlay so its place in this
+          grid doesn't affect layout either way. */}
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 24, alignItems: 'start' }}>
         <PipelineBoard
-          schema={detail.state_schema}
+          schema={schema}
           entities={entities}
           onMove={handleMove}
-          onOpenEntity={handleOpenEntity}
+          onOpenEntity={setSelectedEntityId}
         />
+        {selectedEntity && schema && (
+          <EntityDrawer
+            taskId={taskId}
+            entity={selectedEntity}
+            schema={schema}
+            events={events}
+            onClose={() => setSelectedEntityId(null)}
+            onEdit={(field, value) => handleEditEntity(selectedEntity.id, field, value)}
+            onMerge={(intoId) => handleMergeEntity(selectedEntity.id, intoId)}
+            onRevert={handleRevert}
+            allEntities={entities}
+          />
+        )}
         <ReviewFeed
           events={events}
           entitiesById={entitiesById}
