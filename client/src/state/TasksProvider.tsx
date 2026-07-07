@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
-  createTask as apiCreateTask, deleteTask as apiDeleteTask, getTask, getTasks, patchTask as apiPatchTask,
+  ApiError, createTask as apiCreateTask, deleteTask as apiDeleteTask, getTask, getTasks, patchTask as apiPatchTask,
   type Task, type TaskDetail,
 } from '../lib/api'
 import { subscribeSse } from '../lib/sse'
@@ -77,14 +77,15 @@ export function TasksProvider({ children }: { children: ReactNode }) {
       return detail
     } catch (e) {
       // api.ts's getJSON (which getTask uses) throws `{kind: 'unauthorized'}`
-      // (a plain object, not an Error) for 401s, and a generic
-      // `Error(\`${status} ${statusText}\`)` for every other non-ok response —
-      // there is no structured shape carrying the status code for 404s
-      // specifically. Detecting it is therefore a substring match on the
-      // Error message (e.g. "404 Not Found") rather than a status check.
-      // Anything else (network failure, 401, 5xx) falls through to the log
-      // + rethrow below — only a 404 evicts, per the task_updated DELETE case.
-      const is404 = e instanceof Error && e.message.includes('404')
+      // (a plain object, not an Error) for 401s, and a structured `ApiError`
+      // (status preserved) for every other non-ok response. Detecting a 404
+      // is therefore a status check on ApiError rather than a substring match
+      // on the message — a proxy that happened to echo an upstream status
+      // code into its own statusText could otherwise false-positive a
+      // message-substring check. Anything else (network failure, 401, 5xx)
+      // falls through to the log + rethrow below — only a 404 evicts, per the
+      // task_updated DELETE case.
+      const is404 = e instanceof ApiError && e.status === 404
       if (is404) {
         setDetails(prev => {
           const { [id]: _evicted, ...rest } = prev

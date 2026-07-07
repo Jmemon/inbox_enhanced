@@ -11,7 +11,12 @@ import { NewTaskWizard } from '../task/NewTaskWizard'
 const RECENT_COUNT = 10
 
 function agoLabel(epochSecs: number | null): string {
-  if (epochSecs === null) return 'never'
+  // Number.isNaN guard: `epochSecs` can arrive NaN via lastEventAgo below
+  // when `Date.parse(iso)` fails to parse (a malformed/unexpected
+  // `last_event_at` string) — without this, `s` itself becomes NaN and every
+  // comparison below is false, so `s < 3600` falls through to the final
+  // `${NaN}h ago` branch. Treat unparseable the same as no timestamp at all.
+  if (epochSecs === null || Number.isNaN(epochSecs)) return 'never'
   const s = Math.max(0, Math.floor(Date.now() / 1000) - epochSecs)
   if (s < 60) return `${s}s ago`
   if (s < 3600) return `${Math.floor(s / 60)}m ago`
@@ -114,7 +119,20 @@ export default function HudPage() {
                 return (
                   <div
                     key={task.id}
+                    role="button"
+                    tabIndex={0}
                     onClick={() => navigate(`/tasks/${task.id}`)}
+                    onKeyDown={e => {
+                      // Enter/Space activate the card the same way a click
+                      // does — standard `role="button"` keyboard contract —
+                      // so keyboard/screen-reader users can reach task
+                      // detail without a mouse. Space also scrolls the page
+                      // by default; preventDefault stops that.
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        navigate(`/tasks/${task.id}`)
+                      }
+                    }}
                     style={{ border: '1px solid #eee', borderRadius: 8, padding: 12, cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 6 }}
                   >
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>

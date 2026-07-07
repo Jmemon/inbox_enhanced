@@ -2,6 +2,20 @@ import type { PreviewExample } from './sse'
 
 export type AuthError = 'unauthorized' | 'network'
 
+// Structured HTTP-error type carrying the real status code, so callers can
+// branch on `e.status` (e.g. 404) instead of substring-matching `e.message`
+// against a `${status} ${statusText}` string — a proxy that echoes an
+// upstream status code into its own statusText could otherwise false-positive
+// a plain-Error substring check. Deliberately NOT used for 401s (see getJSON
+// below): useAuth/recheckSession depend on the exact `{kind:'unauthorized'}`
+// shape, not on ApiError/instanceof Error.
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 // Generic JSON fetch with timing and logging so every API call is visible in DevTools.
 export async function getJSON<T>(url: string): Promise<T> {
   const t0 = performance.now()
@@ -10,11 +24,14 @@ export async function getJSON<T>(url: string): Promise<T> {
   const ms = Math.round(performance.now() - t0)
   if (r.status === 401) {
     console.error('[api] GET', url, '→ 401 unauthorized', ms, 'ms')
+    // KEEP this exact shape — useAuth's refresh()/recheckSession() key off
+    // `e.kind === 'unauthorized'`, not instanceof, to distinguish a
+    // definitive 401 from any other failure (network/5xx/timeout).
     throw { kind: 'unauthorized' as const }
   }
   if (!r.ok) {
     console.error('[api] GET', url, '→', r.status, r.statusText, ms, 'ms')
-    throw new Error(`${r.status} ${r.statusText}`)
+    throw new ApiError(`${r.status} ${r.statusText}`, r.status)
   }
   console.log('[api] GET', url, '→', r.status, ms, 'ms')
   return (await r.json()) as T
@@ -304,6 +321,9 @@ export async function getTaskDraft(draftId: string): Promise<TaskDraftPoll> {
 // Helper to extract actionable error detail from API responses (e.g., pydantic 422 validators).
 // If the response JSON contains a string `detail` field, use it; otherwise fall back to the
 // provided fallback message. A LIST detail (e.g., from pydantic array validation) uses the fallback.
+// Throws ApiError (status preserved) rather than a bare Error — its three call
+// sites (createTask, setEntityState, mergeEntity) only ever render `e.message`,
+// and `ApiError instanceof Error` still holds, so this is a transparent upgrade.
 async function throwWithDetail(r: Response, fallback: string): Promise<never> {
   let message = fallback
   try {
@@ -312,7 +332,7 @@ async function throwWithDetail(r: Response, fallback: string): Promise<never> {
   } catch {
     // not JSON — keep the fallback
   }
-  throw new Error(message)
+  throw new ApiError(message, r.status)
 }
 
 export async function createTask(body: {
