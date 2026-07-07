@@ -16,10 +16,11 @@ poll_new_messages owns the history.list call so it can:
 import asyncio
 import json
 import logging
+import zlib
 from sqlalchemy import select
 from app.config import get_settings
 from app.db.session import SessionLocal as _AppSessionLocal
-from app.db.models import User, InboxThread, InboxMessage
+from app.db.models import User, InboxThread, InboxMessage, Task
 from app.realtime import active_users, last_sync, sync_lock
 from app.realtime import redis_client as _redis_client
 from app.gmail.client import get_gmail_client
@@ -82,6 +83,52 @@ def enqueue_polls() -> None:
         # Random 0-10s spread happens at apply_async time. Use a fixed countdown of
         # 0 here for determinism in tests; production beat schedule could randomize.
         poll_new_messages.apply_async(args=[uid], countdown=0)
+
+
+@celery_app.task(name="app.workers.tasks.enqueue_tracker_owner_polls")
+def enqueue_tracker_owner_polls() -> None:
+    """Hourly beat fan-out: poll tracker owners even with no open tab.
+
+    enqueue_polls (30s) only covers active_users — users with a live SSE
+    connection. A tracker keeps advancing only when its owner's inbox gets
+    synced, so an owner who closes their tab would otherwise have their
+    tracker go stale until they next open the app. This picks up the slack:
+    every user with at least one active, non-deleted, schema-bearing tracker
+    gets a poll enqueued, skipping anyone already covered by the 30s path.
+
+    One DISTINCT query, early return when nothing qualifies — cheap on the
+    single-replica beat.  Countdown is `crc32(user_id) % 3600`, a
+    deterministic hash (unlike the process-salted builtin hash()) so a given
+    user always lands at the same offset within the hour instead of every
+    tracker owner's poll firing in the same instant.
+    """
+    db = SessionLocal()
+    try:
+        uids = db.execute(
+            select(Task.user_id)
+            .where(
+                Task.kind == "tracker",
+                Task.status == "active",
+                Task.is_deleted == False,  # noqa: E712
+                Task.user_id.isnot(None),
+                Task.state_schema.isnot(None),
+            )
+            .distinct()
+        ).scalars().all()
+    finally:
+        db.close()
+
+    if not uids:
+        return
+
+    active = set(active_users.list_active())
+    log.info("enqueue_tracker_owner_polls: %d tracker owner(s), %d already active",
+             len(uids), len(active))
+    for uid in uids:
+        if uid in active:
+            continue
+        countdown = zlib.crc32(uid.encode()) % 3600
+        poll_new_messages.apply_async(args=[uid], countdown=countdown)
 
 
 @celery_app.task(name="app.workers.tasks.poll_new_messages")
