@@ -1,13 +1,77 @@
+import { useEffect, useState } from 'react'
 import type { TaskEntity, TaskEvent } from '../../lib/api'
 
-// PLACEHOLDER — Task 8 (plans/2026-07-06-phase2b-task-ui.md) replaces this
-// file's body with the real review tray: human-readable pending_reason copy,
-// evidence blockquotes, a "new entity?" hint via proposed_entity, and the
-// full "recent activity" list. The prop shapes below are the Task 6/8
-// contract — TaskDetail already wires real callbacks (approve/reject/revert
-// → api call + refetch) against them, so keep the shapes stable across the
-// rewrite. This stub renders the pending queue + a trimmed activity list so
-// the wiring is exercised end to end before Task 8 lands.
+// Maps the task engine's five machine-readable pending_reason enum values
+// (server/app/task_engine's correction gate) to user-facing copy.
+// near_duplicate_entity interpolates the LLM's raw proposal; the rest are
+// static. Any other value — including null, e.g. events that never hit a
+// gate — omits the reason line entirely rather than leaking a raw enum
+// string into the UI.
+function pendingReasonCopy(event: TaskEvent): string | null {
+  switch (event.pending_reason) {
+    case 'near_duplicate_entity':
+      return `LLM proposed "${event.proposed_entity ?? '?'}" — close to an existing entity`
+    case 'backward_move':
+      return 'moves the pipeline backward — confirm it'
+    case 'terminal_locked':
+      return 'entity is in a terminal stage — only you can move it'
+    case 'fence_blocked':
+      return 'an older email tried to change something you corrected'
+    case 'low_confidence':
+      return 'low confidence — needs your call'
+    default:
+      return null
+  }
+}
+
+// Entity name for a card/row: prefer the resolved entity (its current
+// display_name, post any merge/rename), fall back to the LLM's raw
+// proposed_entity string for events proposing a brand-new entity that
+// doesn't exist yet (still pending review), and finally an explicit
+// "unknown" — events are user-facing, so this shouldn't silently render
+// blank even in a state the schema doesn't expect.
+function EntityLabel({ event, entitiesById }: { event: TaskEvent; entitiesById: Record<string, TaskEntity> }) {
+  const known = event.entity_id ? entitiesById[event.entity_id] : undefined
+  if (known) return <span>{known.display_name}</span>
+  if (event.proposed_entity) {
+    return (
+      <span>
+        {event.proposed_entity}
+        <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 400, color: '#a06a00' }}>new entity?</span>
+      </span>
+    )
+  }
+  return <span style={{ color: '#999' }}>unknown</span>
+}
+
+function originLabel(origin: TaskEvent['origin']): string {
+  return origin === 'llm' ? 'LLM' : 'you'
+}
+
+function OriginBadge({ origin }: { origin: TaskEvent['origin'] }) {
+  return (
+    <span style={{
+      display: 'inline-block', marginRight: 6, padding: '1px 6px', borderRadius: 999,
+      fontSize: 10, fontWeight: 500,
+      background: origin === 'llm' ? '#eef2f7' : '#e7f1ea',
+      color: origin === 'llm' ? '#4b5563' : '#2f6b46',
+    }}>
+      {originLabel(origin)}
+    </span>
+  )
+}
+
+function EvidenceQuote({ quote }: { quote: string }) {
+  return (
+    <blockquote style={{
+      margin: '4px 0 0', padding: '4px 8px', borderLeft: '3px solid #ddd',
+      color: '#555', fontSize: 12, fontStyle: 'italic',
+    }}>
+      {quote}
+    </blockquote>
+  )
+}
+
 export function ReviewFeed({ events, entitiesById, onApprove, onReject, onRevert }: {
   events: TaskEvent[]
   entitiesById: Record<string, TaskEntity>
@@ -16,45 +80,101 @@ export function ReviewFeed({ events, entitiesById, onApprove, onReject, onRevert
   onRevert: (eventId: string) => void
 }) {
   const pending = events.filter((e) => e.status === 'pending_review')
+  // list_task_events already returns newest-first (task_engine/repo.py's
+  // list_events orders by created_at desc) — filtering preserves that order,
+  // so slicing 30 here is "newest 30 non-pending" without a re-sort.
   const recent = events.filter((e) => e.status !== 'pending_review').slice(0, 30)
 
-  const entityLabel = (e: TaskEvent) =>
-    (e.entity_id && entitiesById[e.entity_id]?.display_name) || e.proposed_entity || '(unknown entity)'
+  // Per-event "action in flight" state, keyed by event id. onApprove/onReject
+  // are locked to a synchronous void signature (TaskDetail fires the API
+  // call + refetch fire-and-forget — see its handleApprove/handleReject) so
+  // there's no promise to await here. Instead, a clicked id stays busy until
+  // the NEXT `events` snapshot arrives that no longer carries it as
+  // pending_review — i.e. the refetch that follows a successful approve or
+  // reject. A request that fails outright never refetches (TaskDetail just
+  // console.errors it), so its button would stay stuck disabled; there's no
+  // signal in this read-only prop contract to recover from that here.
+  const [busy, setBusy] = useState<Set<string>>(new Set())
+
+  useEffect(() => {
+    const stillPending = new Set(pending.map((e) => e.id))
+    setBusy((prev) => {
+      let changed = false
+      const next = new Set<string>()
+      for (const id of prev) {
+        if (stillPending.has(id)) next.add(id)
+        else changed = true
+      }
+      return changed ? next : prev
+    })
+    // Keyed on `events` identity (a fresh array only on an actual refetch),
+    // not `pending` (a fresh array every render) — see comment above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events])
+
+  const markBusy = (id: string) => setBusy((prev) => new Set(prev).add(id))
 
   return (
-    <div style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, display: 'grid', gap: 16 }}>
+    <div style={{ border: '1px solid #eee', borderRadius: 8, padding: 16, display: 'grid', gap: 16, alignContent: 'start' }}>
       <div>
         <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>Needs review ({pending.length})</div>
         {pending.length === 0 && <div style={{ color: '#888', fontSize: 13 }}>nothing pending</div>}
         <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 8 }}>
-          {pending.map((e) => (
-            <li key={e.id} style={{ border: '1px solid #eee', borderRadius: 6, padding: 8, fontSize: 13 }}>
-              <div style={{ fontWeight: 600 }}>{entityLabel(e)}</div>
-              <div style={{ color: '#666' }}>{e.field ?? '—'}: {e.old_value ?? '—'} → {e.new_value ?? '—'}</div>
-              {e.pending_reason && <div style={{ color: '#a06a00', fontSize: 11, marginTop: 2 }}>{e.pending_reason}</div>}
-              <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
-                <button onClick={() => onApprove(e.id)} style={{ fontSize: 12 }}>approve</button>
-                <button onClick={() => onReject(e.id)} style={{ fontSize: 12 }}>reject</button>
-              </div>
-            </li>
-          ))}
+          {pending.map((e) => {
+            const isBusy = busy.has(e.id)
+            const reason = pendingReasonCopy(e)
+            return (
+              <li key={e.id} style={{ border: '1px solid #eee', borderRadius: 6, padding: 8, fontSize: 13 }}>
+                <div style={{ fontWeight: 600 }}>
+                  <EntityLabel event={e} entitiesById={entitiesById} />
+                </div>
+                <div style={{ color: '#666' }}>
+                  {e.field ?? '—'}: {e.old_value ?? '—'} → {e.new_value ?? '—'}
+                </div>
+                {e.evidence_quote && <EvidenceQuote quote={e.evidence_quote} />}
+                {e.confidence !== null && (
+                  <div style={{ color: '#888', fontSize: 11, marginTop: 4 }}>
+                    confidence: {Math.round(e.confidence * 100)}%
+                  </div>
+                )}
+                {reason && <div style={{ color: '#a06a00', fontSize: 11, marginTop: 2 }}>{reason}</div>}
+                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                  <button
+                    disabled={isBusy}
+                    onClick={() => { markBusy(e.id); onApprove(e.id) }}
+                    style={{ fontSize: 12 }}
+                  >
+                    approve
+                  </button>
+                  <button
+                    disabled={isBusy}
+                    onClick={() => { markBusy(e.id); onReject(e.id) }}
+                    style={{ fontSize: 12 }}
+                  >
+                    reject
+                  </button>
+                </div>
+              </li>
+            )
+          })}
         </ul>
       </div>
       <div>
         <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>Recent activity</div>
         {recent.length === 0 && <div style={{ color: '#888', fontSize: 13 }}>no activity yet</div>}
-        <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 6 }}>
+        <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 8 }}>
           {recent.map((e) => (
-            <li key={e.id} style={{
-              fontSize: 12, color: '#444', display: 'flex', alignItems: 'center',
-              justifyContent: 'space-between', gap: 8,
-            }}>
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {entityLabel(e)} — {e.field ?? '—'}: {e.old_value ?? '—'} → {e.new_value ?? '—'} ({e.origin}, {e.status})
-              </span>
-              {e.status === 'applied' && (
-                <button onClick={() => onRevert(e.id)} style={{ fontSize: 11 }}>revert</button>
-              )}
+            <li key={e.id} style={{ fontSize: 12, color: '#444', display: 'grid', gap: 2 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <OriginBadge origin={e.origin} />
+                  <EntityLabel event={e} entitiesById={entitiesById} /> — {e.field ?? '—'}: {e.old_value ?? '—'} → {e.new_value ?? '—'} ({e.status})
+                </span>
+                {e.status === 'applied' && (
+                  <button onClick={() => onRevert(e.id)} style={{ fontSize: 11, flexShrink: 0 }}>revert</button>
+                )}
+              </div>
+              {e.evidence_quote && <EvidenceQuote quote={e.evidence_quote} />}
             </li>
           ))}
         </ul>
