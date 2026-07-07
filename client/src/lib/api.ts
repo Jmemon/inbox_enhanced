@@ -255,7 +255,13 @@ export function getSyncStatus(): Promise<SyncStatus> {
 // Mirrors server/app/api/tasks.py's `_serialize_*` helpers field-for-field —
 // see that module's docstring for the extraction pipeline these feed.
 
-export type TaskSummary = { entities: number; pending_reviews: number; last_event_at: string | null }
+export type TaskSummary = {
+  entities: number; pending_reviews: number; last_event_at: string | null
+  // Histogram of entities.state["stage"] — key order is server-controlled
+  // (schema stage order, then observed extras, then "(no stage)" last).
+  // Consumers must preserve insertion order (plain Object.entries), not sort.
+  stage_counts: Record<string, number>
+}
 export type Task = { id: string; name: string; goal: string; kind: string; status: 'active' | 'paused'; version: number; summary: TaskSummary }
 export type TaskStateSchema = {
   version: number
@@ -275,6 +281,14 @@ export type TaskEvent = {
   pending_reason: string | null; proposed_entity: string | null
   thread_id: string | null; message_id: string | null; gmail_message_id: string | null
   entity_id: string | null; created_at: string
+}
+// Cross-task feed item: a TaskEvent plus the fields /api/reviews and
+// /api/activity add so the HUD can route back to the owning task without a
+// second fetch (see server/app/api/tasks.py's _serialize_feed_event).
+export type FeedItem = TaskEvent & {
+  task_id: string
+  task_name: string
+  entity_display_name: string | null
 }
 export type TaskDraftProposal = { name: string; description: string; state_schema: TaskStateSchema; keyword_probes: string[] }
 export type TaskDraftPoll =
@@ -391,6 +405,20 @@ export function getTaskEvents(id: string, opts: {
   if (opts.limit) params.set('limit', String(opts.limit))
   const qs = params.toString()
   return getJSON<{ events: TaskEvent[] }>(`/api/tasks/${encodeURIComponent(id)}/events${qs ? `?${qs}` : ''}`)
+}
+
+// Unified review tray: every still-pending_review event across all of this
+// user's tasks, newest first. limit is clamped server-side to [1, 200].
+export function getReviews(limit?: number): Promise<FeedItem[]> {
+  const qs = limit ? `?limit=${limit}` : ''
+  return getJSON<{ reviews: FeedItem[] }>(`/api/reviews${qs}`).then(r => r.reviews)
+}
+
+// Activity ticker: every non-pending_review event across all of this user's
+// tasks, newest first. limit is clamped server-side to [1, 100].
+export function getActivity(limit?: number): Promise<FeedItem[]> {
+  const qs = limit ? `?limit=${limit}` : ''
+  return getJSON<{ activity: FeedItem[] }>(`/api/activity${qs}`).then(r => r.activity)
 }
 
 export function getTaskThreads(id: string): Promise<{ threads: InboxThread[] }> {

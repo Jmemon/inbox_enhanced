@@ -31,6 +31,24 @@ function lastEventAgo(iso: string | null): string {
   return agoLabel(iso === null ? null : Math.floor(Date.parse(iso) / 1000))
 }
 
+const STAGE_HISTOGRAM_MAX = 4
+
+// Compact "applied 4 · screen 2 · onsite 1" line from a task's stage_counts.
+// Preserves server-controlled insertion order (plain Object.entries — do not
+// sort), truncates to the first STAGE_HISTOGRAM_MAX stages, and folds the
+// rest into a trailing "+n more". stage_counts is typed required on
+// TaskSummary but is guarded here anyway against older cached payloads or an
+// SSE-race snapshot that predates the server sending it.
+function stageHistogramLabel(stageCounts: Record<string, number> | undefined): string | null {
+  const entries = Object.entries(stageCounts ?? {})
+  if (entries.length === 0) return null
+  const shown = entries.slice(0, STAGE_HISTOGRAM_MAX)
+  const parts = shown.map(([stage, count]) => `${stage} ${count}`)
+  const extra = entries.length - shown.length
+  if (extra > 0) parts.push(`+${extra} more`)
+  return parts.join(' · ')
+}
+
 // Mirrors TaskDetail.tsx's statusChipStyle (kept local rather than shared —
 // this task's scope is HudPage.tsx only) — paused renders visibly dimmed
 // relative to active, per the plan.
@@ -116,6 +134,7 @@ export default function HudPage() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 12 }}>
               {tasks.map(task => {
                 const taskBackfill = backfill[task.id]
+                const stageHistogram = stageHistogramLabel(task.summary.stage_counts)
                 return (
                   <div
                     key={task.id}
@@ -140,6 +159,7 @@ export default function HudPage() {
                       <span style={statusChipStyle(task.status)}>{task.status}</span>
                     </div>
                     <div style={{ fontSize: 12, color: '#888' }}>{task.summary.entities} entities</div>
+                    {stageHistogram && <div style={{ fontSize: 11, color: '#aaa' }}>{stageHistogram}</div>}
                     {task.summary.pending_reviews > 0 && (
                       <span style={{
                         display: 'inline-block', alignSelf: 'flex-start', padding: '2px 8px', borderRadius: 999,
