@@ -27,12 +27,16 @@ type TasksStore = {
 
 const TasksStoreContext = createContext<TasksStore | null>(null)
 
-// TaskDetail = Task & { state_schema }. task_updated's "refetch detail+list
-// item" contract (see loadDetail below) is satisfied from a single GET
-// /api/tasks/{id} response by dropping state_schema back off — no second
-// fetch needed to keep the `tasks` list item current.
+// TaskDetail = Task & { state_schema, criteria }. task_updated's "refetch
+// detail+list item" contract (see loadDetail below) is satisfied from a
+// single GET /api/tasks/{id} response by dropping state_schema and criteria
+// back off — no second fetch needed to keep the `tasks` list item current.
+// criteria is dropped here for the same reason the server's own
+// _serialize_task_list_item omits it: it's detail-only (spec §4.6 learning
+// loop growth, minor #4 final-review wave), and a derived list item should
+// match what a fresh GET /api/tasks would actually return for it.
 function taskFromDetail(detail: TaskDetail): Task {
-  const { state_schema: _state_schema, ...task } = detail
+  const { state_schema: _state_schema, criteria: _criteria, ...task } = detail
   return task
 }
 

@@ -245,7 +245,11 @@ export type TaskStateSchema = {
   entity: { noun: string; identity_hint: string; attributes: { key: string; type: string; values?: string[] | null }[] } | null
   pipeline: { stages: string[]; terminal: string[] }
 }
-export type TaskDetail = Task & { state_schema: TaskStateSchema | null }
+// criteria is detail-only (mirrors server's _serialize_task_detail, which
+// omits it from the list-item serializer) — the spec §4.6 learning loop
+// grows this text with every attach/detach example, and exposing it here
+// is what makes that growth auditable from a task's own detail page.
+export type TaskDetail = Task & { state_schema: TaskStateSchema | null; criteria: string }
 export type TaskEntity = { id: string; entity_key: string; display_name: string; state: Record<string, string | null>; updated_at: string }
 export type TaskEvent = {
   id: string; field: string | null; old_value: string | null; new_value: string | null

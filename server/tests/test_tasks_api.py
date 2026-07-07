@@ -252,6 +252,24 @@ def test_list_and_detail_summaries(authed):
     assert detail.json()["summary"]["entities"] == 1
 
 
+def test_detail_exposes_criteria_but_list_does_not(authed):
+    """Minor #4 (final-review wave): criteria growth (spec §4.6 learning
+    loop — attach/detach appending examples) must be auditable from the
+    detail view, but the list view stays lean (criteria text can grow to
+    EXAMPLE_CAP=30 examples and has no place in a summary row)."""
+    c, TS = authed
+    task_id = _mk_task_with_criteria(TS, criteria="Base criteria.\n\nExample cases:\n<positive>...</positive>")
+
+    detail = c.get(f"/api/tasks/{task_id}")
+    assert detail.status_code == 200
+    assert detail.json()["criteria"] == "Base criteria.\n\nExample cases:\n<positive>...</positive>"
+
+    listing = c.get("/api/tasks")
+    assert listing.status_code == 200
+    item = next(t for t in listing.json()["tasks"] if t["id"] == task_id)
+    assert "criteria" not in item
+
+
 def test_get_task_404_other_user_or_missing(authed):
     c, TS = authed
     other_id = _mk_task(TS, uid="u2")

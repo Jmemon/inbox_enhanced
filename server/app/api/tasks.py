@@ -74,6 +74,13 @@ def _serialize_task_detail(db: Session, task) -> dict:
     return {
         **_serialize_task(task),
         "state_schema": task.state_schema,
+        # criteria is intentionally detail-only, not on _serialize_task (the
+        # list-item base) — the spec §4.6 learning loop grows this text with
+        # every attach/detach example (up to EXAMPLE_CAP=30 blocks), and
+        # surfacing it here is what makes that growth auditable from a
+        # single task's page (minor #4, final-review wave) without bloating
+        # every row of the task list with criteria text nobody reads there.
+        "criteria": task.criteria,
         "summary": _serialize_summary(db, task_id=task.id),
     }
 
