@@ -121,6 +121,10 @@ def enqueue_tracker_owner_polls() -> None:
     if not uids:
         return
 
+    # Purge expired entries before reading active_users; stale entries from
+    # unclean SSE disconnects would otherwise mask offline tracker owners from
+    # the hourly poll path indefinitely.
+    active_users.purge_expired()
     active = set(active_users.list_active())
     log.info("enqueue_tracker_owner_polls: %d tracker owner(s), %d already active",
              len(uids), len(active))

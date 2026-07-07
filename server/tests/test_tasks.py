@@ -438,6 +438,40 @@ def test_enqueue_tracker_owner_polls_excludes_paused_deleted_and_schemaless(
     assert enqueued == []
 
 
+def test_enqueue_tracker_owner_polls_purges_expired_entries_before_reading_active(
+    fake_redis, session_factory, monkeypatch,
+):
+    """A tracker owner with an EXPIRED active_users entry (from an unclean SSE
+    disconnect) must still get enqueued by the hourly path. Without purge_expired
+    being called, the stale entry would remain in the registry and mask this
+    offline owner from the hourly poll indefinitely."""
+    import time
+    monkeypatch.setattr("app.workers.tasks.SessionLocal", session_factory)
+    db = session_factory()
+    db.add(User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc)))
+    db.commit()
+    task_repo.create_task(db, user_id="u1", name="Tracker", goal="", criteria="",
+                          state_schema={"stage": None})
+    db.commit()
+    db.close()
+
+    # Simulate a stale SSE entry: zadd with a score in the past (expired).
+    fake_redis.zadd("active_users", {"u1": time.time() - 1000})
+
+    enqueued: list[tuple] = []
+    monkeypatch.setattr(
+        "app.workers.tasks.poll_new_messages.apply_async",
+        lambda args, countdown=0: enqueued.append((tuple(args), countdown)),
+    )
+
+    tasks.enqueue_tracker_owner_polls.apply()
+
+    # The expired entry should have been purged, so u1 is NOT in the "active" set
+    # and should be enqueued by the hourly path.
+    expected_countdown = zlib.crc32("u1".encode()) % 3600
+    assert enqueued == [(("u1",), expected_countdown)]
+
+
 def test_enqueue_tracker_owner_polls_no_trackers_no_enqueue(
     fake_redis, session_factory, monkeypatch,
 ):
