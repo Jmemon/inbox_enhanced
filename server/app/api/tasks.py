@@ -46,13 +46,58 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _serialize_summary(db: Session, *, task_id: str) -> dict:
-    entities = task_repo.list_entities(db, task_id=task_id)
-    latest = task_repo.list_events(db, task_id=task_id, limit=1)
+_NO_STAGE_KEY = "(no stage)"
+
+
+def _stage_counts(entities: list, *, state_schema: dict | None) -> dict:
+    """Histogram of entities.state["stage"] over an already-fetched entity
+    list (zero extra queries) -- key order is schema stage order (when a
+    valid schema is present) with observed extras appended, then a trailing
+    "(no stage)" bucket for None-staged entities. A schema-less task (or one
+    whose state_schema fails validate_schema -- e.g. hand-edited or written
+    by a buggy migration, see workers/task_engine_tasks.process_task_updates's
+    own per-task isolation for this same failure mode) falls back to observed
+    order only. Stages with zero entities are omitted entirely, so an empty
+    task returns {}."""
+    schema_stages: list[str] = []
+    if state_schema is not None:
+        try:
+            schema_stages = schema_mod.validate_schema(state_schema).all_stages()
+        except ValueError:
+            schema_stages = []
+
+    counts: dict[str, int] = {}
+    observed_order: list[str] = []
+    no_stage_count = 0
+    for entity in entities:
+        stage = entity.state.get("stage")
+        if stage is None:
+            no_stage_count += 1
+            continue
+        if stage not in counts:
+            observed_order.append(stage)
+        counts[stage] = counts.get(stage, 0) + 1
+
+    stage_counts: dict[str, int] = {}
+    for stage in schema_stages:
+        if stage in counts:
+            stage_counts[stage] = counts[stage]
+    for stage in observed_order:
+        if stage not in stage_counts:
+            stage_counts[stage] = counts[stage]
+    if no_stage_count:
+        stage_counts[_NO_STAGE_KEY] = no_stage_count
+    return stage_counts
+
+
+def _serialize_summary(db: Session, *, task) -> dict:
+    entities = task_repo.list_entities(db, task_id=task.id)
+    latest = task_repo.list_events(db, task_id=task.id, limit=1)
     return {
         "entities": len(entities),
-        "pending_reviews": task_repo.pending_count(db, task_id=task_id),
+        "pending_reviews": task_repo.pending_count(db, task_id=task.id),
         "last_event_at": latest[0].created_at if latest else None,
+        "stage_counts": _stage_counts(entities, state_schema=task.state_schema),
     }
 
 
@@ -68,7 +113,7 @@ def _serialize_task(task) -> dict:
 
 
 def _serialize_task_list_item(db: Session, task) -> dict:
-    return {**_serialize_task(task), "summary": _serialize_summary(db, task_id=task.id)}
+    return {**_serialize_task(task), "summary": _serialize_summary(db, task=task)}
 
 
 def _serialize_task_detail(db: Session, task) -> dict:
@@ -82,7 +127,7 @@ def _serialize_task_detail(db: Session, task) -> dict:
         # single task's page (minor #4, final-review wave) without bloating
         # every row of the task list with criteria text nobody reads there.
         "criteria": task.criteria,
-        "summary": _serialize_summary(db, task_id=task.id),
+        "summary": _serialize_summary(db, task=task),
     }
 
 
