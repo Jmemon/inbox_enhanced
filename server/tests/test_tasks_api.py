@@ -207,7 +207,9 @@ def test_create_task_success_enqueues_backfill_and_publishes(authed, monkeypatch
     assert body["kind"] == "tracker"
     assert body["status"] == "active"
     assert body["version"] == 1
-    assert body["summary"] == {"entities": 0, "pending_reviews": 0, "last_event_at": None}
+    assert body["summary"] == {
+        "entities": 0, "pending_reviews": 0, "last_event_at": None, "stage_counts": {},
+    }
 
     mock_apply.assert_called_once_with(
         args=["u1", body["id"], ["interview", "offer"]], countdown=0,
@@ -275,6 +277,140 @@ def test_get_task_404_other_user_or_missing(authed):
     other_id = _mk_task(TS, uid="u2")
     assert c.get(f"/api/tasks/{other_id}").status_code == 404
     assert c.get("/api/tasks/does-not-exist").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# stage_counts (Phase 3 Task 2): a histogram folded into the summary at zero
+# extra queries -- computed from the same list_entities() result _serialize_
+# summary already fetches.
+# ---------------------------------------------------------------------------
+
+
+MULTI_STAGE_SCHEMA = {
+    "version": 1,
+    "entity": {"noun": "company"},
+    "pipeline": {"stages": ["applied", "interview"], "terminal": ["offer", "rejected"]},
+}
+
+
+def _mk_schemaless_task(TS, *, uid="u1", name="Schemaless", kind="tracker") -> str:
+    """Unlike _mk_task, a None state_schema here is NOT replaced with the
+    SINGLETON_SCHEMA default -- this seeds a genuinely schema-less task
+    (Phase 4's bucket-kind, or a tracker whose schema proposal never
+    completed)."""
+    db = TS()
+    task = task_repo.create_task(
+        db, user_id=uid, name=name, goal="goal text", criteria="criteria text",
+        state_schema=None, kind=kind,
+    )
+    db.commit()
+    task_id = task.id
+    db.close()
+    return task_id
+
+
+def _seed_entity_with_stage(TS, task_id, *, entity_key, stage, uid="u1"):
+    """Create one entity and, if `stage` is not None, fold a single applied
+    'stage' event into it so entity.state["stage"] == stage. stage=None
+    leaves the entity freshly-minted with empty state (no "stage" key)."""
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id=uid, task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id=uid, entity_key=entity_key, display_name=entity_key,
+    )
+    db.commit()
+    if stage is not None:
+        event = task_repo.append_event(db, task=task, entity=entity, origin="llm",
+                                       status="applied", field="stage", new_value=stage)
+        task_repo.apply_event(db, task=task, entity=entity, event=event)
+        db.commit()
+    entity_id = entity.id
+    db.close()
+    return entity_id
+
+
+def test_stage_counts_empty_task_is_empty_dict(authed):
+    c, TS = authed
+    task_id = _mk_task(TS, state_schema=MULTI_STAGE_SCHEMA)
+    r = c.get(f"/api/tasks/{task_id}")
+    assert r.json()["summary"]["stage_counts"] == {}
+
+
+def test_stage_counts_matches_seeded_entities_and_follows_schema_order(authed):
+    c, TS = authed
+    task_id = _mk_task(TS, state_schema=MULTI_STAGE_SCHEMA)
+    # Seeded out of schema order (offer before applied/interview) -- the
+    # returned key order must follow the SCHEMA's stage order, not insertion
+    # order.
+    _seed_entity_with_stage(TS, task_id, entity_key="d", stage="offer")
+    _seed_entity_with_stage(TS, task_id, entity_key="a", stage="interview")
+    _seed_entity_with_stage(TS, task_id, entity_key="b", stage="applied")
+    _seed_entity_with_stage(TS, task_id, entity_key="c", stage="interview")
+
+    r = c.get(f"/api/tasks/{task_id}")
+    stage_counts = r.json()["summary"]["stage_counts"]
+    assert stage_counts == {"applied": 1, "interview": 2, "offer": 1}
+    assert list(stage_counts.keys()) == ["applied", "interview", "offer"]
+    # "rejected" is a valid terminal schema stage but has zero entities --
+    # it must not appear as a zero-count key.
+    assert "rejected" not in stage_counts
+
+    listing = c.get("/api/tasks")
+    item = next(t for t in listing.json()["tasks"] if t["id"] == task_id)
+    assert item["summary"]["stage_counts"] == stage_counts
+
+
+def test_stage_counts_no_stage_bucket(authed):
+    c, TS = authed
+    task_id = _mk_task(TS, state_schema=MULTI_STAGE_SCHEMA)
+    _seed_entity_with_stage(TS, task_id, entity_key="a", stage="applied")
+    _seed_entity_with_stage(TS, task_id, entity_key="b", stage=None)
+    _seed_entity_with_stage(TS, task_id, entity_key="c", stage=None)
+
+    r = c.get(f"/api/tasks/{task_id}")
+    stage_counts = r.json()["summary"]["stage_counts"]
+    assert stage_counts == {"applied": 1, "(no stage)": 2}
+    assert list(stage_counts.keys()) == ["applied", "(no stage)"]
+
+
+def test_stage_counts_schemaless_task_uses_observed_order(authed):
+    c, TS = authed
+    task_id = _mk_schemaless_task(TS)
+    # "a" is seeded (and folded) first so it's the OLDER entity;
+    # list_entities returns most-recently-updated first, so "b" (newer)
+    # surfaces before "a" despite "alpha" < "zeta" alphabetically -- this
+    # pins observed order to list_entities' own order, not any sort.
+    _seed_entity_with_stage(TS, task_id, entity_key="a", stage="alpha")
+    _seed_entity_with_stage(TS, task_id, entity_key="b", stage="zeta")
+
+    r = c.get(f"/api/tasks/{task_id}")
+    stage_counts = r.json()["summary"]["stage_counts"]
+    assert stage_counts == {"zeta": 1, "alpha": 1}
+    assert list(stage_counts.keys()) == ["zeta", "alpha"]
+
+
+def test_stage_counts_corrupt_schema_falls_back_to_observed_order_not_500(authed):
+    """A hand-corrupted (or buggy-migration-written) state_schema must not
+    500 the task list/detail -- schema.validate_schema raises ValueError on
+    it (see workers/task_engine_tasks.process_task_updates's own per-task
+    isolation for this exact failure mode), and the summary degrades to
+    observed order instead."""
+    c, TS = authed
+    task_id = _mk_task(TS, state_schema=MULTI_STAGE_SCHEMA)
+    _seed_entity_with_stage(TS, task_id, entity_key="a", stage="applied")
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    task.state_schema = {"version": 1, "pipeline": {"stages": []}}  # invalid: no stages
+    db.commit()
+    db.close()
+
+    r = c.get(f"/api/tasks/{task_id}")
+    assert r.status_code == 200
+    assert r.json()["summary"]["stage_counts"] == {"applied": 1}
+
+    listing = c.get("/api/tasks")
+    assert listing.status_code == 200
 
 
 # ---------------------------------------------------------------------------
