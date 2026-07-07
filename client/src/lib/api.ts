@@ -297,6 +297,20 @@ export async function getTaskDraft(draftId: string): Promise<TaskDraftPoll> {
   throw new Error(`task draft poll: ${r.status}`)
 }
 
+// Helper to extract actionable error detail from API responses (e.g., pydantic 422 validators).
+// If the response JSON contains a string `detail` field, use it; otherwise fall back to the
+// provided fallback message. A LIST detail (e.g., from pydantic array validation) uses the fallback.
+async function throwWithDetail(r: Response, fallback: string): Promise<never> {
+  let message = fallback
+  try {
+    const errBody = await r.json()
+    if (typeof errBody?.detail === 'string') message = errBody.detail
+  } catch {
+    // not JSON — keep the fallback
+  }
+  throw new Error(message)
+}
+
 export async function createTask(body: {
   name: string; goal: string; description: string; state_schema: TaskStateSchema;
   keyword_probes: string[]; confirmed_positives: BucketExampleIn[]; confirmed_negatives: BucketExampleIn[];
@@ -308,19 +322,7 @@ export async function createTask(body: {
     headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   })
   if (!r.ok) {
-    // The EPS schema validator (task_engine/schema.py) surfaces a single
-    // actionable string in `detail` on 422 — surface that instead of the bare
-    // status code so the wizard's inline banner is useful. Guard the parse: a
-    // non-JSON error body (e.g. a proxy error page) falls back to the generic
-    // message rather than throwing from inside the catch.
-    let message = `create task: ${r.status}`
-    try {
-      const errBody = await r.json()
-      if (errBody?.detail) message = errBody.detail
-    } catch {
-      // not JSON — keep the generic message
-    }
-    throw new Error(message)
+    await throwWithDetail(r, `create task: ${r.status}`)
   }
   return r.json()
 }
@@ -421,7 +423,9 @@ export async function setEntityState(id: string, entityId: string, field: string
     method: 'POST', credentials: 'same-origin',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify({ field, value }),
   })
-  if (!r.ok) throw new Error(`set entity state: ${r.status}`)
+  if (!r.ok) {
+    await throwWithDetail(r, `set entity state: ${r.status}`)
+  }
 }
 
 export async function mergeEntity(id: string, entityId: string, intoEntityId: string): Promise<void> {
@@ -429,5 +433,7 @@ export async function mergeEntity(id: string, entityId: string, intoEntityId: st
     method: 'POST', credentials: 'same-origin',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify({ into_entity_id: intoEntityId }),
   })
-  if (r.status !== 204) throw new Error(`merge entity: ${r.status}`)
+  if (r.status !== 204) {
+    await throwWithDetail(r, `merge entity: ${r.status}`)
+  }
 }
