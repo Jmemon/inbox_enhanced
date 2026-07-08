@@ -25,7 +25,7 @@ from app.realtime import active_users, last_sync, sync_lock
 from app.realtime import redis_client as _redis_client
 from app.gmail.client import get_gmail_client
 from app.gmail.parser import thread_to_string
-from app.inbox import inbox_repo, preview_cache
+from app.inbox import inbox_repo
 from app.llm import client as llm_client
 from app.llm.prompts import score_thread
 from app.workers import gmail_sync, task_engine_tasks
@@ -35,14 +35,12 @@ from app.workers.celery_app import celery_app
 SessionLocal = _AppSessionLocal
 log = logging.getLogger(__name__)
 
-# --- draft preview constants ---
-# Maximum number of inbox threads to consider when scoring candidates.
-CANDIDATE_LIMIT = 100
-# If the candidate pool is below this, extend history inline before scoring.
-EXTEND_THRESHOLD = 100
-# How many scored results to surface in each category.
-TOP_POSITIVES = 3
-TOP_NEAR_MISSES = 3
+# --- bucket-draft-preview scoring constants ---
+# draft_preview_bucket itself was deleted in Phase 4 Task 3 (superseded by
+# the task engine's goal->draft flow), but _read_candidates/_score_all below
+# are still late-imported by workers/task_engine_tasks.py's propose_task_draft
+# (the SAME 0-10 scoring rubric, reused for a tracker's proposed name/
+# description instead of a bucket's) -- these thresholds stay put.
 # Score thresholds that define positive vs. near-miss.
 POSITIVE_THRESHOLD = 7
 NEAR_MISS_LOW = 4
@@ -243,52 +241,6 @@ def full_sync_inbox_task(user_id: str) -> None:
         sync_lock.release(user_id)
 
 
-@celery_app.task(name="app.workers.tasks.draft_preview_bucket")
-def draft_preview_bucket(user_id: str, draft_id: str, name: str, description: str,
-                         exclude_thread_ids: list[str] | None = None) -> None:
-    """Score inbox threads against a prospective bucket and publish a preview.
-
-    Reads up to CANDIDATE_LIMIT inbox threads, inline-extends history if the
-    pool is too small, rebuilds full bodies from Postgres (0006+ persisted
-    body_text; no Gmail refetch), scores each thread 0-10 via the LLM in
-    parallel, then publishes a bucket_draft_preview event containing top-3
-    positives (>=7) and top-3 near-misses (4-6).
-    """
-    log.info("draft_preview_bucket: user=%s draft=%s", user_id, draft_id)
-    exclude = set(exclude_thread_ids or [])
-    db = SessionLocal()
-    try:
-        user = db.get(User, user_id)
-        if user is None:
-            return
-
-        candidates = _read_candidates(db, user_id=user_id, exclude=exclude, limit=CANDIDATE_LIMIT)
-        if len(candidates) < EXTEND_THRESHOLD:
-            log.info("draft_preview: pool=%d < %d, extending inline", len(candidates), EXTEND_THRESHOLD)
-            _extend_inline(db, user=user)
-            candidates = _read_candidates(db, user_id=user_id, exclude=exclude, limit=CANDIDATE_LIMIT)
-
-        scored = _score_all(db, user_id=user_id, candidates=candidates,
-                            name=name, description=description)
-
-        positives = sorted([s for s in scored if s["score"] >= POSITIVE_THRESHOLD],
-                           key=lambda s: -s["score"])[:TOP_POSITIVES]
-        near = sorted([s for s in scored if NEAR_MISS_LOW <= s["score"] <= NEAR_MISS_HIGH],
-                      key=lambda s: -s["score"])[:TOP_NEAR_MISSES]
-
-        # Cache before publish: a polling client that arrives between the two
-        # operations sees the ready result rather than stale "pending". The
-        # cache is the source of truth; the SSE push is a perf optimization.
-        preview_cache.store_result(draft_id, user_id=user_id,
-                                   positives=positives, near_misses=near)
-
-        _publish(user_id, "bucket_draft_preview", {
-            "draft_id": draft_id, "positives": positives, "near_misses": near,
-        })
-    finally:
-        db.close()
-
-
 def _read_candidates(db, *, user_id: str, exclude: set[str], limit: int) -> list[dict]:
     """Query the DB for inbox threads to score, newest-first.
 
@@ -302,10 +254,13 @@ def _read_candidates(db, *, user_id: str, exclude: set[str], limit: int) -> list
     the two can diverge (e.g. a thread's most-recent message was soft-deleted
     and pointers recomputed) and last_activity_at is the source of truth
     everywhere else threads are ordered. Also excludes is_archived threads,
-    matching list_threads' default view, so a bucket-draft preview never
-    scores threads the user no longer sees in their inbox. The join against
+    matching list_threads' default view, so a candidate pool never scores
+    threads the user no longer sees in their inbox. The join against
     InboxMessage is kept (not dropped) purely to pull from_addr/body_preview
-    for the still-current recent_message_id.
+    for the still-current recent_message_id. Shared by
+    workers/task_engine_tasks.py's propose_task_draft (recency-pool
+    fallback when its keyword probes come up empty) — the old
+    draft_preview_bucket caller was deleted in Phase 4 Task 3.
     """
     stmt = (
         select(InboxThread.id, InboxThread.gmail_id, InboxThread.subject,
@@ -325,31 +280,6 @@ def _read_candidates(db, *, user_id: str, exclude: set[str], limit: int) -> list
         if len(out) >= limit:
             break
     return out
-
-
-def _extend_inline(db, *, user) -> None:
-    """Acquire the per-user sync lock, run extend_inbox_history, then release.
-
-    Errors here are non-fatal — the preview will just score what's already
-    stored. Skips silently if another sync already holds the lock.
-    Note: extend_inbox_history is implemented in Task 13.
-    """
-    if not sync_lock.acquire(user.id):
-        log.info("draft_preview: extend skipped, another sync holds the lock")
-        return
-    try:
-        # Use the oldest gmail_internal_date in the inbox as the "before"
-        # cursor so extend_inbox_history fetches messages older than those stored.
-        oldest = db.execute(
-            select(InboxMessage.gmail_internal_date)
-            .where(InboxMessage.user_id == user.id)
-            .order_by(InboxMessage.gmail_internal_date.asc()).limit(1)
-        ).scalar_one_or_none()
-        if oldest is None:
-            return
-        gmail_sync.extend_inbox_history(db, user=user, before_internal_date_ms=oldest)
-    finally:
-        sync_lock.release(user.id)
 
 
 @celery_app.task(name="app.workers.tasks.extend_inbox_history")

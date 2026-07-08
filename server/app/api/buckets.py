@@ -1,15 +1,26 @@
-"""Bucket HTTP API. Four routes: GET / POST / PATCH / DELETE / draft preview."""
+"""Bucket HTTP API.
+
+SHIM -- Phase 4 back-compat for one release. Backed by tasks(kind='bucket').
+Delete in Phase 5.
+
+Four routes: GET / POST / PATCH / DELETE. The draft-preview routes (POST
+/buckets/draft/preview, GET /buckets/draft/preview/{id}) and their
+preview_cache/draft_preview_bucket machinery are gone -- superseded by the
+task engine's own goal->draft flow (POST /api/tasks/draft). A stale
+pre-deploy client tab that still calls either deleted route gets a plain
+404; NewBucketModal's existing `gone` polling handler already treats any
+404 that way.
+"""
 
 import logging
-import uuid
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from app.db.models import User, Task
 from app.db.session import get_db
 from app.deps import get_current_user
-from app.inbox import bucket_repo, preview_cache
-from app.workers import task_engine_tasks, tasks
+from app.inbox import bucket_repo
+from app.workers import task_engine_tasks
 
 
 router = APIRouter(prefix="/api", tags=["buckets"])
@@ -103,56 +114,3 @@ def delete_bucket(bucket_id: str, user: User = Depends(get_current_user),
     if b.user_id != user.id: raise HTTPException(403, "not your bucket")
     if b.is_deleted: return
     bucket_repo.soft_delete(db, b); db.commit()
-
-
-class _PreviewBody(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
-    description: str = Field(min_length=1)
-    exclude_thread_ids: list[str] = Field(default_factory=list)
-
-
-@router.post("/buckets/draft/preview", status_code=202)
-def post_draft_preview(body: _PreviewBody, user: User = Depends(get_current_user)) -> dict:
-    """Enqueue a draft preview scoring job and return a draft_id.
-
-    Result delivery has two paths the client can use interchangeably:
-      - SSE push: a bucket_draft_preview event keyed on draft_id when the
-        worker finishes (fast, fire-and-forget — lost if the SSE connection
-        blips during the ~40s scoring window).
-      - Polling: GET /api/buckets/draft/preview/{draft_id} returns the
-        cached result with a 600s TTL. Safety net for SSE delivery loss.
-    """
-    draft_id = uuid.uuid4().hex
-    # mark pending BEFORE enqueueing so the GET endpoint never returns 404
-    # to a fast-polling client racing the worker's first redis write.
-    preview_cache.mark_pending(draft_id, user_id=user.id)
-    tasks.draft_preview_bucket.apply_async(
-        args=[user.id, draft_id, body.name, body.description, body.exclude_thread_ids],
-        countdown=0,
-    )
-    return {"draft_id": draft_id}
-
-
-@router.get("/buckets/draft/preview/{draft_id}")
-def get_draft_preview(draft_id: str, response: Response,
-                      user: User = Depends(get_current_user)) -> dict:
-    """Polling fallback for the SSE-pushed preview result.
-
-      200 + {status:"ready", positives, near_misses} — worker finished.
-      202 + {status:"pending"}                       — still scoring.
-      404 — unknown draft_id (typo, expired, or never created).
-      403 — draft belongs to a different user.
-    """
-    entry = preview_cache.load(draft_id)
-    if entry is None:
-        raise HTTPException(404, "not found")
-    if entry.get("user_id") != user.id:
-        raise HTTPException(403, "not your preview")
-    if entry.get("status") == "pending":
-        response.status_code = 202
-        return {"status": "pending"}
-    return {
-        "status": "ready",
-        "positives": entry.get("positives", []),
-        "near_misses": entry.get("near_misses", []),
-    }

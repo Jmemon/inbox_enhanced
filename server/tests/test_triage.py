@@ -207,30 +207,52 @@ def test_triage_mismatched_current_bucket_ids_length_raises():
         classify_mod.triage([_t()], [_b("b1", "X")], [], [])
 
 
-def test_triage_zero_trackers_matches_classify_bucket_behavior(monkeypatch):
-    """Regression guarantee substrate: with zero trackers, triage()'s bucket
-    resolution must behave identically to classify() for the same inputs —
-    same no-fit fallback to current_bucket_id, same order preservation."""
-    answers_classify = iter(['{"bucket_name": "X"}', '{"bucket_name": null}'])
-    answers_triage = iter([
+def test_triage_zero_trackers_no_fit_falls_back_to_current_bucket(monkeypatch):
+    """Zero-tracker regression guarantee: with zero trackers, triage()'s
+    bucket resolution must still fall back to current_bucket_id on a
+    null/unknown bucket_name and preserve input order — the exact no-fit
+    behavior the old classify() had (classify() itself was deleted in
+    Phase 4 Task 3, so this is asserted directly against triage() rather
+    than by comparing the two side by side)."""
+    answers = iter([
         '{"bucket_name": "X", "relevant_tasks": []}',
         '{"bucket_name": null, "relevant_tasks": []}',
+        '{"bucket_name": "GHOST", "relevant_tasks": []}',
     ])
 
-    async def _fake_classify(**kw):
-        return next(answers_classify)
+    async def _fake(**kw):
+        return next(answers)
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
 
-    async def _fake_triage(**kw):
-        return next(answers_triage)
+    out = classify_mod.triage(
+        [_t("gT1"), _t("gT2"), _t("gT3")],
+        [_b("b1", "X")],
+        [],   # zero trackers
+        [None, "b1", "b1"],
+    )
+    # T1: name "X" → b1. T2: null → keep existing b1. T3: unknown name ("GHOST")
+    # → keep existing b1.
+    assert [b for b, _ in out] == ["b1", "b1", "b1"]
 
-    threads = [_t("gT1"), _t("gT2")]
-    buckets = [_b("b1", "X")]
-    current = [None, "b1"]
 
-    monkeypatch.setattr(llm_client, "call_messages", _fake_classify)
-    classify_out = classify_mod.classify(threads, buckets, current)
+def test_triage_threads_task_id_through_to_call_messages(monkeypatch):
+    """Migrated from the now-deleted test_classify.py (Phase 4 Task 3):
+    backfill_task's per-candidate triage() calls carried no task_id, so
+    their llm_calls metrics rows couldn't be attributed to the tracker that
+    triggered them. triage() must accept an optional task_id kwarg and
+    forward it verbatim to call_messages (which already accepts task_id).
+    Orthogonal to classify() — pure triage() coverage, so it survives
+    test_classify.py's deletion rather than being dropped with it."""
+    captured = {}
 
-    monkeypatch.setattr(llm_client, "call_messages", _fake_triage)
-    triage_out = classify_mod.triage(threads, buckets, [], current)
+    async def _fake(**kw):
+        captured.update(kw)
+        return '{"bucket_name": null, "relevant_tasks": []}'
+    monkeypatch.setattr(llm_client, "call_messages", _fake)
 
-    assert [b for b, _ in triage_out] == classify_out
+    classify_mod.triage(
+        [_t("gT1")], [], [_task("tk1", "Tracker")], [None],
+        user_id="u1", task_id="tk1",
+    )
+
+    assert captured["task_id"] == "tk1"

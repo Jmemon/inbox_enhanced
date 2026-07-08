@@ -7,54 +7,9 @@ from app.config import get_settings
 from app.db.models import Task
 from app.gmail.parser import ParsedThread, thread_to_string
 from app.llm import client
-from app.llm.prompts import classify_thread, triage_thread
+from app.llm.prompts import triage_thread
 
 log = logging.getLogger(__name__)
-
-
-async def _classify_one(*, thread: ParsedThread, buckets: list[Task], current_bucket_id: str | None,
-                        user_id: str | None = None) -> str | None:
-    s = get_settings()
-    # Stability hint references the current bucket by name, not opaque id, so
-    # the model has semantic context. Falls through to None if current points
-    # at a deleted bucket — the LLM can't pick a deleted bucket anyway.
-    current_name = next((b.name for b in buckets if b.id == current_bucket_id), None)
-    text = await client.call_messages(
-        model=s.llm_classify_model,
-        system=classify_thread.SYSTEM_PROMPT,
-        user=classify_thread.build_user_message(
-            thread_str=thread_to_string(thread), buckets=buckets,
-            current_bucket_name=current_name,
-        ),
-        stage="classify", user_id=user_id,
-    )
-    # parse_response already validates name → id resolution against `buckets`
-    # (returns None for null, unknown, or ambiguous duplicate-name picks).
-    bid = classify_thread.parse_response(text, buckets)
-    if bid is None:
-        return current_bucket_id  # no-fit: keep existing (None for new threads)
-    return bid
-
-
-def classify(
-    threads: list[ParsedThread], buckets: list[Task], current_bucket_ids: list[str | None],
-    *, user_id: str | None = None,
-) -> list[str | None]:
-    """No production callers as of Phase 2A (triage() replaced it on the sync
-    path); Phase 4 removes it."""
-    if not threads:
-        return []
-    if not buckets:
-        return [None] * len(threads)
-    if len(current_bucket_ids) != len(threads):
-        raise ValueError("current_bucket_ids length must match threads length")
-
-    async def _all():
-        return await asyncio.gather(*[
-            _classify_one(thread=t, buckets=buckets, current_bucket_id=cur, user_id=user_id)
-            for t, cur in zip(threads, current_bucket_ids)
-        ])
-    return client.run_in_loop(_all())
 
 
 async def _triage_one(
@@ -63,7 +18,9 @@ async def _triage_one(
     task_id: str | None = None,
 ) -> tuple[str | None, list[tuple[str, int]]]:
     s = get_settings()
-    # Same stability-hint semantics as _classify_one.
+    # Stability hint references the current bucket by name, not opaque id, so
+    # the model has semantic context. Falls through to None if current points
+    # at a deleted bucket — the LLM can't pick a deleted bucket anyway.
     current_name = next((b.name for b in buckets if b.id == current_bucket_id), None)
     text = await client.call_messages(
         model=s.llm_classify_model,
@@ -88,11 +45,11 @@ def triage(
     current_bucket_ids: list[str | None], *, user_id: str | None = None,
     task_id: str | None = None,
 ) -> list[tuple[str | None, list[tuple[str, int]]]]:
-    """The single call that replaces classify() in the sync path: one Haiku
-    call per thread returns both the bucket pick and tracker relevance
-    (D2 — no doubled LLM volume). Same asyncio.gather shape as classify();
-    output preserves input order. classify() itself is untouched — this is
-    an additive function for callers that also need tracker relevance.
+    """The one Haiku call per thread that returns both the bucket pick and
+    tracker relevance (D2 — no doubled LLM volume); replaced the old
+    classify() on the sync path entirely (classify() itself was deleted in
+    Phase 4 Task 3 — triage() is the only classify-stage entrypoint left).
+    Same asyncio.gather shape classify() used; output preserves input order.
 
     task_id is optional and forwarded verbatim to call_messages's own task_id
     kwarg for llm_calls metrics attribution — most callers (the live sync
@@ -108,7 +65,7 @@ def triage(
         raise ValueError("current_bucket_ids length must match threads length")
     if not buckets and not trackers:
         # Nothing for the LLM to determine either way — skip the call
-        # entirely, mirroring classify()'s empty-buckets short-circuit.
+        # entirely (mirrors the old classify()'s empty-buckets short-circuit).
         return [(None, [])] * len(threads)
 
     async def _all():
