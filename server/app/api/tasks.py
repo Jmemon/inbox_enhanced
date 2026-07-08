@@ -19,6 +19,7 @@ own `_publish_task_updated` helper of the same shape.
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
@@ -247,7 +248,13 @@ class _CreateTaskBody(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     goal: str = Field(min_length=1)
     description: str = Field(min_length=1)
-    state_schema: dict
+    # Phase 4 Task 2: kind-aware creation -- 'tracker' (the pre-existing
+    # default, for source compatibility with every caller that predates
+    # kind) requires a state_schema; 'bucket' (buckets are now
+    # tasks(kind='bucket'), see task_engine/repo.list_active_buckets) must
+    # NOT have one -- a bucket carries no EPS pipeline, only criteria.
+    kind: Literal["tracker", "bucket"] = "tracker"
+    state_schema: dict | None = None
     keyword_probes: list[str] = Field(default_factory=list)
     confirmed_positives: list[_ExampleIn] = Field(default_factory=list)
     confirmed_negatives: list[_ExampleIn] = Field(default_factory=list)
@@ -268,10 +275,18 @@ def list_tasks(user: User = Depends(get_current_user), db: Session = Depends(get
 @router.post("/tasks", status_code=201)
 def create_task(body: _CreateTaskBody, user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)) -> dict:
-    try:
-        schema = schema_mod.validate_schema(body.state_schema)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
+    if body.kind == "tracker":
+        if body.state_schema is None:
+            raise HTTPException(422, "state_schema is required for tracker tasks")
+        try:
+            schema = schema_mod.validate_schema(body.state_schema)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        state_schema = schema.model_dump()
+    else:  # kind == "bucket"
+        if body.state_schema is not None:
+            raise HTTPException(422, "bucket tasks cannot have a state_schema")
+        state_schema = None
 
     criteria = criteria_mod.formulate_criteria(
         description=body.description,
@@ -280,12 +295,13 @@ def create_task(body: _CreateTaskBody, user: User = Depends(get_current_user),
     )
     task = task_repo.create_task(
         db, user_id=user.id, name=body.name, goal=body.goal, criteria=criteria,
-        state_schema=schema.model_dump(), kind="tracker",
+        state_schema=state_schema, kind=body.kind,
     )
     db.commit()
-    # Async — the user gets 201 immediately; a newly created tracker is run
-    # over the user's stored history in the background (progress arrives via
-    # task_backfill_progress SSE events, see workers/task_engine_tasks.py).
+    # Async — the user gets 201 immediately; a newly created task (tracker OR
+    # bucket) is backfilled over the user's stored history in the background
+    # (progress arrives via task_backfill_progress SSE events, see
+    # workers/task_engine_tasks.py's kind-branching backfill_task).
     task_engine_tasks.backfill_task.apply_async(
         args=[user.id, task.id, body.keyword_probes], countdown=0,
     )

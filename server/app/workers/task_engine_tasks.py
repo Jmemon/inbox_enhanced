@@ -12,10 +12,23 @@ own top level, or the two modules would form an import cycle. `_publish`
 score thresholds) is therefore pulled in with a late import inside each task
 function's body instead of a top-level `from app.workers.tasks import ...`.
 
-No `sync_lock` anywhere in this module: no task here ever writes
-`inbox_threads`/`inbox_messages` (they only read), so there's nothing that
-can race the sync path's `(user_id, gmail_id)` unique constraint. Idempotency
-for the two extraction tasks instead comes entirely from
+No `sync_lock` anywhere in this module. Most tasks here only ever READ
+`inbox_threads`/`inbox_messages`, so there's nothing that can race the sync
+path's `(user_id, gmail_id)` unique constraint (the hazard sync_lock exists
+to guard). The one exception is `_run_bucket_backfill`, which DOES write
+`InboxThread.bucket_id` — still without sync_lock, because it does no Gmail
+I/O of its own and so never touches the unique-constraint hazard the lock
+guards against. That write path has its own, narrower race instead: a
+concurrent poll (holding sync_lock, re-triaging the same thread against
+FRESH content) can commit a different bucket_id while a backfill batch —
+which read the OLD bucket_id as its stability hint before its own
+multi-second `classify.triage()` round-trip — is still mid-flight.
+`_run_bucket_backfill` guards against this optimistically: immediately
+before writing, it re-reads `bucket_id` fresh (a column-level `select()`,
+which always issues a real query rather than resolving from the session's
+identity map) and skips the write — and the `threads_updated` publish — if
+the row moved since the read that fed `triage()`. Idempotency for the two
+extraction tasks instead comes entirely from
 `transitions.validate_and_stage`'s step 7 (SELECT-first check against
 `(task_id, message_id, field)`, backed by the migrated DB's partial unique
 index as a race backstop) — re-running either against the same (task,
@@ -28,8 +41,10 @@ it against the same draft_id just overwrites the cache entry with a fresh
 
 import logging
 
+from sqlalchemy import select
+
 from app.config import get_settings
-from app.db.models import User
+from app.db.models import InboxThread, User
 from app.db.session import SessionLocal as _AppSessionLocal
 from app.inbox import inbox_repo, search_repo
 from app.llm import classify
@@ -482,28 +497,63 @@ BACKFILL_TRIAGE_BATCH = 25
 BACKFILL_PROGRESS_INTERVAL = 50
 
 
-@celery_app.task(name="app.workers.task_engine_tasks.backfill_task")
-def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None = None) -> None:
-    """Run a newly created tracker over a user's stored history.
+def _backfill_candidate_pool(db, *, user_id: str, keyword_probes: list[str] | None) -> list[str]:
+    """Candidate thread ids for a backfill run -- shared by both of
+    `backfill_task`'s kind branches. FTS union over `keyword_probes`
+    (`search_repo.search_threads`, capped at BACKFILL_PROBE_CANDIDATE_CAP
+    unique threads across all probes) unioned with the newest
+    BACKFILL_RECENCY_LIMIT threads (`inbox_repo.list_threads(...,
+    include_archived=True)`). Both sources use include_archived=True --
+    backfill's whole point (tracker OR bucket) is to scan everything stored,
+    not just what's currently in the live inbox view. A bucket backfill is
+    always invoked with `keyword_probes=[]` (buckets have no LLM-proposed
+    search terms the way a tracker wizard does) -- the FTS half then
+    contributes nothing and this degrades to exactly the recency-window
+    pool, the "empty probes -> recent-window fallback" every caller relies
+    on.
+    """
+    seen: set[str] = set()
+    candidate_ids: list[str] = []
+    for probe in (keyword_probes or []):
+        if len(seen) >= BACKFILL_PROBE_CANDIDATE_CAP:
+            break
+        for thread in search_repo.search_threads(
+            db, user_id=user_id, q=probe, include_archived=True,
+            limit=BACKFILL_SEARCH_LIMIT_PER_PROBE,
+        ):
+            if thread.id in seen:
+                continue
+            seen.add(thread.id)
+            candidate_ids.append(thread.id)
+            if len(seen) >= BACKFILL_PROBE_CANDIDATE_CAP:
+                break
+    for thread in inbox_repo.list_threads(
+        db, user_id=user_id, limit=BACKFILL_RECENCY_LIMIT, offset=0,
+        include_archived=True,
+    ):
+        if thread.id in seen:
+            continue
+        seen.add(thread.id)
+        candidate_ids.append(thread.id)
+    return candidate_ids
+
+
+def _run_tracker_backfill(db, *, task, user_id: str, candidate_ids: list[str], publish) -> None:
+    """kind='tracker' backfill body -- unchanged Phase 2A/2C behavior, only
+    extracted out of `backfill_task` so `_backfill_candidate_pool` can be
+    shared with the kind='bucket' branch without duplicating it.
 
     Two phases, in order:
 
-    1. Triage phase. Candidate pool = FTS union over `keyword_probes`
-       (`search_repo.search_threads`, capped at BACKFILL_PROBE_CANDIDATE_CAP
-       unique threads across all probes) unioned with the newest
-       BACKFILL_RECENCY_LIMIT threads (`inbox_repo.list_threads(...,
-       include_archived=True)`). Both sources use include_archived=True --
-       backfill's whole point is to scan everything stored, not just what's
-       currently in the live inbox view.
-
-       Candidates are triaged in batches of BACKFILL_TRIAGE_BATCH via
-       `classify.triage()`, called with ONLY this tracker in the tracker list,
-       `buckets=[]`, and `task_id=task.id` (so each call's llm_calls metrics
-       row is attributable to the tracker being backfilled). triage() always
-       returns a bucket pick alongside
-       tracker relevance, but that pick is entirely ignored here -- never
-       written to thread.bucket_id or anywhere else. Backfill's only job is
-       tracker relevance; with buckets=[] the pick is always None anyway (see
+    1. Triage phase. Candidates (already resolved by
+       `_backfill_candidate_pool`) are triaged in batches of
+       BACKFILL_TRIAGE_BATCH via `classify.triage()`, called with ONLY this
+       tracker in the tracker list, `buckets=[]`, and `task_id=task.id` (so
+       each call's llm_calls metrics row is attributable to the tracker being
+       backfilled). triage() always returns a bucket pick alongside tracker
+       relevance, but that pick is entirely ignored here -- never written to
+       thread.bucket_id or anywhere else. Backfill's only job here is tracker
+       relevance; with buckets=[] the pick is always None anyway (see
        classify._triage_one's no-fit fallthrough), so there's nothing
        meaningful to write even if we wanted to.
 
@@ -533,136 +583,254 @@ def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None =
     Progress: `task_backfill_progress` publishes every BACKFILL_PROGRESS_
     INTERVAL threads scanned during phase 1 (`{"task_id", "scanned",
     "matched", "done": False}`), a terminal one with `"done": True` once
-    phase 2 finishes, and exactly one final `task_updated` (fresh version +
-    pending_count, via `_publish_task_updated`) after that.
-
-    Idempotent by construction: re-running this task for the same task_id
-    re-derives the same candidate pool, `upsert_link` no-ops on rows already
-    at the target state, and extraction's own SELECT-first idempotency check
-    (`transitions.validate_and_stage` step 7) drops any proposal it's already
-    staged an event for -- a second run relinks nothing new and stages no
-    duplicate events; it still publishes progress + a terminal task_updated
-    (backfill is a one-shot job the wizard waits on, so it always reports a
-    definitive completion, unlike `process_task_updates`' skip-if-no-change
-    publish suppression for a periodic sync tick).
+    phase 2 finishes. `backfill_task` publishes the final `task_updated`
+    itself, once this returns.
     """
-    from app.workers.tasks import _publish
+    settings = get_settings()
+
+    scanned = 0
+    last_published = 0
+    matched_thread_ids: set[str] = set()
+
+    for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
+        batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
+        # load_parsed_threads may drop an id with no usable (non-deleted)
+        # messages -- ordered_ids/parsed_list are derived from its
+        # OWN returned triples (not batch_ids) so triage()'s
+        # input-order-preserving output zips back up correctly.
+        triples = inbox_repo.load_parsed_threads(db, user_id=user_id, internal_ids=batch_ids)
+        if triples:
+            ordered_ids = [tid for tid, _, _ in triples]
+            parsed_list = [parsed for _, _, parsed in triples]
+            results = classify.triage(
+                parsed_list, buckets=[], trackers=[task],
+                current_bucket_ids=[None] * len(parsed_list), user_id=user_id,
+                task_id=task.id,
+            )
+            for thread_id, (_, relevant_tasks) in zip(ordered_ids, results):
+                if not relevant_tasks:
+                    continue
+                # Only this one tracker was passed in, so relevant_tasks
+                # has at most one entry.
+                _, confidence = relevant_tasks[0]
+                if confidence < settings.task_link_confidence:
+                    continue
+                link = task_repo.upsert_link(
+                    db, task_id=task.id, thread_id=thread_id, user_id=user_id,
+                    origin="llm", state="attached", confidence=confidence,
+                )
+                if link is not None:
+                    matched_thread_ids.add(thread_id)
+            db.commit()
+
+        # scanned tracks progress through the whole candidate pool,
+        # including ids load_parsed_threads dropped -- those still
+        # represent forward progress for the wizard's progress bar.
+        scanned += len(batch_ids)
+        if scanned - last_published >= BACKFILL_PROGRESS_INTERVAL:
+            publish(user_id, "task_backfill_progress", {
+                "task_id": task.id, "scanned": scanned,
+                "matched": len(matched_thread_ids), "done": False,
+            })
+            last_published = scanned
+
+    # --- Extraction phase: ascending last_activity_at ---
+    matched_threads = inbox_repo.get_threads_batch(
+        db, user_id=user_id, thread_ids=list(matched_thread_ids),
+    )
+    matched_threads.sort(key=lambda t: (t.last_activity_at is None, t.last_activity_at))
+
+    for thread in matched_threads:
+        try:
+            staged = extract_for_pair(
+                db, task=task, thread_internal_id=thread.id, user_id=user_id,
+            )
+            if staged is None:
+                continue
+            db.commit()
+        except Exception:
+            log.exception(
+                "backfill_task: task=%s thread=%s extraction failed; continuing",
+                task.id, thread.id,
+            )
+            db.rollback()
+            continue
+
+    publish(user_id, "task_backfill_progress", {
+        "task_id": task.id, "scanned": scanned,
+        "matched": len(matched_thread_ids), "done": True,
+    })
+
+
+def _run_bucket_backfill(
+    db, *, task, user_id: str, candidate_ids: list[str], publish, publish_thread_ids,
+) -> None:
+    """kind='bucket' backfill body (Phase 4 Task 2): a pure reclassification
+    pass over the candidate pool, no task-engine writes at all.
+
+    Each batch is triaged against the FULL active bucket set
+    (`repo.list_active_buckets` -- the new bucket included) with `trackers=[]`
+    and each thread's CURRENT `bucket_id` passed as the stability hint via
+    `current_bucket_ids` -- classify.triage() only returns a different pick
+    when the thread genuinely fits the new bucket set better, exactly the
+    stability rationale the old (Phase 4 Task 1) `workers.tasks._reclassify_
+    all` used. `thread.bucket_id` is written only when the picked bucket
+    differs from the stored one -- mirroring that same write discipline
+    exactly. Unlike the tracker branch: no `repo.upsert_link` calls (bucket-
+    kind tasks never get task_thread_links), no `extract_for_pair` calls, no
+    task_events -- bucket-kind tasks track no board/pipeline state for
+    extraction to write into.
+
+    Progress cadence matches the tracker branch (interval `task_backfill_
+    progress` publishes with `"done": False`, one terminal publish with
+    `"done": True`) with "matched" reinterpreted as "bucket_id actually
+    changed" -- the bucket-kind analog of the tracker branch's "newly
+    linked". Every thread whose bucket changed is also published as a single
+    `threads_updated` event (via `publish_thread_ids`, a no-op for an empty
+    list) right before the terminal progress publish, so the browser's inbox
+    view picks up the reassignment -- there is no final `task_updated` here
+    (unlike the tracker branch): a bucket-kind task carries no version-gated
+    board/event state for a client to refetch.
+
+    `buckets` (the active bucket set triage() is called against) is resolved
+    ONCE before the batch loop, not per-batch -- a bucket created or deleted
+    mid-backfill is simply not seen by later batches. Acceptable: the backfill
+    triages against the set as of its start, the same read-once semantics the
+    old (Phase 4 Task 1) reclassify-all pass had.
+
+    Write-time race: this function writes `InboxThread.bucket_id` without
+    `sync_lock` (see the module docstring). A concurrent poll can commit a
+    fresher pick for a thread already read into this batch's stability hint
+    (`old_bucket`) before this batch's own `classify.triage()` call returns.
+    Immediately before writing, each candidate whose pick differs from
+    `old_bucket` is re-checked against a fresh, identity-map-bypassing
+    `select(InboxThread.bucket_id)` -- if the stored value has already moved
+    off `old_bucket`, something fresher won the race; skip the write (and
+    leave the thread out of `changed_thread_ids`/the `threads_updated`
+    publish) rather than clobber it with a pick computed from stale content.
+    """
+    scanned = 0
+    last_published = 0
+    changed_thread_ids: set[str] = set()
+    buckets = task_repo.list_active_buckets(db, user_id=user_id)
+
+    for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
+        batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
+        triples = inbox_repo.load_parsed_threads(db, user_id=user_id, internal_ids=batch_ids)
+        if triples:
+            ordered_ids = [tid for tid, _, _ in triples]
+            current_bucket_ids = [bid for _, bid, _ in triples]
+            parsed_list = [parsed for _, _, parsed in triples]
+            results = classify.triage(
+                parsed_list, buckets=buckets, trackers=[],
+                current_bucket_ids=current_bucket_ids, user_id=user_id,
+                task_id=task.id,
+            )
+            for thread_id, old_bucket, (new_bucket, _relevant_tasks) in zip(
+                ordered_ids, current_bucket_ids, results,
+            ):
+                if new_bucket == old_bucket:
+                    continue
+                # Optimistic guard: a plain column select always issues a
+                # real query (unlike db.get(), which would return this
+                # session's identity-mapped InboxThread -- loaded by
+                # load_parsed_threads above, before triage()'s multi-second
+                # round-trip -- and so could still report the stale
+                # old_bucket even though the row has since moved).
+                fresh_bucket = db.execute(
+                    select(InboxThread.bucket_id).where(InboxThread.id == thread_id)
+                ).scalar_one_or_none()
+                if fresh_bucket != old_bucket:
+                    log.info(
+                        "_run_bucket_backfill: task=%s thread=%s bucket_id moved "
+                        "(%r -> %r) since triage read; skipping stale write",
+                        task.id, thread_id, old_bucket, fresh_bucket,
+                    )
+                    continue
+                thread_row = db.get(InboxThread, thread_id)
+                if thread_row is not None:
+                    thread_row.bucket_id = new_bucket
+                    changed_thread_ids.add(thread_id)
+            db.commit()
+
+        scanned += len(batch_ids)
+        if scanned - last_published >= BACKFILL_PROGRESS_INTERVAL:
+            publish(user_id, "task_backfill_progress", {
+                "task_id": task.id, "scanned": scanned,
+                "matched": len(changed_thread_ids), "done": False,
+            })
+            last_published = scanned
+
+    publish_thread_ids(user_id, list(changed_thread_ids))
+    publish(user_id, "task_backfill_progress", {
+        "task_id": task.id, "scanned": scanned,
+        "matched": len(changed_thread_ids), "done": True,
+    })
+
+
+@celery_app.task(name="app.workers.task_engine_tasks.backfill_task")
+def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None = None) -> None:
+    """Run a newly created task -- tracker OR bucket kind -- over a user's
+    stored history.
+
+    Both kinds resolve the same candidate pool up front
+    (`_backfill_candidate_pool`) and share the BACKFILL_TRIAGE_BATCH/
+    BACKFILL_PROGRESS_INTERVAL cadence, then diverge entirely:
+
+    - kind='tracker' (`_run_tracker_backfill`, unchanged Phase 2A/2C
+      behavior): triage against ONLY this tracker, link every thread that
+      clears `settings.task_link_confidence`, then extract every newly-
+      linked thread in ascending `last_activity_at` order. Followed by
+      exactly one final `task_updated` (fresh version + pending_count).
+    - kind='bucket' (`_run_bucket_backfill`, Phase 4 Task 2): triage against
+      the FULL active bucket set with each thread's current `bucket_id` as
+      the stability hint, writing `thread.bucket_id` only when the pick
+      actually changes -- a pure reclassification pass with NO task_thread_
+      links, NO task_events, and NO extraction. Publishes `threads_updated`
+      for the changed threads instead of a final `task_updated` (there is no
+      task-engine board/event state on a bucket-kind task for a client to
+      refetch).
+
+    Both kinds are idempotent by construction: re-running this task for the
+    same task_id re-derives the same candidate pool and re-triages it, so a
+    second run changes nothing new (tracker: `upsert_link` no-ops +
+    extraction's own SELECT-first idempotency check; bucket: the pick is
+    re-derived against the now-updated `bucket_id`, so an already-converged
+    thread's pick no longer differs and nothing is rewritten) -- both still
+    publish progress + a terminal signal on every run, since backfill is a
+    one-shot job the wizard waits on and always reports a definitive
+    completion, unlike `process_task_updates`' skip-if-no-change publish
+    suppression for a periodic sync tick.
+    """
+    from app.workers.tasks import _publish, _publish_thread_ids
 
     db = SessionLocal()
     try:
         task = task_repo.get_owned_task(db, user_id=user_id, task_id=task_id)
-        if (
-            task is None
-            or task.kind != "tracker"
-            or task.status != "active"
-            or task.state_schema is None
-        ):
+        if task is None or task.status != "active":
+            log.info("backfill_task: task=%s not an active task, skipping", task_id)
+            return
+        if task.kind == "tracker" and task.state_schema is None:
             log.info(
-                "backfill_task: task=%s not an active schema-bearing tracker, skipping",
-                task_id,
+                "backfill_task: task=%s tracker has no state_schema yet, skipping", task_id,
+            )
+            return
+        if task.kind not in ("tracker", "bucket"):
+            log.info("backfill_task: task=%s unsupported kind=%r, skipping", task_id, task.kind)
+            return
+
+        candidate_ids = _backfill_candidate_pool(db, user_id=user_id, keyword_probes=keyword_probes)
+
+        if task.kind == "bucket":
+            _run_bucket_backfill(
+                db, task=task, user_id=user_id, candidate_ids=candidate_ids,
+                publish=_publish, publish_thread_ids=_publish_thread_ids,
             )
             return
 
-        settings = get_settings()
-
-        # --- Candidate pool ---
-        seen: set[str] = set()
-        candidate_ids: list[str] = []
-        for probe in (keyword_probes or []):
-            if len(seen) >= BACKFILL_PROBE_CANDIDATE_CAP:
-                break
-            for thread in search_repo.search_threads(
-                db, user_id=user_id, q=probe, include_archived=True,
-                limit=BACKFILL_SEARCH_LIMIT_PER_PROBE,
-            ):
-                if thread.id in seen:
-                    continue
-                seen.add(thread.id)
-                candidate_ids.append(thread.id)
-                if len(seen) >= BACKFILL_PROBE_CANDIDATE_CAP:
-                    break
-        for thread in inbox_repo.list_threads(
-            db, user_id=user_id, limit=BACKFILL_RECENCY_LIMIT, offset=0,
-            include_archived=True,
-        ):
-            if thread.id in seen:
-                continue
-            seen.add(thread.id)
-            candidate_ids.append(thread.id)
-
-        # --- Triage phase ---
-        scanned = 0
-        last_published = 0
-        matched_thread_ids: set[str] = set()
-
-        for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
-            batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
-            # load_parsed_threads may drop an id with no usable (non-deleted)
-            # messages -- ordered_ids/parsed_list are derived from its
-            # OWN returned triples (not batch_ids) so triage()'s
-            # input-order-preserving output zips back up correctly.
-            triples = inbox_repo.load_parsed_threads(db, user_id=user_id, internal_ids=batch_ids)
-            if triples:
-                ordered_ids = [tid for tid, _, _ in triples]
-                parsed_list = [parsed for _, _, parsed in triples]
-                results = classify.triage(
-                    parsed_list, buckets=[], trackers=[task],
-                    current_bucket_ids=[None] * len(parsed_list), user_id=user_id,
-                    task_id=task.id,
-                )
-                for thread_id, (_, relevant_tasks) in zip(ordered_ids, results):
-                    if not relevant_tasks:
-                        continue
-                    # Only this one tracker was passed in, so relevant_tasks
-                    # has at most one entry.
-                    _, confidence = relevant_tasks[0]
-                    if confidence < settings.task_link_confidence:
-                        continue
-                    link = task_repo.upsert_link(
-                        db, task_id=task.id, thread_id=thread_id, user_id=user_id,
-                        origin="llm", state="attached", confidence=confidence,
-                    )
-                    if link is not None:
-                        matched_thread_ids.add(thread_id)
-                db.commit()
-
-            # scanned tracks progress through the whole candidate pool,
-            # including ids load_parsed_threads dropped -- those still
-            # represent forward progress for the wizard's progress bar.
-            scanned += len(batch_ids)
-            if scanned - last_published >= BACKFILL_PROGRESS_INTERVAL:
-                _publish(user_id, "task_backfill_progress", {
-                    "task_id": task_id, "scanned": scanned,
-                    "matched": len(matched_thread_ids), "done": False,
-                })
-                last_published = scanned
-
-        # --- Extraction phase: ascending last_activity_at ---
-        matched_threads = inbox_repo.get_threads_batch(
-            db, user_id=user_id, thread_ids=list(matched_thread_ids),
+        _run_tracker_backfill(
+            db, task=task, user_id=user_id, candidate_ids=candidate_ids, publish=_publish,
         )
-        matched_threads.sort(key=lambda t: (t.last_activity_at is None, t.last_activity_at))
-
-        for thread in matched_threads:
-            try:
-                staged = extract_for_pair(
-                    db, task=task, thread_internal_id=thread.id, user_id=user_id,
-                )
-                if staged is None:
-                    continue
-                db.commit()
-            except Exception:
-                log.exception(
-                    "backfill_task: task=%s thread=%s extraction failed; continuing",
-                    task.id, thread.id,
-                )
-                db.rollback()
-                continue
-
-        _publish(user_id, "task_backfill_progress", {
-            "task_id": task_id, "scanned": scanned,
-            "matched": len(matched_thread_ids), "done": True,
-        })
         _publish_task_updated(db, user_id=user_id, task=task)
     finally:
         db.close()
