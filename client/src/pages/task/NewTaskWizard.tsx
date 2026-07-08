@@ -6,17 +6,28 @@ import { postTaskDraft, getTaskDraft, type TaskStateSchema, type TaskDraftPropos
 import { useTasksStore } from '../../state/TasksProvider'
 import { SchemaEditor } from './SchemaEditor'
 
-// Cloned from NewBucketModal.tsx's step machine (read that file first) — same
-// appliedRef per-draft idempotency, same SSE-fast-path + 5s-poll-fallback
-// dance, same Backdrop/modal styles (copied below rather than extracted to a
-// shared module: the duplication is small and keeps this task's diff to the
-// two new files the plan named, instead of also touching NewBucketModal.tsx).
+// Step machine: goal form -> draft pending (SSE `task_draft_ready` fast path +
+// 5s-poll fallback) -> review (name/description/schema/examples, seeded from
+// the draft) -> create -> 'creating' (post-create backfill wait). Per-draft
+// idempotency (appliedRef), unmount guard, and Backdrop/modal styles below
+// follow the same shape as the bucket draft-preview flow this superseded.
 //
-// Differences from the bucket flow:
-// - One extra step ('creating') for the post-create backfill wait.
+// Phase 4 Task 5: `kind` gives this wizard a second mode ('bucket', default
+// 'tracker') so bucket creation goes through the same goal->draft->review
+// flow instead of a separate modal. Bucket mode diverges only where the two
+// domains actually differ: no EPS state_schema (the review step skips
+// <SchemaEditor> and always sends `state_schema: null`), and no per-task
+// detail page to hand off to on completion (`onCreated` instead of
+// `navigate`). Every other line here is unchanged, byte-identical tracker
+// behavior — search for `kind ===` to see every divergence point.
+//
+// Other differences from the old bucket-draft-preview modal it replaces:
+// - One extra step ('creating') for the post-create backfill wait (both
+//   kinds backfill now — see workers/task_engine_tasks.py's kind branch).
 // - The SSE payload (`task_draft_ready`) carries only the draft_id, not the
-//   proposal — unlike `bucket_draft_preview`, which inlines positives/near_misses
-//   directly. The fast path here does event -> getTaskDraft(id) -> apply.
+//   proposal — unlike the old `bucket_draft_preview`, which inlined
+//   positives/near_misses directly. The fast path here does event ->
+//   getTaskDraft(id) -> apply.
 // - No "more examples" affordance (the plan doesn't call for one here).
 
 type Choice = 'positive' | 'near_miss' | 'rejected'
@@ -25,7 +36,16 @@ type Step = 'form' | 'pending' | 'review' | 'creating'
 
 const HINT = "We recommend confirming at least 2 positives + 2 near-misses before creating the task — but it's not required."
 
-export function NewTaskWizard({ onClose }: { onClose: () => void }) {
+export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
+  onClose: () => void
+  // 'bucket' skips the EPS schema step entirely — buckets carry criteria only,
+  // no pipeline/entity state (see task_engine/repo.create_task).
+  kind?: 'tracker' | 'bucket'
+  // Bucket mode's completion hook — there's no per-task detail page for a
+  // bucket to navigate to, so the caller (InboxPage) refreshes its own bucket
+  // list instead. Unused in tracker mode.
+  onCreated?: (taskId: string) => void
+}) {
   const navigate = useNavigate()
   const { createTask, backfill } = useTasksStore()
 
@@ -57,8 +77,7 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
 
   // Idempotent apply: a result for a given draft_id can arrive via SSE OR via
   // the polling fallback (or both, in either order). appliedRef ensures we
-  // only push the proposal + examples and flip step once per draft_id —
-  // identical rationale to NewBucketModal's appliedRef.
+  // only push the proposal + examples and flip step once per draft_id.
   const appliedRef = useRef<Set<string>>(new Set())
 
   // Guards the fast-path's async getTaskDraft() fetch (kicked off from inside
@@ -78,7 +97,13 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
     appliedRef.current.add(forDraftId)
     setName(proposal.name)
     setDescription(proposal.description)
-    setStateSchema(proposal.state_schema)
+    // Bucket mode never seeds/edits/sends a schema — the draft proposal's
+    // state_schema (the endpoint is shared across both kinds) is discarded
+    // rather than applied, so `stateSchema` stays null for the review-step
+    // gating and submit() below.
+    setStateSchema(kind === 'bucket' ? null : proposal.state_schema)
+    // keyword_probes are kept for both kinds — bucket backfill uses them for
+    // its FTS prefilter same as tracker backfill does.
     setKeywordProbes(proposal.keyword_probes)
     setExamples([
       ...positives.map(ex => ({ ...ex, initial: 'positive' as const, choice: 'positive' as const })),
@@ -105,11 +130,10 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
     })
   }, [draftId])
 
-  // Safety net: poll the cache every 5s while pending. Same cancellation
-  // semantics as NewBucketModal's preview poll — a `cancelled` flag closed
-  // over per-effect-run plus clearTimeout on cleanup, checked at both async
-  // boundaries. Stops on success, on draftId change, on step change, or on
-  // unmount.
+  // Safety net: poll the cache every 5s while pending. A `cancelled` flag
+  // closed over per-effect-run plus clearTimeout on cleanup, checked at both
+  // async boundaries. Stops on success, on draftId change, on step change, or
+  // on unmount.
   useEffect(() => {
     if (step !== 'pending' || !draftId) return
     const localId = draftId
@@ -153,19 +177,37 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   }, [draftId, step])
 
   // Once the task is created, watch its backfill progress for completion and
-  // hand off to the task's own page. Keyed on this task's own progress entry
-  // (not the whole `backfill` record) so unrelated tasks' progress updates
-  // don't re-run this effect, and guarded by navigatedRef so it fires at most
-  // once even if `progress` changes again after done=true.
+  // hand off — to the task's own page in tracker mode, or back to the caller
+  // in bucket mode (there is no per-bucket detail page to navigate to).
+  // Keyed on this task's own progress entry (not the whole `backfill` record)
+  // so unrelated tasks' progress updates don't re-run this effect, and
+  // guarded by navigatedRef so it fires at most once even if `progress`
+  // changes again after done=true.
+  //
+  // This relies on TasksProvider's task_backfill_progress SSE handler
+  // recording `backfill[taskId]` unconditionally by task_id, with no check
+  // against its (tracker-only) task list — confirmed by reading
+  // state/TasksProvider.tsx: `setBackfill(prev => ({ ...prev, [e.task_id]:
+  // ... }))` never consults `byId`/`known`. So a bucket task id — never
+  // present in that list — still gets its progress recorded here, and this
+  // effect's `backfill[taskId]` read works unchanged for bucket mode. (The
+  // handler's `if (e.done) void loadDetail(e.task_id)` follow-up also
+  // resolves fine for a bucket id — GET /api/tasks/{id} has no kind filter —
+  // but is a no-op for the tracker list since `setTasks`'s `.map` only
+  // transforms existing entries, never inserts new ones.)
   const progress = taskId ? backfill[taskId] : undefined
   useEffect(() => {
     if (step !== 'creating' || !taskId || navigatedRef.current) return
     if (progress?.done) {
       navigatedRef.current = true
-      navigate(`/tasks/${taskId}`)
+      if (kind === 'bucket') {
+        onCreated?.(taskId)
+      } else {
+        navigate(`/tasks/${taskId}`)
+      }
       onClose()
     }
-  }, [step, taskId, progress?.done, navigate, onClose])
+  }, [step, taskId, progress?.done, navigate, onClose, kind, onCreated])
 
   async function startDraft() {
     setStartError(null)
@@ -196,14 +238,18 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   }
 
   async function submit() {
-    if (!stateSchema || submitting) return
+    if (submitting) return
+    // Tracker mode requires a schema (SchemaEditor keeps it non-null past the
+    // review step); bucket mode never has one — see applyDraft.
+    if (kind === 'tracker' && !stateSchema) return
     setSubmitting(true)
     setCreateError(null)
     try {
       const positives = examples.filter(e => e.choice === 'positive').map(toExampleIn)
       const negatives = examples.filter(e => e.choice === 'near_miss').map(toExampleIn)
       const task = await createTask({
-        name, goal: goal.trim(), description, state_schema: trimStateSchema(stateSchema),
+        name, goal: goal.trim(), description, kind,
+        state_schema: stateSchema ? trimStateSchema(stateSchema) : null,
         keyword_probes: keywordProbes, confirmed_positives: positives, confirmed_negatives: negatives,
       })
       setTaskId(task.id)
@@ -222,17 +268,18 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
   return (
     <Backdrop onClose={onClose}>
       <div style={modalStyle}>
-        <h3 style={{ margin: 0 }}>new task</h3>
+        <h3 style={{ margin: 0 }}>{kind === 'bucket' ? 'New bucket' : 'new task'}</h3>
 
         {step === 'form' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 16 }}>
             {startError && <div style={errorBannerStyle}>{startError}</div>}
             <label style={fieldLabelStyle}>
-              <span>what do you want to track?</span>
+              <span>{kind === 'bucket' ? 'What should this bucket catch?' : 'what do you want to track?'}</span>
               <textarea
                 style={textareaStyle}
                 rows={4}
-                placeholder="I'm job hunting — track every company I'm in process with…"
+                placeholder={kind === 'bucket' ? undefined
+                  : "I'm job hunting — track every company I'm in process with…"}
                 value={goal}
                 onChange={e => setGoal(e.target.value)}
               />
@@ -260,7 +307,11 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {step === 'review' && stateSchema && (
+        {/* Tracker mode's gate is unchanged: stateSchema is only non-null once
+            applyDraft has run, so this also holds the step on 'review' until
+            a draft has actually landed. Bucket mode never sets stateSchema
+            (see applyDraft), so it gates on the step alone. */}
+        {step === 'review' && (kind === 'bucket' || stateSchema) && (
           <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 20 }}>
             {createError && <div style={errorBannerStyle}>{createError}</div>}
             <label style={fieldLabelStyle}>
@@ -275,7 +326,9 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
               />
             </label>
 
-            <SchemaEditor value={stateSchema} onChange={setStateSchema} />
+            {/* Bucket mode skips the EPS schema step entirely — a bucket has
+                no pipeline/entity state, only criteria (see applyDraft). */}
+            {kind === 'tracker' && stateSchema && <SchemaEditor value={stateSchema} onChange={setStateSchema} />}
 
             <div>
               <div style={{ fontSize: 12, color: '#666', marginBottom: 12 }}>{HINT}</div>
@@ -285,7 +338,9 @@ export function NewTaskWizard({ onClose }: { onClose: () => void }) {
             </div>
 
             <div style={{ display: 'flex', gap: 8 }}>
-              <button disabled={submitting} onClick={() => void submit()}>create task</button>
+              <button disabled={submitting} onClick={() => void submit()}>
+                {kind === 'bucket' ? 'create bucket' : 'create task'}
+              </button>
               <button onClick={onClose}>cancel</button>
             </div>
           </div>
