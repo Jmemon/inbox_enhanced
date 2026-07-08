@@ -21,7 +21,8 @@ log = logging.getLogger(__name__)
 QUEUE_MAXSIZE = 100
 # Tighter than the original 20s: Railway's edge / browser idle-killers
 # sometimes close streams that go quiet for tens of seconds, especially
-# during long-running worker tasks (reclassify_user_inbox can run ~110s).
+# during long-running worker tasks (a tracker's or bucket's backfill_task
+# can run well over a minute scanning a large stored inbox).
 # Cheap insurance — a keepalive frame is just `: keepalive\n\n`.
 HEARTBEAT_SECONDS = 5
 ACTIVE_USERS_TTL_SECONDS = 60
