@@ -707,6 +707,22 @@ def test_list_pending_events_for_user_respects_limit(two_users):
     assert [e.id for e, _ in pairs] == list(reversed(ids))[:2]
 
 
+def test_list_pending_events_for_user_excludes_bucket_kind_tasks(two_users):
+    """Defense-in-depth (final-review wave): a bucket-kind task can't
+    structurally acquire an event today (no extraction ever runs against
+    one), but simulate the impossible state directly -- bypassing the
+    normal write path -- to prove the query's own Task.kind == 'tracker'
+    filter holds even if that invariant were ever broken elsewhere."""
+    bucket = _mk_task(two_users, uid="u1", kind="bucket")
+    two_users.commit()
+    entity = _mk_entity(two_users, bucket)
+    repo.append_event(two_users, task=bucket, entity=entity, origin="llm",
+                       status="pending_review", field="stage", new_value="x")
+    two_users.commit()
+
+    assert repo.list_pending_events_for_user(two_users, user_id="u1") == []
+
+
 def test_list_recent_events_for_user_returns_only_non_pending_newest_first(two_users):
     task = _mk_task(two_users, uid="u1")
     two_users.commit()
@@ -775,6 +791,19 @@ def test_list_recent_events_for_user_respects_limit(two_users):
 
     pairs = repo.list_recent_events_for_user(two_users, user_id="u1", limit=2)
     assert [e.id for e, _ in pairs] == list(reversed(ids))[:2]
+
+
+def test_list_recent_events_for_user_excludes_bucket_kind_tasks(two_users):
+    """Same defense-in-depth probe as the pending feed's own bucket-kind
+    test, for the activity feed."""
+    bucket = _mk_task(two_users, uid="u1", kind="bucket")
+    two_users.commit()
+    entity = _mk_entity(two_users, bucket)
+    repo.append_event(two_users, task=bucket, entity=entity, origin="llm",
+                       status="applied", field="stage", new_value="x")
+    two_users.commit()
+
+    assert repo.list_recent_events_for_user(two_users, user_id="u1") == []
 
 
 def test_get_entity_display_names_batch_resolves(two_users):

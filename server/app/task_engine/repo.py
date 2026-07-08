@@ -465,6 +465,8 @@ def list_pending_events_for_user(
         .where(
             Task.user_id == user_id,
             Task.is_deleted == False,  # noqa: E712
+            # defense-in-depth: bucket-kind tasks structurally have no events; keep the feeds tracker-only by construction
+            Task.kind == "tracker",
             TaskEvent.status == "pending_review",
         )
         .order_by(TaskEvent.created_at.desc())
@@ -486,6 +488,8 @@ def list_recent_events_for_user(
         .where(
             Task.user_id == user_id,
             Task.is_deleted == False,  # noqa: E712
+            # defense-in-depth: bucket-kind tasks structurally have no events; keep the feeds tracker-only by construction
+            Task.kind == "tracker",
             TaskEvent.status != "pending_review",
         )
         .order_by(TaskEvent.created_at.desc())

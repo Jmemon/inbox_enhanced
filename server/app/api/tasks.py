@@ -491,6 +491,12 @@ def list_task_threads(task_id: str, user: User = Depends(get_current_user),
 def attach_thread(task_id: str, body: _AttachThreadBody, user: User = Depends(get_current_user),
                   db: Session = Depends(get_db)) -> dict:
     task = _require_owned_task(db, user_id=user.id, task_id=task_id)
+    if task.kind != "tracker":
+        # kind isolation (spec §4.1): bucket-kind tasks NEVER get
+        # task_thread_links — get_owned_task/_require_owned_task resolve by
+        # id alone, with no kind filter, so this is the guard that actually
+        # enforces it against a hand-crafted request.
+        raise HTTPException(422, "thread links are tracker-only")
     thread = inbox_repo.get_thread(db, user_id=user.id, thread_id=body.thread_id)
     if thread is None:
         raise HTTPException(404, "not found")
@@ -533,6 +539,10 @@ def detach_thread(task_id: str, thread_id: str, add_example: bool = Query(defaul
                   user: User = Depends(get_current_user),
                   db: Session = Depends(get_db)) -> None:
     task = _require_owned_task(db, user_id=user.id, task_id=task_id)
+    if task.kind != "tracker":
+        # Same kind isolation as attach_thread above — a bucket-kind task
+        # can have no task_thread_link to detach in the first place.
+        raise HTTPException(422, "thread links are tracker-only")
     thread = inbox_repo.get_thread(db, user_id=user.id, thread_id=thread_id)
     if thread is None:
         raise HTTPException(404, "not found")

@@ -947,6 +947,35 @@ def test_detach_other_users_thread_404(authed):
 
 
 # ---------------------------------------------------------------------------
+# kind isolation (spec §4.1, final-review wave): bucket-kind tasks NEVER get
+# task_thread_links. _require_owned_task/get_owned_task resolve a task_id
+# with no kind filter, so a hand-crafted request against a bucket-kind
+# task_id must be rejected explicitly by attach/detach themselves.
+# ---------------------------------------------------------------------------
+
+
+def test_attach_thread_to_bucket_kind_task_422(authed):
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Bucket1", kind="bucket")
+    thread_id = _seed_thread(TS, gmail_thread_id="gBucketAttach")
+
+    r = c.post(f"/api/tasks/{bucket_id}/threads", json={"thread_id": thread_id})
+    assert r.status_code == 422
+
+    db = TS()
+    assert task_repo.list_attached_thread_ids(db, task_id=bucket_id) == set()
+
+
+def test_detach_thread_from_bucket_kind_task_422(authed):
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Bucket1", kind="bucket")
+    thread_id = _seed_thread(TS, gmail_thread_id="gBucketDetach")
+
+    r = c.delete(f"/api/tasks/{bucket_id}/threads/{thread_id}")
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # Task 2 (spec §4.6 learning loop): attach/detach feed corrections into
 # task.criteria as tagged examples
 # ---------------------------------------------------------------------------
