@@ -340,6 +340,62 @@ def test_get_task_404_other_user_or_missing(authed):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/tasks?kind= (Phase 4 Task 3): buckets share this table now
+# (Phase 4 Task 1), so the list route must explicitly separate the HUD's
+# task grid (tracker-only) from the bucket-backed views built on top of the
+# same endpoint.
+# ---------------------------------------------------------------------------
+
+
+def test_list_tasks_default_and_explicit_tracker_exclude_bucket_kind(authed):
+    c, TS = authed
+    tracker_id = _mk_task(TS, name="Tracker1")
+    bucket_id = _mk_schemaless_task(TS, name="Bucket1", kind="bucket")
+
+    for query in ("", "?kind=tracker"):
+        r = c.get(f"/api/tasks{query}")
+        assert r.status_code == 200
+        ids = {t["id"] for t in r.json()["tasks"]}
+        assert tracker_id in ids
+        assert bucket_id not in ids
+
+
+def test_list_tasks_kind_bucket_includes_defaults_and_extra_fields(authed):
+    c, TS = authed
+    tracker_id = _mk_task(TS, name="Tracker1")
+    bucket_id = _mk_schemaless_task(TS, name="Bucket1", kind="bucket")
+    db = TS()
+    default_bucket = task_repo.create_task(
+        db, user_id=None, name="Default", goal="", criteria="default criteria",
+        state_schema=None, kind="bucket",
+    )
+    db.commit()
+    default_bucket_id = default_bucket.id
+    db.close()
+
+    r = c.get("/api/tasks?kind=bucket")
+    assert r.status_code == 200
+    items = {t["id"]: t for t in r.json()["tasks"]}
+    assert tracker_id not in items
+    assert bucket_id in items and default_bucket_id in items
+    assert items[bucket_id]["criteria"] == "criteria text"
+    assert items[bucket_id]["is_default"] is False
+    assert items[default_bucket_id]["is_default"] is True
+
+    # Trackers never pay the kind-conditional criteria/is_default payload.
+    tracker_item = next(
+        t for t in c.get("/api/tasks?kind=tracker").json()["tasks"] if t["id"] == tracker_id
+    )
+    assert "criteria" not in tracker_item
+    assert "is_default" not in tracker_item
+
+
+def test_list_tasks_invalid_kind_422(authed):
+    c, TS = authed
+    assert c.get("/api/tasks?kind=whatever").status_code == 422
+
+
+# ---------------------------------------------------------------------------
 # stage_counts (Phase 3 Task 2): a histogram folded into the summary at zero
 # extra queries -- computed from the same list_entities() result _serialize_
 # summary already fetches.

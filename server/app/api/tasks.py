@@ -114,7 +114,17 @@ def _serialize_task(task) -> dict:
 
 
 def _serialize_task_list_item(db: Session, task) -> dict:
-    return {**_serialize_task(task), "summary": _serialize_summary(db, task=task)}
+    item = {**_serialize_task(task), "summary": _serialize_summary(db, task=task)}
+    if task.kind == "bucket":
+        # Kind-conditional extras (Phase 4 Task 3): GET /api/tasks?kind=bucket
+        # is the task-backed replacement for the old dedicated bucket list,
+        # so its rows must carry the same criteria/is_default fields that
+        # shape once had. Trackers never pay this — criteria can grow to
+        # EXAMPLE_CAP=30 learning-loop examples and, like the detail-only
+        # criteria field above, has no place in a lean tracker list row.
+        item["criteria"] = task.criteria
+        item["is_default"] = task.user_id is None
+    return item
 
 
 def _serialize_task_detail(db: Session, task) -> dict:
@@ -267,8 +277,22 @@ class _PatchTaskBody(BaseModel):
 
 
 @router.get("/tasks")
-def list_tasks(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
-    rows = task_repo.list_tasks(db, user_id=user.id)
+def list_tasks(
+    kind: str | None = Query(default=None),
+    user: User = Depends(get_current_user), db: Session = Depends(get_db),
+) -> dict:
+    """Phase 4 Task 3: `kind` narrows which half of the now-shared `tasks`
+    table this returns. `None`/`"tracker"` -> tracker-only, explicitly (not
+    just the historical default) -- buckets share this table now (Phase 4
+    Task 1) and must never leak into the HUD's task grid. `"bucket"` ->
+    `list_active_buckets` (defaults included), the task-backed replacement
+    for the old dedicated bucket list. Anything else -> 422."""
+    if kind is not None and kind not in ("tracker", "bucket"):
+        raise HTTPException(422, "kind must be 'tracker' or 'bucket'")
+    if kind == "bucket":
+        rows = task_repo.list_active_buckets(db, user_id=user.id)
+    else:
+        rows = task_repo.list_tasks(db, user_id=user.id, kind="tracker")
     return {"tasks": [_serialize_task_list_item(db, t) for t in rows]}
 
 

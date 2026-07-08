@@ -44,9 +44,13 @@ def authed(tmp_path):
 
 
 def test_full_lifecycle(authed):
-    # GET shows defaults
+    # GET shows defaults, list shape matches the old bucket contract
+    # byte-for-byte: {id, name, criteria, is_default}.
     r = authed.get("/api/buckets")
-    assert r.status_code == 200 and any(b["name"] == "Important" for b in r.json()["buckets"])
+    assert r.status_code == 200
+    default = next(b for b in r.json()["buckets"] if b["name"] == "Important")
+    assert default["is_default"] is True
+    assert set(default.keys()) == {"id", "name", "criteria", "is_default"}
 
     # POST creates
     r = authed.post("/api/buckets", json={
@@ -57,6 +61,7 @@ def test_full_lifecycle(authed):
     })
     assert r.status_code == 201
     bid = r.json()["id"]
+    assert r.json()["is_default"] is False
     assert "<positive>" in r.json()["criteria"]
 
     # PATCH renames
@@ -67,6 +72,35 @@ def test_full_lifecycle(authed):
     assert authed.delete(f"/api/buckets/{bid}").status_code == 204
     listed = authed.get("/api/buckets").json()["buckets"]
     assert all(b["id"] != bid for b in listed)
+
+
+def test_delete_is_idempotent(authed):
+    """Shim contract: a second DELETE on a bucket this user already deleted
+    is a silent 204 no-op, not a 404 -- distinct from the never-existed/
+    other-user cases, which stay 404/403."""
+    c = authed
+    r = c.post("/api/buckets", json={"name": "Once", "description": "d"})
+    bid = r.json()["id"]
+    assert c.delete(f"/api/buckets/{bid}").status_code == 204
+    assert c.delete(f"/api/buckets/{bid}").status_code == 204
+
+
+def test_draft_preview_routes_deleted(authed):
+    """Phase 4 Task 3: the draft-preview machinery (POST/GET .../draft/
+    preview*) and its preview_cache backing are gone entirely, superseded by
+    the task engine's own goal->draft flow (POST /api/tasks/draft). Neither
+    path matches any surviving route in app/api/buckets.py -- the POST falls
+    through to app.main's GET-only SPA catch-all, which matches the path but
+    not the method (405, Starlette's standard "path exists, wrong verb"
+    response); the polling GET falls through to that same catch-all's own
+    explicit `api/`-prefix 404. NewBucketModal's existing `gone` polling
+    handler already treats the GET path's 404 this way, so this is safe for
+    the one-release shim window."""
+    c = authed
+    assert c.post("/api/buckets/draft/preview", json={
+        "name": "X", "description": "d", "exclude_thread_ids": [],
+    }).status_code == 405
+    assert c.get("/api/buckets/draft/preview/some-draft-id").status_code == 404
 
 
 def test_403_on_default_and_other_user(authed):
