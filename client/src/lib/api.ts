@@ -152,87 +152,11 @@ export async function requestRefresh(): Promise<void> {
 }
 
 // --- Bucket types ---
+// Bucket is now the client-side mapped shape of a `GET /api/tasks?kind=bucket`
+// list item (buckets are tasks(kind='bucket'), see reference/); BucketExampleIn
+// is still reused as the confirmed_positives/negatives element for createTask.
 export type Bucket = { id: string; name: string; criteria: string; is_default: boolean }
 export type BucketExampleIn = { sender: string; subject: string; snippet: string; rationale: string }
-
-// --- Bucket calls ---
-export function getBuckets(): Promise<{ buckets: Bucket[] }> {
-  return getJSON<{ buckets: Bucket[] }>('/api/buckets')
-}
-
-export async function createBucket(body: {
-  name: string; description: string;
-  confirmed_positives: BucketExampleIn[]; confirmed_negatives: BucketExampleIn[];
-}): Promise<Bucket> {
-  const r = await fetch('/api/buckets', {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-  })
-  if (!r.ok) throw new Error(`create bucket: ${r.status}`)
-  return r.json()
-}
-
-export async function patchBucket(id: string, name: string): Promise<Bucket> {
-  const r = await fetch(`/api/buckets/${encodeURIComponent(id)}`, {
-    method: 'PATCH', credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
-  })
-  if (!r.ok) throw new Error(`rename bucket: ${r.status}`)
-  return r.json()
-}
-
-export async function deleteBucket(id: string): Promise<void> {
-  const r = await fetch(`/api/buckets/${encodeURIComponent(id)}`, {
-    method: 'DELETE', credentials: 'same-origin',
-  })
-  if (r.status !== 204) throw new Error(`delete bucket: ${r.status}`)
-}
-
-export async function postBucketDraftPreview(body: {
-  name: string; description: string; exclude_thread_ids?: string[];
-}): Promise<{ draft_id: string }> {
-  const r = await fetch('/api/buckets/draft/preview', {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ exclude_thread_ids: [], ...body }),
-  })
-  if (r.status !== 202) throw new Error(`draft preview: ${r.status}`)
-  return r.json()
-}
-
-export type DraftPreviewPoll =
-  | { status: 'pending' }
-  | { status: 'ready'; positives: PreviewExample[]; near_misses: PreviewExample[] }
-  | { status: 'gone' }   // 404: TTL expired or unknown draft_id
-
-// Polling fallback for the SSE-pushed bucket_draft_preview event. The worker
-// caches its result in redis with a 600s TTL keyed on draft_id; this hits
-// that cache directly so a lost SSE frame doesn't strand the modal.
-export async function getBucketDraftPreview(draft_id: string): Promise<DraftPreviewPoll> {
-  const url = `/api/buckets/draft/preview/${encodeURIComponent(draft_id)}`
-  const t0 = performance.now()
-  const r = await fetch(url, { credentials: 'same-origin' })
-  const ms = Math.round(performance.now() - t0)
-  if (r.status === 202) {
-    console.log('[api] poll', url, '→ pending', ms, 'ms')
-    return { status: 'pending' }
-  }
-  if (r.status === 200) {
-    const body = await r.json() as {
-      status: 'ready'; positives: PreviewExample[]; near_misses: PreviewExample[]
-    }
-    console.log('[api] poll', url, '→ ready (+',
-                body.positives.length, 'positives, +',
-                body.near_misses.length, 'near-misses) in', ms, 'ms')
-    return body
-  }
-  if (r.status === 404) {
-    console.warn('[api] poll', url, '→ 404 (gone) in', ms, 'ms')
-    return { status: 'gone' }
-  }
-  console.error('[api] poll', url, '→', r.status, ms, 'ms')
-  throw new Error(`draft preview poll: ${r.status}`)
-}
 
 export async function postInboxExtend(beforeInternalDate: number): Promise<void> {
   const r = await fetch('/api/inbox/extend', {
@@ -262,7 +186,13 @@ export type TaskSummary = {
   // Consumers must preserve insertion order (plain Object.entries), not sort.
   stage_counts: Record<string, number>
 }
-export type Task = { id: string; name: string; goal: string; kind: string; status: 'active' | 'paused'; version: number; summary: TaskSummary }
+// criteria/is_default are kind-conditional extras _serialize_task_list_item
+// only adds for kind='bucket' rows (GET /api/tasks?kind=bucket) — absent on
+// tracker rows, hence optional here.
+export type Task = {
+  id: string; name: string; goal: string; kind: string; status: 'active' | 'paused'; version: number
+  summary: TaskSummary; criteria?: string; is_default?: boolean
+}
 export type TaskStateSchema = {
   version: number
   entity: { noun: string; identity_hint: string; attributes: { key: string; type: string; values?: string[] | null }[] } | null
@@ -350,7 +280,8 @@ async function throwWithDetail(r: Response, fallback: string): Promise<never> {
 }
 
 export async function createTask(body: {
-  name: string; goal: string; description: string; state_schema: TaskStateSchema;
+  name: string; goal: string; description: string; state_schema: TaskStateSchema | null;
+  kind?: 'tracker' | 'bucket';
   keyword_probes: string[]; confirmed_positives: BucketExampleIn[]; confirmed_negatives: BucketExampleIn[];
 }): Promise<TaskDetail> {
   // POST /api/tasks 201s with the full task-detail body (_serialize_task_detail
@@ -365,8 +296,12 @@ export async function createTask(body: {
   return r.json()
 }
 
-export function getTasks(): Promise<{ tasks: Task[] }> {
-  return getJSON<{ tasks: Task[] }>('/api/tasks')
+// kind='bucket' -> GET /api/tasks?kind=bucket, the task-backed replacement
+// for the old dedicated bucket list (defaults included). No-arg call sites
+// (the tracker HUD grid) are unchanged: `kind` omitted -> tracker-only.
+export function getTasks(opts: { kind?: 'bucket' } = {}): Promise<{ tasks: Task[] }> {
+  const qs = opts.kind ? `?kind=${opts.kind}` : ''
+  return getJSON<{ tasks: Task[] }>(`/api/tasks${qs}`)
 }
 
 export function getTask(id: string): Promise<TaskDetail> {
