@@ -1,8 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
-import { subscribeSse, type PreviewExample } from '../../lib/sse'
+import type { PreviewExample } from '../../lib/sse'
 import {
-  postBucketDraftPreview, getBucketDraftPreview,
   type Bucket, type BucketExampleIn,
 } from '../../lib/api'
 
@@ -11,11 +10,19 @@ type ExampleState = PreviewExample & { initial: Exclude<Choice, 'rejected'>; cho
 
 const HINT = "We recommend confirming at least 2 positives + 2 near-misses before saving — but it's not required."
 
+const PREVIEW_UNAVAILABLE =
+  'Example preview is unavailable in this build — bucket creation is moving to the task wizard.'
 
 // onSave is owned by Home's useBuckets instance so its bucket list refreshes
 // after creation. Calling useBuckets() here would create a separate state
 // instance that nobody renders from, leaving the toolbar/filter dropdown
 // stale until a page reload.
+//
+// Phase 4 Task 4: the draft-preview backend this modal relied on (POST/GET
+// /api/buckets/draft/preview + the bucket_draft_preview SSE event) was
+// deleted in Task 3. This whole modal is dead code walking — Task 5 replaces
+// bucket creation with the task wizard — so startPreview/moreExamples below
+// are stubbed to an inline error instead of restoring the deleted backend.
 export function NewBucketModal({ onClose, onSave }: {
   onClose: () => void
   onSave: (body: {
@@ -23,87 +30,21 @@ export function NewBucketModal({ onClose, onSave }: {
     confirmed_positives: BucketExampleIn[]; confirmed_negatives: BucketExampleIn[]
   }) => Promise<Bucket>
 }) {
-  const [step, setStep] = useState<'form' | 'pending' | 'review'>('form')
+  // Never transitions past 'form' now that startPreview/moreExamples are
+  // stubbed below — 'pending'/'review' JSX is unreachable dead code, kept
+  // only because this whole modal is replaced in Task 5.
+  const [step] = useState<'form' | 'pending' | 'review'>('form')
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
-  const [draftId, setDraftId] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [examples, setExamples] = useState<ExampleState[]>([])
-  const seenIds = examples.map(e => e.thread_id)
-
-  // Idempotent apply: a result for a given draft_id can arrive via SSE OR
-  // via the polling fallback (or both, in either order). appliedRef ensures
-  // we only push examples + flip step once per draft_id.
-  const appliedRef = useRef<Set<string>>(new Set())
-
-  function applyPreview(forDraftId: string,
-                        positives: PreviewExample[], nearMisses: PreviewExample[]) {
-    if (appliedRef.current.has(forDraftId)) return
-    appliedRef.current.add(forDraftId)
-    const newOnes: ExampleState[] = [
-      ...positives.map(ex => ({ ...ex, initial: 'positive' as const, choice: 'positive' as const })),
-      ...nearMisses.map(ex => ({ ...ex, initial: 'near_miss' as const, choice: 'near_miss' as const })),
-    ]
-    setExamples(prev => [...prev, ...newOnes])
-    setStep('review')
-  }
-
-  // Fast path: SSE push when the worker publishes.
-  useEffect(() => {
-    return subscribeSse((e) => {
-      if (e.event !== 'bucket_draft_preview' || e.draft_id !== draftId) return
-      applyPreview(e.draft_id, e.positives, e.near_misses)
-    })
-  }, [draftId])
-
-  // Safety net: poll the cache every 5s while pending. SSE-delivery loss
-  // (connection blip during the ~40s scoring window, browser tab throttling,
-  // redis pubsub having no subscriber at the publish moment) used to make
-  // this feature ~50/50; polling decouples correctness from connection life.
-  // Stops on success, on draftId change (user clicked "more examples"),
-  // or on unmount.
-  useEffect(() => {
-    if (step !== 'pending' || !draftId) return
-    const localId = draftId
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-
-    async function tick() {
-      if (cancelled || appliedRef.current.has(localId)) return
-      try {
-        const r = await getBucketDraftPreview(localId)
-        if (cancelled) return
-        if (r.status === 'ready') {
-          applyPreview(localId, r.positives, r.near_misses)
-          return
-        }
-        if (r.status === 'gone') {
-          console.warn('[bucket draft preview] cache expired before result arrived')
-          return  // give up; user can click "find examples" again
-        }
-      } catch (e) {
-        console.error('[bucket draft preview] poll failed', e)
-      }
-      timer = setTimeout(tick, 5000)
-    }
-
-    // Start at 5s — let SSE win on the happy path (~40s scoring), and only
-    // burn HTTP requests if SSE doesn't deliver.
-    timer = setTimeout(tick, 5000)
-
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [draftId, step])
 
   async function startPreview() {
-    const { draft_id } = await postBucketDraftPreview({ name, description, exclude_thread_ids: seenIds })
-    setDraftId(draft_id); setStep('pending')
+    setError(PREVIEW_UNAVAILABLE)
   }
 
   async function moreExamples() {
-    const { draft_id } = await postBucketDraftPreview({ name, description, exclude_thread_ids: seenIds })
-    setDraftId(draft_id); setStep('pending')
+    setError(PREVIEW_UNAVAILABLE)
   }
 
   function setChoice(threadId: string, choice: Choice) {
@@ -140,6 +81,7 @@ export function NewBucketModal({ onClose, onSave }: {
                 onChange={e => setDescription(e.target.value)}
               />
             </label>
+            {error && <div style={{ color: '#8a1c25', fontSize: 13 }}>{error}</div>}
             <div style={{ display: 'flex', gap: 8 }}>
               <button disabled={!name || !description} onClick={startPreview}>find examples</button>
               <button onClick={onClose}>cancel</button>
