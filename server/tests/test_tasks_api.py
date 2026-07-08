@@ -191,6 +191,66 @@ def test_create_task_invalid_schema_422(authed):
     assert "stage" in r.json()["detail"]
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 Task 2: kind-aware creation -- 'tracker' (default) requires a
+# state_schema, 'bucket' must not have one.
+# ---------------------------------------------------------------------------
+
+
+def test_create_tracker_missing_schema_422(authed):
+    c, TS = authed
+    r = c.post("/api/tasks", json={
+        "name": "Job hunt", "goal": "land a job", "description": "tracks companies",
+    })
+    assert r.status_code == 422
+    assert r.json()["detail"] == "state_schema is required for tracker tasks"
+
+
+def test_create_tracker_explicit_kind_missing_schema_422(authed):
+    c, TS = authed
+    r = c.post("/api/tasks", json={
+        "name": "Job hunt", "goal": "land a job", "description": "tracks companies",
+        "kind": "tracker",
+    })
+    assert r.status_code == 422
+    assert r.json()["detail"] == "state_schema is required for tracker tasks"
+
+
+def test_create_bucket_with_schema_422(authed):
+    c, TS = authed
+    r = c.post("/api/tasks", json={
+        "name": "Newsletters", "goal": "organize newsletters",
+        "description": "bucket for newsletters", "kind": "bucket",
+        "state_schema": SINGLETON_SCHEMA,
+    })
+    assert r.status_code == 422
+    assert r.json()["detail"] == "bucket tasks cannot have a state_schema"
+
+
+def test_create_bucket_success_has_null_schema_and_enqueues_backfill(authed, monkeypatch):
+    c, TS = authed
+    captured = _capture_publish(monkeypatch)
+    with patch("app.api.tasks.task_engine_tasks.backfill_task.apply_async") as mock_apply:
+        r = c.post("/api/tasks", json={
+            "name": "Newsletters", "goal": "organize newsletters",
+            "description": "bucket for newsletters", "kind": "bucket",
+        })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["kind"] == "bucket"
+    assert body["state_schema"] is None
+    assert body["status"] == "active"
+
+    # keyword_probes defaults to [] when omitted -- same field as the tracker
+    # create path, just unused by a bucket's own wizard.
+    mock_apply.assert_called_once_with(
+        args=["u1", body["id"], []], countdown=0,
+    )
+    assert len(captured) == 1
+    assert captured[0] == ("u1", "task_updated",
+                          {"task_id": body["id"], "version": 1, "pending_count": 0})
+
+
 def test_create_task_success_enqueues_backfill_and_publishes(authed, monkeypatch):
     c, TS = authed
     captured = _capture_publish(monkeypatch)

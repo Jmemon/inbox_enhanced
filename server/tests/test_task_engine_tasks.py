@@ -846,3 +846,181 @@ def test_backfill_task_never_reattaches_user_detached_link(session_factory, fake
     # blocked the attach, so this thread never counted as matched.
     progress = [p for _, e, p in captured if e == "task_backfill_progress" and p["done"]]
     assert progress == [{"task_id": task_id, "scanned": 1, "matched": 0, "done": True}]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Task 2: backfill_task's kind='bucket' branch -- a pure
+# reclassification pass (no task_thread_links, no task_events, no
+# extraction). Reuses every fixture above; only new machinery is
+# _seed_bucket_task (a kind='bucket' task, state_schema=None like every real
+# bucket) and _fake_triage_capturing (a classify.triage() stand-in that
+# records each call's (buckets, trackers, current_bucket_ids) and resolves a
+# per-thread bucket pick by a marker substring in that thread's body_text --
+# _seed_backfill_thread hardcodes the same subject for every thread, so
+# picks can't be keyed by subject the way _backfill_llm_fake keys by stage).
+# ---------------------------------------------------------------------------
+
+
+def _seed_bucket_task(session_factory, *, user_id=USER_ID, name="Bucket") -> str:
+    db = session_factory()
+    task = task_repo.create_task(
+        db, user_id=user_id, name=name, goal="", criteria="bucket criteria",
+        state_schema=None, kind="bucket",
+    )
+    db.commit()
+    task_id = task.id
+    db.close()
+    return task_id
+
+
+def _fake_triage_capturing(calls: list, picks_by_marker: dict):
+    def _fake(threads, buckets, trackers, current_bucket_ids, *, user_id=None, task_id=None):
+        calls.append({
+            "buckets": list(buckets), "trackers": list(trackers),
+            "current_bucket_ids": list(current_bucket_ids),
+            "user_id": user_id, "task_id": task_id,
+        })
+        out = []
+        for parsed, cur in zip(threads, current_bucket_ids):
+            combined = " ".join(m.body_text for m in parsed.messages)
+            pick = cur  # stability default: no marker match keeps the current pick
+            for marker, bucket_id in picks_by_marker.items():
+                if marker in combined:
+                    pick = bucket_id
+                    break
+            out.append((pick, []))
+        return out
+    return _fake
+
+
+def test_backfill_bucket_writes_changed_bucket_ids_and_skips_unchanged(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+
+    _seed_backfill_thread(
+        session_factory, thread_id="bkA", gmail_thread_id="gbkA", message_gmail_id="mA",
+        body_text="MARKER-A receipt for your order.", last_activity_at=1000,
+    )
+    _seed_backfill_thread(
+        session_factory, thread_id="bkB", gmail_thread_id="gbkB", message_gmail_id="mB",
+        body_text="MARKER-B team meeting notes.", last_activity_at=2000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkA").bucket_id = "old-bucket"
+    db.get(InboxThread, "bkB").bucket_id = "unchanged-bucket"
+    db.commit()
+    db.close()
+
+    calls: list = []
+    fake = _fake_triage_capturing(
+        calls, picks_by_marker={"MARKER-A": bucket_id, "MARKER-B": "unchanged-bucket"},
+    )
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, None])
+
+    db2 = session_factory()
+    assert db2.get(InboxThread, "bkA").bucket_id == bucket_id  # pick differed -> written
+    assert db2.get(InboxThread, "bkB").bucket_id == "unchanged-bucket"  # pick matched -> untouched
+
+    # Stability hint: triage's current_bucket_ids must carry each thread's
+    # ACTUAL stored bucket_id at call time, not None/blank.
+    all_current = [cur for call in calls for cur in call["current_bucket_ids"]]
+    assert "old-bucket" in all_current
+    assert "unchanged-bucket" in all_current
+
+    for call in calls:
+        assert call["trackers"] == []  # bucket branch never passes trackers
+        assert call["task_id"] == bucket_id
+        # FULL active bucket set, new bucket included -- not just this one.
+        assert any(b.id == bucket_id for b in call["buckets"])
+
+
+def test_backfill_bucket_never_writes_links_events_or_extracts(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    _seed_backfill_thread(
+        session_factory, thread_id="bkC", gmail_thread_id="gbkC", message_gmail_id="mC",
+        body_text="MARKER-C receipt.", last_activity_at=1000,
+    )
+
+    calls: list = []
+    fake = _fake_triage_capturing(calls, picks_by_marker={"MARKER-C": bucket_id})
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+
+    def _extract_should_not_run(*args, **kwargs):
+        raise AssertionError("extract_for_pair must never run for a bucket-kind backfill")
+    monkeypatch.setattr(task_engine_tasks, "extract_for_pair", _extract_should_not_run)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, None])
+
+    db = session_factory()
+    assert task_repo.list_attached_thread_ids(db, task_id=bucket_id) == set()
+    assert task_repo.list_events(db, task_id=bucket_id) == []
+    assert db.get(InboxThread, "bkC").bucket_id == bucket_id  # the reclassify itself still happened
+
+
+def test_backfill_bucket_uses_recency_fallback_when_probes_empty(
+    session_factory, fake_redis, monkeypatch,
+):
+    """A bucket backfill is always enqueued with keyword_probes=[] (see
+    api/buckets.py's POST route) -- _backfill_candidate_pool's unconditional
+    recency-window union must still surface every stored thread for the
+    triage pass, same fallback the tracker branch relies on."""
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    _seed_backfill_thread(
+        session_factory, thread_id="bkD1", gmail_thread_id="gbkD1", message_gmail_id="mD1",
+        body_text="MARKER-D1 first thread.", last_activity_at=3000,
+    )
+    _seed_backfill_thread(
+        session_factory, thread_id="bkD2", gmail_thread_id="gbkD2", message_gmail_id="mD2",
+        body_text="MARKER-D2 second thread.", last_activity_at=2000,
+    )
+
+    calls: list = []
+    fake = _fake_triage_capturing(calls, picks_by_marker={})  # no picks -> nothing ever changes
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, []])
+
+    progress_done = [p for _, e, p in captured if e == "task_backfill_progress" and p["done"]]
+    # scanned=2 proves BOTH recency-window threads were triaged despite empty
+    # keyword_probes; matched=0 since no bucket pick ever changed.
+    assert progress_done == [{"task_id": bucket_id, "scanned": 2, "matched": 0, "done": True}]
+
+
+def test_backfill_bucket_publishes_threads_updated_then_terminal_progress_no_task_updated(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    _seed_backfill_thread(
+        session_factory, thread_id="bkE", gmail_thread_id="gbkE", message_gmail_id="mE",
+        body_text="MARKER-E receipt.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkE").bucket_id = "old-bucket"
+    db.commit()
+    db.close()
+
+    calls: list = []
+    fake = _fake_triage_capturing(calls, picks_by_marker={"MARKER-E": bucket_id})
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, None])
+
+    events = [(e, p) for _, e, p in captured]
+    assert events == [
+        ("threads_updated", {"thread_ids": ["bkE"]}),
+        ("task_backfill_progress", {"task_id": bucket_id, "scanned": 1, "matched": 1, "done": True}),
+    ]
+    # No final task_updated -- a bucket-kind task carries no task-engine
+    # board/event state for a client to refetch (unlike the tracker branch).
+    assert all(e != "task_updated" for e, _ in events)

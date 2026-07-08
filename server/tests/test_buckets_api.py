@@ -33,10 +33,12 @@ def authed(tmp_path):
     db.commit()
     sid = sessions.create_session(db, user_id="u1", ttl_seconds=600)
     c = TestClient(app); c.cookies.set("session", sid)
-    # POST /api/buckets enqueues reclassify_user_inbox; without a real broker,
-    # apply_async would fail. The lifecycle test only cares that the bucket
-    # was created — reclassification correctness is exercised separately.
-    with patch("app.api.buckets.tasks.reclassify_user_inbox.apply_async"):
+    # POST /api/buckets enqueues backfill_task (Phase 4 Task 2: buckets are
+    # tasks(kind='bucket'), backfilled the same way a fresh tracker is);
+    # without a real broker, apply_async would fail. The lifecycle test only
+    # cares that the bucket was created — backfill correctness is exercised
+    # separately (test_task_engine_tasks.py).
+    with patch("app.api.buckets.task_engine_tasks.backfill_task.apply_async"):
         yield c
     app.dependency_overrides.clear(); eng.dispose()
 
@@ -77,3 +79,18 @@ def test_403_on_default_and_other_user(authed):
 def test_unauth_returns_401():
     c = TestClient(app)
     assert c.get("/api/buckets").status_code == 401
+
+
+def test_post_enqueues_backfill_task_not_reclassify(authed):
+    """Phase 4 Task 2: POST /api/buckets must enqueue backfill_task for the
+    new bucket's own task id with empty keyword_probes (a bucket has no
+    LLM-proposed search terms the way a tracker wizard does) -- the old
+    reclassify_user_inbox enqueue is gone entirely."""
+    c = authed
+    with patch("app.api.buckets.task_engine_tasks.backfill_task.apply_async") as mock_apply:
+        r = c.post("/api/buckets", json={
+            "name": "Receipts", "description": "purchase receipts",
+        })
+    assert r.status_code == 201
+    bid = r.json()["id"]
+    mock_apply.assert_called_once_with(args=["u1", bid, []], countdown=0)

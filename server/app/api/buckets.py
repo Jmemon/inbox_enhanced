@@ -9,7 +9,7 @@ from app.db.models import User, Task
 from app.db.session import get_db
 from app.deps import get_current_user
 from app.inbox import bucket_repo, preview_cache
-from app.workers import tasks
+from app.workers import task_engine_tasks, tasks
 
 
 router = APIRouter(prefix="/api", tags=["buckets"])
@@ -69,11 +69,19 @@ def create_bucket(body: _CreateBody, user: User = Depends(get_current_user),
     )
     row = bucket_repo.create_custom(db, user_id=user.id, name=body.name, criteria=criteria)
     db.commit()
-    # Reclassify existing inbox threads against the new bucket set so the
-    # custom bucket can pick up matching threads that are already synced.
-    # Async — the user gets 201 immediately, the inbox view updates via the
-    # threads_updated SSE event when the worker finishes.
-    tasks.reclassify_user_inbox.apply_async(args=[user.id], countdown=0)
+    # Phase 4 Task 2: a bucket is now tasks(kind='bucket'), so a fresh custom
+    # bucket is backfilled the same way a fresh tracker is -- backfill_task's
+    # kind='bucket' branch reclassifies the user's stored inbox history
+    # against the new (full) bucket set so this bucket can pick up matching
+    # threads that are already synced. keyword_probes=[] -- a bucket has no
+    # LLM-proposed search terms the way a tracker's wizard does, so the
+    # FTS-probe prefilter degrades to backfill_task's recency-window fallback
+    # over the user's whole history. Async — the user gets 201 immediately,
+    # the inbox view updates via the threads_updated SSE event when the
+    # worker finishes.
+    task_engine_tasks.backfill_task.apply_async(
+        args=[user.id, row.id, []], countdown=0,
+    )
     return _serialize(row)
 
 
