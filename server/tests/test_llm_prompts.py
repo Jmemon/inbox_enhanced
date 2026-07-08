@@ -1,8 +1,12 @@
-from app.db.models import Bucket
+from datetime import datetime, timezone
+from app.db.models import Task
 from app.llm.prompts import classify_thread, score_thread
 
 
-def _b(id_, name): return Bucket(id=id_, user_id=None, name=name, criteria="x", is_deleted=False)
+def _b(id_, name):
+    return Task(id=id_, user_id=None, kind="bucket", name=name, goal="", criteria="x",
+               state_schema=None, status="active", version=1, is_deleted=False,
+               created_at=datetime.now(timezone.utc))
 
 
 def test_classify_user_message_includes_buckets_and_stability_hint_when_set():

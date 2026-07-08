@@ -6,7 +6,8 @@ classify(), stage="classify"), and gmail_sync._triage_batch (the zero-tracker
 regression guarantee: bucket wiring must match the old _classify_batch path)."""
 
 import pytest
-from app.db.models import Bucket, Task
+from datetime import datetime, timezone
+from app.db.models import Task
 from app.gmail.parser import ParsedMessage, ParsedThread
 from app.llm import classify as classify_mod, client as llm_client
 from app.llm.prompts import triage_thread
@@ -21,7 +22,9 @@ def _t(tid="gT1"):
 
 
 def _b(id_, name):
-    return Bucket(id=id_, user_id=None, name=name, criteria="x", is_deleted=False)
+    return Task(id=id_, user_id=None, kind="bucket", name=name, goal="", criteria="x",
+               state_schema=None, status="active", version=1, is_deleted=False,
+               created_at=datetime.now(timezone.utc))
 
 
 def _task(id_, name, criteria="tracks x"):

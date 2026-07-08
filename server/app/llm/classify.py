@@ -4,7 +4,7 @@ under the shared semaphore. Output preserves input order."""
 import asyncio
 import logging
 from app.config import get_settings
-from app.db.models import Bucket, Task
+from app.db.models import Task
 from app.gmail.parser import ParsedThread, thread_to_string
 from app.llm import client
 from app.llm.prompts import classify_thread, triage_thread
@@ -12,7 +12,7 @@ from app.llm.prompts import classify_thread, triage_thread
 log = logging.getLogger(__name__)
 
 
-async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_bucket_id: str | None,
+async def _classify_one(*, thread: ParsedThread, buckets: list[Task], current_bucket_id: str | None,
                         user_id: str | None = None) -> str | None:
     s = get_settings()
     # Stability hint references the current bucket by name, not opaque id, so
@@ -37,7 +37,7 @@ async def _classify_one(*, thread: ParsedThread, buckets: list[Bucket], current_
 
 
 def classify(
-    threads: list[ParsedThread], buckets: list[Bucket], current_bucket_ids: list[str | None],
+    threads: list[ParsedThread], buckets: list[Task], current_bucket_ids: list[str | None],
     *, user_id: str | None = None,
 ) -> list[str | None]:
     """No production callers as of Phase 2A (triage() replaced it on the sync
@@ -58,7 +58,7 @@ def classify(
 
 
 async def _triage_one(
-    *, thread: ParsedThread, buckets: list[Bucket], trackers: list[Task],
+    *, thread: ParsedThread, buckets: list[Task], trackers: list[Task],
     current_bucket_id: str | None, user_id: str | None = None,
     task_id: str | None = None,
 ) -> tuple[str | None, list[tuple[str, int]]]:
@@ -84,7 +84,7 @@ async def _triage_one(
 
 
 def triage(
-    threads: list[ParsedThread], buckets: list[Bucket], trackers: list[Task],
+    threads: list[ParsedThread], buckets: list[Task], trackers: list[Task],
     current_bucket_ids: list[str | None], *, user_id: str | None = None,
     task_id: str | None = None,
 ) -> list[tuple[str | None, list[tuple[str, int]]]]:

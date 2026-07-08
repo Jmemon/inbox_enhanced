@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import pytest
-from app.db.models import Bucket, Task
+from app.db.models import Task
 from app.gmail.parser import ParsedMessage, ParsedThread
 from app.llm import classify as classify_mod, client as llm_client
 
@@ -13,7 +13,10 @@ def _t(tid="gT1"):
     return ParsedThread(gmail_thread_id=tid, subject="s", recent_internal_date=1, messages=[m])
 
 
-def _b(id_, name): return Bucket(id=id_, user_id=None, name=name, criteria="x", is_deleted=False)
+def _b(id_, name):
+    return Task(id=id_, user_id=None, kind="bucket", name=name, goal="", criteria="x",
+               state_schema=None, status="active", version=1, is_deleted=False,
+               created_at=datetime.now(timezone.utc))
 
 
 def _task(id_, name):

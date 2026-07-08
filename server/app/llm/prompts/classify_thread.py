@@ -1,5 +1,5 @@
 import json
-from app.db.models import Bucket
+from app.db.models import Task
 
 
 SYSTEM_PROMPT = """You classify email threads into buckets defined by criteria.
@@ -17,7 +17,7 @@ or
 """
 
 
-def build_user_message(*, thread_str: str, buckets: list[Bucket], current_bucket_name: str | None) -> str:
+def build_user_message(*, thread_str: str, buckets: list[Task], current_bucket_name: str | None) -> str:
     blocks = "\n\n".join(
         f'<bucket name="{b.name}">\n{b.criteria}\n</bucket>'
         for b in buckets
@@ -31,7 +31,7 @@ def build_user_message(*, thread_str: str, buckets: list[Bucket], current_bucket
     return f"Available buckets:\n\n{blocks}\n\nThread to classify:\n\n{thread_str}{stability}"
 
 
-def parse_response(text: str, buckets: list[Bucket]) -> str | None:
+def parse_response(text: str, buckets: list[Task]) -> str | None:
     """Resolve the model's chosen bucket name to a bucket id using the same
     buckets list shown in the prompt. Returns None for null, unknown, or
     ambiguous (duplicate-name) responses — caller treats None as no-fit."""

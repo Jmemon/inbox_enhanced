@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from app.main import app
-from app.db.models import Base, User, Bucket
+from app.db.models import Base, User, Task
 from app.db.session import get_db
 from app.auth import sessions
 
@@ -24,8 +24,12 @@ def authed(tmp_path):
     db = TS()
     db.add(User(id="u1", email="a@b.com", created_at=datetime.now(timezone.utc)))
     db.add(User(id="u2", email="c@d.com", created_at=datetime.now(timezone.utc)))
-    db.add(Bucket(id="def", user_id=None, name="Important", criteria="x", is_deleted=False))
-    db.add(Bucket(id="other", user_id="u2", name="theirs", criteria="x", is_deleted=False))
+    db.add(Task(id="def", user_id=None, kind="bucket", name="Important", goal="",
+                criteria="x", state_schema=None, status="active", version=1,
+                is_deleted=False, created_at=datetime.now(timezone.utc)))
+    db.add(Task(id="other", user_id="u2", kind="bucket", name="theirs", goal="",
+                criteria="x", state_schema=None, status="active", version=1,
+                is_deleted=False, created_at=datetime.now(timezone.utc)))
     db.commit()
     sid = sessions.create_session(db, user_id="u1", ttl_seconds=600)
     c = TestClient(app); c.cookies.set("session", sid)
