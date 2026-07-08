@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { InboxList } from './InboxList'
 import { SecondaryHeader } from '../buckets/SecondaryHeader'
 import { ViewBucketsModal } from '../buckets/ViewBucketsModal'
-import { NewBucketModal } from '../buckets/NewBucketModal'
+import { NewTaskWizard } from '../task/NewTaskWizard'
 import { useInboxSearch } from '../search/useInboxSearch'
 import { SearchBar } from '../search/SearchBar'
 import { useInboxStore } from '../../state/InboxProvider'
@@ -14,21 +14,6 @@ export default function InboxPage() {
   const [showNew, setShowNew] = useState(false)
 
   const search = useInboxSearch()
-
-  // Reclassify watchdog: POST /api/buckets enqueues reclassify_user_inbox,
-  // which takes ~30-150s and publishes threads_updated when done. SSE
-  // delivery during long-running tasks is unreliable (subscribers can churn
-  // mid-task and pubsub is fire-and-forget), so schedule explicit resyncs at
-  // 60s + 150s. resync() doesn't toggle the loading flag, so it doesn't flash
-  // the list — it just merges the current server state into the display layer.
-  const createWithWatchdog = useCallback(async (
-    body: Parameters<typeof buckets.create>[0],
-  ) => {
-    const bucket = await buckets.create(body)
-    setTimeout(() => { void inbox.resync() }, 60_000)
-    setTimeout(() => { void inbox.resync() }, 150_000)
-    return bucket
-  }, [buckets.create, inbox])
 
   // Hydrate the current page when navigating to a page whose thread ids are
   // not yet in the display layer.
@@ -72,7 +57,14 @@ export default function InboxPage() {
 
       {showView && <ViewBucketsModal buckets={buckets.buckets} onClose={() => setShowView(false)}
                                        onRename={buckets.rename} onDelete={buckets.softDelete} />}
-      {showNew && <NewBucketModal onClose={() => setShowNew(false)} onSave={createWithWatchdog} />}
+      {/* Bucket creation goes through the task wizard (Phase 4 Task 5) — no
+          more watchdog resync here: bucket backfill (workers/task_engine_tasks.py's
+          kind='bucket' branch) publishes threads_updated deterministically on
+          completion, unlike the old fire-and-forget reclassify_user_inbox this
+          replaced. */}
+      {showNew && (
+        <NewTaskWizard kind="bucket" onCreated={() => buckets.refresh()} onClose={() => setShowNew(false)} />
+      )}
     </>
   )
 }
