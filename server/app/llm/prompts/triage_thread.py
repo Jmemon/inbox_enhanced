@@ -1,5 +1,5 @@
 import json
-from app.db.models import Bucket, Task
+from app.db.models import Task
 from app.llm.prompts import classify_thread
 
 
@@ -28,7 +28,7 @@ Output exactly one line of JSON, with no other text or code fences:
 
 
 def build_user_message(
-    *, thread_str: str, buckets: list[Bucket], trackers: list[Task],
+    *, thread_str: str, buckets: list[Task], trackers: list[Task],
     current_bucket_name: str | None,
 ) -> str:
     """Renders the bucket section identically to classify_thread's own
@@ -48,7 +48,7 @@ def build_user_message(
 
 
 def parse_response(
-    text: str, buckets: list[Bucket], trackers: list[Task],
+    text: str, buckets: list[Task], trackers: list[Task],
 ) -> tuple[str | None, list[tuple[str, int]]]:
     """Resolve the model's bucket pick + tracked-task relevance against the
     same buckets/trackers lists shown in the prompt.

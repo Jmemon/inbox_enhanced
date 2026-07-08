@@ -32,7 +32,7 @@ from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from app.config import get_settings
-from app.db.models import Bucket, InboxMessage, InboxThread, User
+from app.db.models import InboxMessage, InboxThread, User
 from app.inbox import inbox_repo, bucket_repo
 from app.llm.classify import triage
 from app.task_engine import repo as task_repo

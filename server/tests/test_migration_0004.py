@@ -35,7 +35,11 @@ def migrated_db(tmp_path):
     db_path = tmp_path / "mig.db"
     db_url = f"sqlite+pysqlite:///{db_path}"
     cfg = _alembic_cfg(db_url)
-    command.upgrade(cfg, "head")
+    # Pinned to this migration's own revision (not "head") — same rationale
+    # as test_migration_0003: this test is about 0004's behavior, not
+    # whatever the buckets table looks like at whatever head currently is.
+    # Load-bearing since Phase 4's 0009 drops the buckets table entirely.
+    command.upgrade(cfg, "0004_marketing_bucket")
     eng = create_engine(db_url, future=True)
     yield eng, cfg
     eng.dispose()

@@ -5,7 +5,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from app.db.models import User, Bucket
+from app.db.models import User, Task
 from app.db.session import get_db
 from app.deps import get_current_user
 from app.inbox import bucket_repo, preview_cache
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/api", tags=["buckets"])
 log = logging.getLogger(__name__)
 
 
-def _serialize(b: Bucket) -> dict:
+def _serialize(b: Task) -> dict:
     return {"id": b.id, "name": b.name, "criteria": b.criteria, "is_default": b.user_id is None}
 
 
@@ -38,7 +38,7 @@ class _PatchBody(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
 
-def _load_owned_or_403(db: Session, user_id: str, bucket_id: str) -> Bucket:
+def _load_owned_or_403(db: Session, user_id: str, bucket_id: str) -> Task:
     """Load a bucket the user can mutate (PATCH/DELETE). Default → 403,
     other-user → 403, missing/soft-deleted → 404."""
     b = bucket_repo.get_by_id(db, bucket_id)

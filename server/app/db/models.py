@@ -37,20 +37,6 @@ class UserSession(Base):
     user: Mapped[User] = relationship(back_populates="sessions")
 
 
-class Bucket(Base):
-    __tablename__ = "buckets"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    # null user_id => default bucket shared by all users
-    user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), index=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    criteria: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # Soft-delete flag for custom buckets. Defaults are never deleted (their
-    # rows always have is_deleted=False). When True, GET /api/buckets omits
-    # the row and the classifier excludes it from _available_bucket_ids.
-    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
-
-
 class InboxThread(Base):
     __tablename__ = "inbox_threads"
     # Prevents duplicate rows when concurrent Celery tasks (beat + user-triggered reload,
@@ -63,7 +49,7 @@ class InboxThread(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     gmail_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     subject: Mapped[str | None] = mapped_column(Text)
-    bucket_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("buckets.id"))
+    bucket_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("tasks.id"))
     # recent_message_id can't FK at row-create time (chicken/egg); it's a soft pointer.
     recent_message_id: Mapped[str | None] = mapped_column(String(36))
     # Mirrors Gmail INBOX-label removal (archive). Archived threads stay
@@ -130,14 +116,15 @@ class LlmCall(Base):
 
 
 class Task(Base):
-    """Phase 2A task engine: a user-defined tracker (or, in Phase 4, an
-    LLM-managed classify-bucket) that threads get linked to and scored
+    """Phase 2A task engine: a user-defined tracker, or (Phase 4) an
+    LLM-managed classify-bucket, that threads get linked to and scored
     against. See reference/ for the classify -> link -> extract -> fold
     pipeline this anchors."""
     __tablename__ = "tasks"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    # null user_id reserved for Phase-4 default classify-tasks; always set in 2A.
+    # null user_id => default bucket shared by all users (Phase 4); always set
+    # for tracker-kind tasks.
     user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), index=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="tracker")  # 'tracker' | 'bucket' (Phase 4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)

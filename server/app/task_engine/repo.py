@@ -123,6 +123,23 @@ def list_active_trackers(db: Session, *, user_id: str) -> list[Task]:
     return list(db.execute(stmt).scalars().all())
 
 
+def list_active_buckets(db: Session, *, user_id: str) -> list[Task]:
+    """Defaults (user_id IS NULL) + this user's custom, non-deleted
+    kind='bucket' tasks, name ascending — the Phase 4 task-backed
+    replacement for bucket_repo.list_active's query. Read-only, never
+    flushes."""
+    stmt = (
+        select(Task)
+        .where(
+            Task.kind == "bucket",
+            Task.is_deleted == False,  # noqa: E712
+            (Task.user_id.is_(None)) | (Task.user_id == user_id),
+        )
+        .order_by(Task.name.asc())
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
 def bump_version(db: Session, *, task: Task) -> int:
     """Increment task.version (SSE gap-detection counter, D4) and return it."""
     task.version += 1

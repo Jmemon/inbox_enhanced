@@ -1,5 +1,11 @@
 """Bucket CRUD helpers shared by api endpoints + workers.
 
+Task-backed since Phase 4; buckets are tasks(kind='bucket'). This module
+keeps its five original signatures (returning/accepting Task rows, not a
+dedicated Bucket model) so api/buckets.py, workers/tasks.py, and
+workers/gmail_sync.py — which duck-type .id/.name/.criteria/.user_id/
+.is_deleted — kept working unchanged across the migration.
+
 Caller owns the transaction (Session). This module never commits. Endpoints
 in api/buckets.py wrap each call in a normal request lifecycle; workers wrap
 in their task-level commit.
@@ -10,51 +16,43 @@ keeps the repo callable from internal code that should be allowed to
 mutate defaults if necessary.
 """
 
-import uuid
-from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.db.models import Bucket
+from app.db.models import Task
+from app.task_engine import repo as task_repo
 from app.task_engine.criteria import formulate_criteria  # noqa: F401
 
 
-def list_active(db: Session, *, user_id: str) -> list[Bucket]:
+def list_active(db: Session, *, user_id: str) -> list[Task]:
     """Defaults (user_id IS NULL) + this user's custom buckets where
     is_deleted = False. Sorted by name for stable api output."""
-    stmt = (
-        select(Bucket)
-        .where(Bucket.is_deleted.is_(False))
-        .where((Bucket.user_id.is_(None)) | (Bucket.user_id == user_id))
-        .order_by(Bucket.name.asc())
-    )
-    return list(db.execute(stmt).scalars().all())
+    return task_repo.list_active_buckets(db, user_id=user_id)
 
 
-def get_by_id(db: Session, bucket_id: str) -> Bucket | None:
+def get_by_id(db: Session, bucket_id: str) -> Task | None:
     """Bare lookup — does not check ownership or is_deleted. Endpoints layer
     on the policy: PATCH/DELETE check `bucket.user_id == request_user_id`
-    and return 403 / 404 accordingly."""
-    return db.get(Bucket, bucket_id)
-
-
-def create_custom(db: Session, *, user_id: str, name: str, criteria: str) -> Bucket:
-    """Insert a user-owned bucket. Returns the new row (caller commits)."""
-    row = Bucket(
-        id=uuid.uuid4().hex,
-        user_id=user_id,
-        name=name,
-        criteria=criteria,
-        is_deleted=False,
-    )
-    db.add(row)
-    db.flush()
+    and return 403 / 404 accordingly. Returns None for a non-bucket-kind
+    task id (e.g. a tracker) — bucket_id-shaped lookups must never resolve
+    to a tracker row."""
+    row = db.get(Task, bucket_id)
+    if row is None or row.kind != "bucket":
+        return None
     return row
 
 
-def rename(db: Session, bucket: Bucket, name: str) -> Bucket:
+def create_custom(db: Session, *, user_id: str, name: str, criteria: str) -> Task:
+    """Insert a user-owned bucket. Returns the new row (caller commits)."""
+    return task_repo.create_task(
+        db, user_id=user_id, name=name, goal="", criteria=criteria,
+        state_schema=None, kind="bucket",
+    )
+
+
+def rename(db: Session, bucket: Task, name: str) -> Task:
     bucket.name = name
     return bucket
 
 
-def soft_delete(db: Session, bucket: Bucket) -> Bucket:
+def soft_delete(db: Session, bucket: Task) -> Task:
     bucket.is_deleted = True
     return bucket
