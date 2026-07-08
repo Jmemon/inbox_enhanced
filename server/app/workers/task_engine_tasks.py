@@ -12,10 +12,23 @@ own top level, or the two modules would form an import cycle. `_publish`
 score thresholds) is therefore pulled in with a late import inside each task
 function's body instead of a top-level `from app.workers.tasks import ...`.
 
-No `sync_lock` anywhere in this module: no task here ever writes
-`inbox_threads`/`inbox_messages` (they only read), so there's nothing that
-can race the sync path's `(user_id, gmail_id)` unique constraint. Idempotency
-for the two extraction tasks instead comes entirely from
+No `sync_lock` anywhere in this module. Most tasks here only ever READ
+`inbox_threads`/`inbox_messages`, so there's nothing that can race the sync
+path's `(user_id, gmail_id)` unique constraint (the hazard sync_lock exists
+to guard). The one exception is `_run_bucket_backfill`, which DOES write
+`InboxThread.bucket_id` — still without sync_lock, because it does no Gmail
+I/O of its own and so never touches the unique-constraint hazard the lock
+guards against. That write path has its own, narrower race instead: a
+concurrent poll (holding sync_lock, re-triaging the same thread against
+FRESH content) can commit a different bucket_id while a backfill batch —
+which read the OLD bucket_id as its stability hint before its own
+multi-second `classify.triage()` round-trip — is still mid-flight.
+`_run_bucket_backfill` guards against this optimistically: immediately
+before writing, it re-reads `bucket_id` fresh (a column-level `select()`,
+which always issues a real query rather than resolving from the session's
+identity map) and skips the write — and the `threads_updated` publish — if
+the row moved since the read that fed `triage()`. Idempotency for the two
+extraction tasks instead comes entirely from
 `transitions.validate_and_stage`'s step 7 (SELECT-first check against
 `(task_id, message_id, field)`, backed by the migrated DB's partial unique
 index as a race backstop) — re-running either against the same (task,
@@ -27,6 +40,8 @@ it against the same draft_id just overwrites the cache entry with a fresh
 """
 
 import logging
+
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.db.models import InboxThread, User
@@ -676,10 +691,28 @@ def _run_bucket_backfill(
     view picks up the reassignment -- there is no final `task_updated` here
     (unlike the tracker branch): a bucket-kind task carries no version-gated
     board/event state for a client to refetch.
+
+    `buckets` (the active bucket set triage() is called against) is resolved
+    ONCE before the batch loop, not per-batch -- a bucket created or deleted
+    mid-backfill is simply not seen by later batches. Acceptable: the backfill
+    triages against the set as of its start, the same read-once semantics the
+    old (Phase 4 Task 1) reclassify-all pass had.
+
+    Write-time race: this function writes `InboxThread.bucket_id` without
+    `sync_lock` (see the module docstring). A concurrent poll can commit a
+    fresher pick for a thread already read into this batch's stability hint
+    (`old_bucket`) before this batch's own `classify.triage()` call returns.
+    Immediately before writing, each candidate whose pick differs from
+    `old_bucket` is re-checked against a fresh, identity-map-bypassing
+    `select(InboxThread.bucket_id)` -- if the stored value has already moved
+    off `old_bucket`, something fresher won the race; skip the write (and
+    leave the thread out of `changed_thread_ids`/the `threads_updated`
+    publish) rather than clobber it with a pick computed from stale content.
     """
     scanned = 0
     last_published = 0
     changed_thread_ids: set[str] = set()
+    buckets = task_repo.list_active_buckets(db, user_id=user_id)
 
     for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
         batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
@@ -688,7 +721,6 @@ def _run_bucket_backfill(
             ordered_ids = [tid for tid, _, _ in triples]
             current_bucket_ids = [bid for _, bid, _ in triples]
             parsed_list = [parsed for _, _, parsed in triples]
-            buckets = task_repo.list_active_buckets(db, user_id=user_id)
             results = classify.triage(
                 parsed_list, buckets=buckets, trackers=[],
                 current_bucket_ids=current_bucket_ids, user_id=user_id,
@@ -698,6 +730,22 @@ def _run_bucket_backfill(
                 ordered_ids, current_bucket_ids, results,
             ):
                 if new_bucket == old_bucket:
+                    continue
+                # Optimistic guard: a plain column select always issues a
+                # real query (unlike db.get(), which would return this
+                # session's identity-mapped InboxThread -- loaded by
+                # load_parsed_threads above, before triage()'s multi-second
+                # round-trip -- and so could still report the stale
+                # old_bucket even though the row has since moved).
+                fresh_bucket = db.execute(
+                    select(InboxThread.bucket_id).where(InboxThread.id == thread_id)
+                ).scalar_one_or_none()
+                if fresh_bucket != old_bucket:
+                    log.info(
+                        "_run_bucket_backfill: task=%s thread=%s bucket_id moved "
+                        "(%r -> %r) since triage read; skipping stale write",
+                        task.id, thread_id, old_bucket, fresh_bucket,
+                    )
                     continue
                 thread_row = db.get(InboxThread, thread_id)
                 if thread_row is not None:

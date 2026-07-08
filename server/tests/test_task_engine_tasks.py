@@ -26,7 +26,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.config import get_settings
@@ -1024,3 +1024,77 @@ def test_backfill_bucket_publishes_threads_updated_then_terminal_progress_no_tas
     # No final task_updated -- a bucket-kind task carries no task-engine
     # board/event state for a client to refetch (unlike the tracker branch).
     assert all(e != "task_updated" for e, _ in events)
+
+
+def test_backfill_bucket_skips_stale_write_when_bucket_moves_during_triage(
+    session_factory, fake_redis, monkeypatch,
+):
+    """Fix round 1 regression test for the optimistic write-time guard in
+    `_run_bucket_backfill`: a concurrent poll (holding sync_lock, off in its
+    own session) reclassifies a thread against FRESH content and commits a
+    new bucket_id WHILE this batch's own `classify.triage()` call is still
+    running -- after this batch already read the OLD bucket_id as its
+    stability hint, but before this batch writes its own (now stale-content)
+    pick. The backfill must not clobber the fresher value, and the thread
+    must not appear in the `threads_updated` publish.
+
+    The concurrent commit is simulated via a raw SQL UPDATE against the SAME
+    session `backfill_task` uses (captured below by wrapping SessionLocal),
+    deliberately bypassing the ORM so the already-loaded InboxThread entity
+    (loaded earlier by `load_parsed_threads`, before this fake runs) is left
+    with a stale `bucket_id` attribute in the session's identity map -- a
+    real concurrent session would leave it exactly this stale, since
+    `expire_on_commit` only ever invalidates a session's OWN identity map,
+    never another session's. This is what proves the guard re-reads via a
+    fresh column select rather than `db.get(...)`'s cached object: without
+    the fix, `db.get(InboxThread, thread_id).bucket_id = new_bucket` would
+    overwrite the fresher value regardless of what's actually stored.
+    """
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    _seed_backfill_thread(
+        session_factory, thread_id="bkF", gmail_thread_id="gbkF", message_gmail_id="mF",
+        body_text="MARKER-F receipt.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkF").bucket_id = "old-bucket"
+    db.commit()
+    db.close()
+
+    captured_session: dict = {}
+
+    def _spy_session_local():
+        s = session_factory()
+        captured_session["db"] = s
+        return s
+    monkeypatch.setattr(task_engine_tasks, "SessionLocal", _spy_session_local)
+
+    def _fake_triage_with_concurrent_write(threads, buckets, trackers, current_bucket_ids, *, user_id=None, task_id=None):
+        # Simulate the concurrent poll's commit landing mid-triage, via a raw
+        # UPDATE that bypasses the ORM (so the already-loaded "bkF" entity's
+        # cached bucket_id attribute is left stale, matching what a genuinely
+        # separate session would leave behind).
+        captured_session["db"].execute(
+            text("UPDATE inbox_threads SET bucket_id = :b WHERE id = :tid"),
+            {"b": "fresher-bucket", "tid": "bkF"},
+        )
+        # This batch's own pick, computed from the stale content it read
+        # before the concurrent write above -- deliberately a THIRD value so
+        # a wrongly-applied write is unambiguous below.
+        return [("stale-pick-bucket", [])]
+    monkeypatch.setattr("app.llm.classify.triage", _fake_triage_with_concurrent_write)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, None])
+
+    db2 = session_factory()
+    # The concurrent write wins -- the backfill's stale-content pick must
+    # never land.
+    assert db2.get(InboxThread, "bkF").bucket_id == "fresher-bucket"
+
+    # The thread must be absent from every threads_updated publish (the
+    # guard excludes it from changed_thread_ids entirely).
+    updated_ids = [
+        tid for _, e, p in captured if e == "threads_updated" for tid in p["thread_ids"]
+    ]
+    assert "bkF" not in updated_ids
