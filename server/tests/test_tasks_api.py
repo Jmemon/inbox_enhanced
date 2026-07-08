@@ -621,6 +621,38 @@ def test_patch_other_user_404(authed):
     assert c.patch(f"/api/tasks/{other_id}", json={"name": "x"}).status_code == 404
 
 
+def test_patch_state_schema_on_bucket_kind_task_422(authed):
+    """kind isolation (final-review wave round 2): PATCH must not be able to
+    graft a state_schema onto a bucket-kind task, closing the same class of
+    hole attach/detach had for task_thread_links -- rejected before the
+    schema is applied, and without bumping version."""
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Bucket1", kind="bucket")
+    schema = {
+        "version": 1, "entity": None,
+        "pipeline": {"stages": ["todo"], "terminal": ["done"]},
+    }
+    r = c.patch(f"/api/tasks/{bucket_id}", json={"state_schema": schema})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "bucket tasks cannot have a state_schema"
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=bucket_id)
+    assert task.state_schema is None
+    assert task.version == 1
+
+
+def test_patch_name_on_bucket_kind_task_still_works(authed):
+    """Name/status PATCH fields stay allowed for buckets -- the client's
+    bucket-rename path depends on this -- only state_schema is kind-gated."""
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Old", kind="bucket")
+    r = c.patch(f"/api/tasks/{bucket_id}", json={"name": "New"})
+    assert r.status_code == 200
+    assert r.json()["name"] == "New"
+    assert r.json()["version"] == 2
+
+
 # ---------------------------------------------------------------------------
 # DELETE
 # ---------------------------------------------------------------------------

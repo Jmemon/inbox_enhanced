@@ -345,6 +345,15 @@ def patch_task(task_id: str, body: _PatchTaskBody, user: User = Depends(get_curr
                db: Session = Depends(get_db)) -> dict:
     task = _require_owned_task(db, user_id=user.id, task_id=task_id)
 
+    if task.kind != "tracker" and body.state_schema is not None:
+        # kind isolation (spec §4.1, final-review wave round 2): a bucket-kind
+        # task's state_schema is always None (enforced at creation in POST
+        # /tasks) -- this is the guard that keeps PATCH from grafting one on
+        # after the fact. Checked before any field is applied below so a
+        # rejected PATCH has zero side effects, same as attach/detach's own
+        # kind guard above.
+        raise HTTPException(422, "bucket tasks cannot have a state_schema")
+
     if body.name is not None:
         task.name = body.name
 
