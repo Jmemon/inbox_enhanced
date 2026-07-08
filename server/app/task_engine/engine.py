@@ -3,8 +3,9 @@ thread) pair.
 
 This module owns the one thing neither `transitions.py` nor `repo.py` may
 own: the LLM round-trip. It rebuilds the thread from stored Postgres rows
-(never refetches Gmail — same self-sufficiency rule `_reclassify_all`/
-`_score_all` already follow), builds the `gmail_message_id -> internal
+(never refetches Gmail — same self-sufficiency rule `_score_all` and
+backfill_task's own `load_parsed_threads` calls already follow), builds
+the `gmail_message_id -> internal
 InboxMessage.id` map from the SAME rows `inbox_repo.load_parsed_threads` used
 internally, calls the extraction LLM once, and hands `extract_transition.
 parse_response(...)`'s output straight to `transitions.validate_and_stage` —

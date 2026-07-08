@@ -52,12 +52,14 @@ def triage(
     Same asyncio.gather shape classify() used; output preserves input order.
 
     task_id is optional and forwarded verbatim to call_messages's own task_id
-    kwarg for llm_calls metrics attribution — most callers (the live sync
-    path's _triage_batch, _reclassify_all) triage against several trackers at
-    once and have no single task_id to attribute a call to, so it defaults to
-    None there. backfill_task calls triage() with exactly one tracker in
-    `trackers` and passes that tracker's own id, so its LLM spend is
-    attributable to the tracker that triggered it.
+    kwarg for llm_calls metrics attribution — the live sync path's
+    _triage_batch (partial/full/extend) triages against every bucket and
+    tracker at once and has no single task_id to attribute a call to, so it
+    defaults to None there. backfill_task (Phase 4: both the tracker and
+    bucket kind branches) calls triage() with one task's id in mind and
+    passes it through, so its LLM spend is attributable to the tracker or
+    bucket actually being backfilled — even for the bucket branch, which
+    still triages against the full active bucket set.
     """
     if not threads:
         return []
