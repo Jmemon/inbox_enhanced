@@ -51,11 +51,13 @@ dialect-guards any PG-only DDL (none expected beyond JSONB variant).
 ### 1.2 Stage machines
 
 - **creation**: `proposing` → `draft_ready` (needs_user=true) → `backfilling`
-  → `done` | `failed` (from any stage; `error` set) | `dismissed`
-  (user-initiated, any non-terminal stage = cancel-intent: a dismissed
-  `draft_ready` job simply never confirms; a dismissed `backfilling` job
-  keeps running server-side but disappears from the UI — we do NOT implement
-  worker cancellation).
+  → `done` | `failed` (from any stage; `error` set). Dismissal is user-
+  initiated from any stage and is recorded ONLY via `dismissed_at` — `stage`
+  keeps its last value and the string `'dismissed'` never appears in the
+  column (T1 implementation decision, ratified). A dismissed `draft_ready`
+  job simply never confirms; a dismissed `backfilling` job keeps running
+  server-side but disappears from the UI — we do NOT implement worker
+  cancellation. Do not write branches that test `stage == 'dismissed'`.
 - **delete_retriage**: `running` → `done` | `failed`. `needs_user` is never
   true; it exists to show progress and completion.
 
