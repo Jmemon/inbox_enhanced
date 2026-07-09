@@ -51,6 +51,7 @@ from app.llm import classify
 from app.llm import client as llm_client
 from app.llm.prompts import propose_task
 from app.task_engine import draft_cache
+from app.task_engine import jobs_repo
 from app.task_engine import repo as task_repo
 from app.task_engine import schema as schema_mod
 from app.task_engine.engine import extract_for_pair
@@ -497,6 +498,29 @@ BACKFILL_TRIAGE_BATCH = 25
 BACKFILL_PROGRESS_INTERVAL = 50
 
 
+def _write_job_progress(
+    db, *, job, scanned: int, matched: int, total: int, user_id: str, job_id: str, publish,
+) -> None:
+    """Shared per-batch job-row write for both backfill_task branches
+    (Phase 4.5 Task 2): overwrite the progress counters, commit, and nudge
+    the jobs panel. `total` is the fixed candidate-pool size for the whole
+    run -- re-passing the same value on every call is equivalent to "written
+    once" since it never changes between batches."""
+    jobs_repo.update_progress(db, job=job, scanned=scanned, matched=matched, total=total)
+    db.commit()
+    publish(user_id, "job_updated", {"job_id": job_id})
+
+
+def _write_job_done(db, *, job, user_id: str, job_id: str, publish) -> None:
+    """Shared terminal job-row write for both backfill_task branches' happy
+    path (Phase 4.5 Task 2). The failure path's equivalent write lives in
+    `_record_job_failure` below, deliberately on a fresh session instead of
+    this one -- see that function's docstring."""
+    jobs_repo.update_stage(db, job=job, stage="done")
+    db.commit()
+    publish(user_id, "job_updated", {"job_id": job_id})
+
+
 def _backfill_candidate_pool(db, *, user_id: str, keyword_probes: list[str] | None) -> list[str]:
     """Candidate thread ids for a backfill run -- shared by both of
     `backfill_task`'s kind branches. FTS union over `keyword_probes`
@@ -538,7 +562,9 @@ def _backfill_candidate_pool(db, *, user_id: str, keyword_probes: list[str] | No
     return candidate_ids
 
 
-def _run_tracker_backfill(db, *, task, user_id: str, candidate_ids: list[str], publish) -> None:
+def _run_tracker_backfill(
+    db, *, task, user_id: str, candidate_ids: list[str], publish, job_id: str | None = None,
+) -> None:
     """kind='tracker' backfill body -- unchanged Phase 2A/2C behavior, only
     extracted out of `backfill_task` so `_backfill_candidate_pool` can be
     shared with the kind='bucket' branch without duplicating it.
@@ -585,12 +611,31 @@ def _run_tracker_backfill(db, *, task, user_id: str, candidate_ids: list[str], p
     "matched", "done": False}`), a terminal one with `"done": True` once
     phase 2 finishes. `backfill_task` publishes the final `task_updated`
     itself, once this returns.
+
+    `job_id` (optional, Phase 4.5 Task 2): when set, every triage batch
+    below also overwrites the job row's `scanned`/`matched`/`total` counters
+    (commit-then-publish `job_updated`, via `_write_job_progress`), and a
+    final `stage='done'` write happens once phase 2 (extraction) finishes.
+    This is a finer cadence than `task_backfill_progress`'s interval-gated
+    publish above -- every batch, not every BACKFILL_PROGRESS_INTERVAL
+    threads -- since the jobs panel's progress bar wants fresh numbers.
     """
     settings = get_settings()
 
     scanned = 0
     last_published = 0
     matched_thread_ids: set[str] = set()
+
+    # Resolve the job row (if any) ONCE up front -- same session throughout,
+    # so every per-batch write below reuses this one object rather than
+    # re-querying it every iteration.
+    job = jobs_repo.get_owned_job(db, user_id=user_id, job_id=job_id) if job_id is not None else None
+    if job_id is not None and job is None:
+        log.warning(
+            "backfill_task: job=%s not found for user=%s; skipping job progress writes",
+            job_id, user_id,
+        )
+    total = len(candidate_ids)
 
     for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
         batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
@@ -627,6 +672,11 @@ def _run_tracker_backfill(db, *, task, user_id: str, candidate_ids: list[str], p
         # including ids load_parsed_threads dropped -- those still
         # represent forward progress for the wizard's progress bar.
         scanned += len(batch_ids)
+        if job is not None:
+            _write_job_progress(
+                db, job=job, scanned=scanned, matched=len(matched_thread_ids), total=total,
+                user_id=user_id, job_id=job_id, publish=publish,
+            )
         if scanned - last_published >= BACKFILL_PROGRESS_INTERVAL:
             publish(user_id, "task_backfill_progress", {
                 "task_id": task.id, "scanned": scanned,
@@ -660,10 +710,13 @@ def _run_tracker_backfill(db, *, task, user_id: str, candidate_ids: list[str], p
         "task_id": task.id, "scanned": scanned,
         "matched": len(matched_thread_ids), "done": True,
     })
+    if job is not None:
+        _write_job_done(db, job=job, user_id=user_id, job_id=job_id, publish=publish)
 
 
 def _run_bucket_backfill(
     db, *, task, user_id: str, candidate_ids: list[str], publish, publish_thread_ids,
+    job_id: str | None = None,
 ) -> None:
     """kind='bucket' backfill body (Phase 4 Task 2): a pure reclassification
     pass over the candidate pool, no task-engine writes at all.
@@ -714,6 +767,15 @@ def _run_bucket_backfill(
     changed_thread_ids: set[str] = set()
     buckets = task_repo.list_active_buckets(db, user_id=user_id)
 
+    # Phase 4.5 Task 2 -- see _run_tracker_backfill's identical comment.
+    job = jobs_repo.get_owned_job(db, user_id=user_id, job_id=job_id) if job_id is not None else None
+    if job_id is not None and job is None:
+        log.warning(
+            "backfill_task: job=%s not found for user=%s; skipping job progress writes",
+            job_id, user_id,
+        )
+    total = len(candidate_ids)
+
     for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
         batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
         triples = inbox_repo.load_parsed_threads(db, user_id=user_id, internal_ids=batch_ids)
@@ -754,6 +816,11 @@ def _run_bucket_backfill(
             db.commit()
 
         scanned += len(batch_ids)
+        if job is not None:
+            _write_job_progress(
+                db, job=job, scanned=scanned, matched=len(changed_thread_ids), total=total,
+                user_id=user_id, job_id=job_id, publish=publish,
+            )
         if scanned - last_published >= BACKFILL_PROGRESS_INTERVAL:
             publish(user_id, "task_backfill_progress", {
                 "task_id": task.id, "scanned": scanned,
@@ -766,10 +833,49 @@ def _run_bucket_backfill(
         "task_id": task.id, "scanned": scanned,
         "matched": len(changed_thread_ids), "done": True,
     })
+    if job is not None:
+        _write_job_done(db, job=job, user_id=user_id, job_id=job_id, publish=publish)
+
+
+def _record_job_failure(*, user_id: str, job_id: str, error: str) -> None:
+    """Best-effort terminal failure write for `backfill_task`'s top-level
+    except clause (Phase 4.5 Task 2). Deliberately opens a BRAND-NEW session
+    rather than reusing the run's own `db` -- that session may be poisoned
+    by whatever just raised (a failed mid-batch commit, a dropped
+    connection, an error thrown from deep inside triage/extraction with the
+    session left in an unknown state), and this write's only job is to make
+    the failure visible no matter what broke. Any failure in this write
+    itself is logged and swallowed, never re-raised -- the caller's `raise`
+    must surface the ORIGINAL exception, not a secondary one from this
+    best-effort path. Late-imports `_publish` for the same import-cycle
+    reason the rest of this module does (see module docstring)."""
+    from app.workers.tasks import _publish
+
+    fail_db = SessionLocal()
+    try:
+        job = jobs_repo.get_owned_job(fail_db, user_id=user_id, job_id=job_id)
+        if job is None:
+            log.warning(
+                "backfill_task: job=%s not found for user=%s while recording failure",
+                job_id, user_id,
+            )
+            return
+        jobs_repo.mark_failed(fail_db, job=job, error=error)
+        fail_db.commit()
+        _publish(user_id, "job_updated", {"job_id": job_id})
+    except Exception:
+        log.exception(
+            "backfill_task: failed to record job failure for job=%s user=%s", job_id, user_id,
+        )
+    finally:
+        fail_db.close()
 
 
 @celery_app.task(name="app.workers.task_engine_tasks.backfill_task")
-def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None = None) -> None:
+def backfill_task(
+    user_id: str, task_id: str, keyword_probes: list[str] | None = None,
+    job_id: str | None = None,
+) -> None:
     """Run a newly created task -- tracker OR bucket kind -- over a user's
     stored history.
 
@@ -801,6 +907,27 @@ def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None =
     one-shot job the wizard waits on and always reports a definitive
     completion, unlike `process_task_updates`' skip-if-no-change publish
     suppression for a periodic sync tick.
+
+    `job_id` (optional, Phase 4.5 Task 2 -- jobs surface): when the caller
+    threads a job row's id through (today, only the jobs-surface confirm
+    endpoint does; a direct `POST /api/tasks` passes none), both branches
+    write per-batch progress into that job row (`scanned`/`matched`/`total`,
+    commit-then-publish `job_updated`) and mark it `stage='done'` on their
+    own terminal write -- entirely additional to their unchanged
+    `task_backfill_progress`/`task_updated` publishes. `job_id=None` (every
+    pre-existing caller) takes none of these extra reads/writes at all, so
+    its behavior is unchanged byte-for-byte.
+
+    A TOP-LEVEL `try/except` wraps the entire body (both kinds): if ANYTHING
+    raises -- an LLM failure, a DB error, a bug in either branch -- the run's
+    own session is rolled back and, when `job_id` is set, the job row is
+    marked `stage='failed'` with the exception text (via
+    `_record_job_failure`, on a FRESH session -- see that function's
+    docstring for why) and a `job_updated` nudge is published, before the
+    exception is re-raised so Celery still records the run as FAILED. This
+    closes the ledgered latent where a backfill that raised before its
+    terminal publish left a client polling forever with no signal anything
+    went wrong.
     """
     from app.workers.tasks import _publish, _publish_thread_ids
 
@@ -824,13 +951,24 @@ def backfill_task(user_id: str, task_id: str, keyword_probes: list[str] | None =
         if task.kind == "bucket":
             _run_bucket_backfill(
                 db, task=task, user_id=user_id, candidate_ids=candidate_ids,
-                publish=_publish, publish_thread_ids=_publish_thread_ids,
+                publish=_publish, publish_thread_ids=_publish_thread_ids, job_id=job_id,
             )
             return
 
         _run_tracker_backfill(
             db, task=task, user_id=user_id, candidate_ids=candidate_ids, publish=_publish,
+            job_id=job_id,
         )
         _publish_task_updated(db, user_id=user_id, task=task)
+    except Exception as exc:
+        log.exception("backfill_task: task=%s failed", task_id)
+        # Guard rollback so it can't replace the original exception if connection drops.
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("backfill_task: rollback failed; original error takes precedence")
+        if job_id is not None:
+            _record_job_failure(user_id=user_id, job_id=job_id, error=str(exc))
+        raise
     finally:
         db.close()

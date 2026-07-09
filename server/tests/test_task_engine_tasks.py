@@ -32,6 +32,7 @@ from sqlalchemy.orm import sessionmaker
 from app.config import get_settings
 from app.db.models import Base, InboxMessage, InboxThread, User
 from app.llm import client as llm_client
+from app.task_engine import jobs_repo
 from app.task_engine import repo as task_repo
 from app.task_engine.schema import AttributeSpec, EntitySpec, PipelineSpec, TaskStateSchema
 from app.workers import task_engine_tasks
@@ -1098,3 +1099,202 @@ def test_backfill_bucket_skips_stale_write_when_bucket_moves_during_triage(
         tid for _, e, p in captured if e == "threads_updated" for tid in p["thread_ids"]
     ]
     assert "bkF" not in updated_ids
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.5 Task 2: backfill_task threads an optional job_id through to
+# jobs_repo -- per-batch progress writes + a terminal 'done'/'failed' stage,
+# and a top-level try/except that marks the job failed (via a FRESH session)
+# and re-raises on any exception. job_id=None (every pre-existing caller)
+# must take none of these extra reads/writes at all.
+# ---------------------------------------------------------------------------
+
+
+def _seed_job(session_factory, *, user_id=USER_ID, task_kind="tracker") -> str:
+    db = session_factory()
+    job = jobs_repo.create_job(db, user_id=user_id, kind="creation", task_kind=task_kind, goal="g")
+    db.commit()
+    job_id = job.id
+    db.close()
+    return job_id
+
+
+def test_backfill_task_job_id_none_never_touches_jobs_repo(session_factory, fake_redis, monkeypatch):
+    """The default (and every pre-existing caller's) path must be byte-
+    identical: no job row reads or writes at all when job_id is omitted."""
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _seed_backfill_thread(
+        session_factory, thread_id="bfN", gmail_thread_id="gN", message_gmail_id="mN",
+        body_text="MARKER-N no job wired up.", last_activity_at=1000,
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("jobs_repo must not be touched on the job_id=None path")
+
+    for name in ("get_owned_job", "update_progress", "update_stage", "mark_failed"):
+        monkeypatch.setattr(jobs_repo, name, _boom)
+
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker", marker_confidences={"MARKER-N": 90},
+        marker_extractions={"MARKER-N": _extraction_response(confidence=90, message_id="mN")},
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    # Must complete without raising -- if any jobs_repo call happened, _boom
+    # above would blow up first (and Celery-eager would propagate it).
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+
+
+def test_backfill_task_tracker_with_job_id_writes_progress_per_batch_and_terminal_done(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)
+    job_id = _seed_job(session_factory, task_kind="tracker")
+
+    # Small batch/interval, mirroring the non-job progress-cadence test above.
+    monkeypatch.setattr(task_engine_tasks, "BACKFILL_TRIAGE_BATCH", 2)
+    monkeypatch.setattr(task_engine_tasks, "BACKFILL_PROGRESS_INTERVAL", 2)
+
+    _seed_backfill_thread(session_factory, thread_id="m1", gmail_thread_id="gm1",
+                          message_gmail_id="mm1", body_text="MARKER-M1 relevant thread.",
+                          last_activity_at=4000)
+    _seed_backfill_thread(session_factory, thread_id="n1", gmail_thread_id="gn1",
+                          message_gmail_id="mn1", body_text="MARKER-N1 unrelated thread.",
+                          last_activity_at=3000)
+    _seed_backfill_thread(session_factory, thread_id="m2", gmail_thread_id="gm2",
+                          message_gmail_id="mm2", body_text="MARKER-M2 relevant thread.",
+                          last_activity_at=2000)
+    _seed_backfill_thread(session_factory, thread_id="n2", gmail_thread_id="gn2",
+                          message_gmail_id="mn2", body_text="MARKER-N2 unrelated thread.",
+                          last_activity_at=1000)
+
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker",
+        marker_confidences={
+            "MARKER-M1": 90, "MARKER-M2": 90, "MARKER-N1": None, "MARKER-N2": None,
+        },
+        marker_extractions={},  # extraction phase is a no-op -- only progress matters here
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None, job_id])
+
+    job_updates = [p for _, e, p in captured if e == "job_updated"]
+    # One per triage batch (2 batches of 2) + one terminal 'done' write == 3.
+    # Every payload is the bare {"job_id": ...} -- events carry ids, never rows.
+    assert job_updates == [{"job_id": job_id}] * 3
+
+    db = session_factory()
+    job = jobs_repo.get_owned_job(db, user_id=USER_ID, job_id=job_id)
+    assert job.stage == "done"
+    assert job.scanned == 4
+    assert job.matched == 2
+    assert job.total == 4  # candidate-pool size, constant across every write
+
+
+def test_backfill_bucket_with_job_id_writes_progress_and_terminal_done(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    job_id = _seed_job(session_factory, task_kind="bucket")
+    _seed_backfill_thread(
+        session_factory, thread_id="bkJ", gmail_thread_id="gbkJ", message_gmail_id="mJ",
+        body_text="MARKER-J receipt.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkJ").bucket_id = "old-bucket"
+    db.commit()
+    db.close()
+
+    calls: list = []
+    fake = _fake_triage_capturing(calls, picks_by_marker={"MARKER-J": bucket_id})
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, None, job_id])
+
+    job_updates = [p for _, e, p in captured if e == "job_updated"]
+    assert job_updates == [{"job_id": job_id}] * 2  # one batch + terminal done
+
+    db2 = session_factory()
+    job = jobs_repo.get_owned_job(db2, user_id=USER_ID, job_id=job_id)
+    assert job.stage == "done"
+    assert job.scanned == 1
+    assert job.matched == 1
+    assert job.total == 1
+
+
+def test_backfill_task_exception_marks_job_failed_with_error_and_reraises(
+    session_factory, fake_redis, monkeypatch,
+):
+    """Top-level try/except: the SECOND triage batch raises mid-run (after
+    the first batch's progress already committed) -- the job row must end up
+    'failed' with the exception text, the FIRST batch's progress must
+    survive (not rolled back away), and the exception must still propagate
+    so Celery records the run as FAILED (not silently swallowed)."""
+    _seed_user(session_factory)
+    bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    job_id = _seed_job(session_factory, task_kind="bucket")
+
+    monkeypatch.setattr(task_engine_tasks, "BACKFILL_TRIAGE_BATCH", 1)
+
+    _seed_backfill_thread(
+        session_factory, thread_id="bkOK", gmail_thread_id="gOK", message_gmail_id="mOK",
+        body_text="MARKER-OK first, succeeds.", last_activity_at=2000,
+    )
+    _seed_backfill_thread(
+        session_factory, thread_id="bkBoom", gmail_thread_id="gBoom", message_gmail_id="mBoom",
+        body_text="MARKER-BOOM second, blows up.", last_activity_at=1000,
+    )
+
+    call_count = 0
+
+    def _fake_triage_then_boom(threads, buckets, trackers, current_bucket_ids, *, user_id=None, task_id=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return [(cur, []) for cur in current_bucket_ids]  # first batch: no-op pick
+        raise RuntimeError("triage blew up on batch 2")
+
+    monkeypatch.setattr("app.llm.classify.triage", _fake_triage_then_boom)
+    captured = _capture_publish(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="triage blew up on batch 2"):
+        task_engine_tasks.backfill_task.apply(args=[USER_ID, bucket_id, None, job_id])
+
+    db = session_factory()
+    job = jobs_repo.get_owned_job(db, user_id=USER_ID, job_id=job_id)
+    assert job.stage == "failed"
+    assert "triage blew up on batch 2" in job.error
+    assert job.scanned == 1  # the first (successful) batch's progress survives
+    assert job.total == 2
+
+    job_updates = [p for _, e, p in captured if e == "job_updated"]
+    assert job_updates[-1] == {"job_id": job_id}  # the failure write's own nudge
+    assert len(job_updates) == 2  # batch-1 progress + the failure write
+
+
+def test_backfill_task_missing_job_row_is_a_defensive_noop(session_factory, fake_redis, monkeypatch):
+    """job_id pointing at a job row that doesn't exist (or isn't owned by
+    this user) must not crash the backfill -- it just skips every job write,
+    same as if job_id were never given."""
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _seed_backfill_thread(
+        session_factory, thread_id="bfG", gmail_thread_id="gG", message_gmail_id="mG",
+        body_text="MARKER-G ghost job id.", last_activity_at=1000,
+    )
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker", marker_confidences={"MARKER-G": 90},
+        marker_extractions={"MARKER-G": _extraction_response(confidence=90, message_id="mG")},
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    captured = _capture_publish(monkeypatch)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None, "no-such-job"])
+
+    assert all(e != "job_updated" for _, e, _ in captured)
