@@ -211,3 +211,41 @@ class TaskEvent(Base):
     # verbatim entity string (not the normalized key), so the review tray can
     # render "LLM said 'Stripewise Corp', closest match 'stripe'".
     proposed_entity: Mapped[str | None] = mapped_column(String(255))
+
+
+class Job(Base):
+    """Phase 4.5 jobs surface: a persisted, pollable progress row for the
+    creation wizard's goal -> draft -> backfill flow and for bucket-delete
+    re-triage. Replaces the old fire-and-forget SSE popup (task_draft_ready),
+    whose stranded-after-a-connection-blip failure mode motivated moving this
+    state into Postgres — see task_engine/jobs_repo.py for the stage machines
+    this backs."""
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # Jobs are always user-owned — unlike Task.user_id, never NULL.
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # 'creation' | 'delete_retriage'
+    task_kind: Mapped[str | None] = mapped_column(String(16))  # 'tracker' | 'bucket' — creation jobs only
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Denormalized: true only while stage='draft_ready' — the header chip's
+    # blue-dot query reads this instead of re-deriving it from stage.
+    needs_user: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # The proposed draft (creation jobs): {name, description, criteria,
+    # state_schema, keyword_probes, positives, near_misses}. none_as_null=True
+    # for the same reason as Task.state_schema — a Python None must persist as
+    # SQL NULL, not the JSON scalar 'null'.
+    payload: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
+    # Set at confirm-time (creation) or at enqueue-time (delete_retriage = the
+    # deleted bucket's id).
+    task_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("tasks.id"))
+    goal: Mapped[str] = mapped_column(Text, nullable=False, default="")  # creation jobs; display-name fallback
+    scanned: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    matched: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    error: Mapped[str | None] = mapped_column(Text)  # populated on stage='failed'
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # user dismissal
