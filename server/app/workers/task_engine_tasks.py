@@ -962,7 +962,11 @@ def backfill_task(
         _publish_task_updated(db, user_id=user_id, task=task)
     except Exception as exc:
         log.exception("backfill_task: task=%s failed", task_id)
-        db.rollback()
+        # Guard rollback so it can't replace the original exception if connection drops.
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("backfill_task: rollback failed; original error takes precedence")
         if job_id is not None:
             _record_job_failure(user_id=user_id, job_id=job_id, error=str(exc))
         raise

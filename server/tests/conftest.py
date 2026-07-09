@@ -1,5 +1,8 @@
 import os
 # Set test env BEFORE app modules load settings.
+# CELERY_TASK_ALWAYS_EAGER must be set before celery_app imports (which freezes it at first import).
+# Tests are collected alphabetically, so conftest runs before individual test files.
+os.environ.setdefault("CELERY_TASK_ALWAYS_EAGER", "1")
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"  # overridden per-test by fakeredis patches
 os.environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
 os.environ["SESSION_SECRET"] = "test-session-secret"
