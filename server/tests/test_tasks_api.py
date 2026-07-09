@@ -1,14 +1,16 @@
-"""Task 10: server/app/api/tasks.py — the full draft/CRUD/board/events/
-corrections router.
+"""Task 10 (+ Phase 4.5 Task 3 trim): server/app/api/tasks.py — the tracker/
+bucket CRUD/board/events/corrections router.
 
 Authed-client pattern mirrors test_inbox_api.py/test_buckets_api.py (file-
-backed sqlite `authed` fixture, session cookie via app.auth.sessions).
-draft_cache is redis-backed (fakeredis, matching test_propose_task.py's
-fake_redis fixture); the two celery enqueues (propose_task_draft/
-backfill_task/extract_for_thread) are monkeypatched at their apply_async
-call sites so no real broker is needed; `app.workers.tasks._publish` is
-captured the same way test_task_engine_tasks.py does, since api/tasks.py
-calls it via the same late-bound `tasks` module reference.
+backed sqlite `authed` fixture, session cookie via app.auth.sessions). The
+two celery enqueues (backfill_task/extract_for_thread) are monkeypatched at
+their apply_async call sites so no real broker is needed; `app.workers.
+tasks._publish` is captured the same way test_task_engine_tasks.py does,
+since api/tasks.py calls it via the same late-bound `tasks` module
+reference. The old goal->draft flow (`POST/GET /tasks/draft*`) retired in
+favor of the jobs surface — see test_jobs_api.py — and its tests (draft
+post/pending/ready, 404, 403) moved there in job-based form; a retirement
+probe (both routes now 404) lives in test_jobs_api.py too.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -24,7 +26,6 @@ from app.db.models import Base, User
 from app.db.session import get_db
 from app.inbox import inbox_repo
 from app.main import app
-from app.task_engine import draft_cache
 from app.task_engine import repo as task_repo
 
 SINGLETON_SCHEMA = {
@@ -59,14 +60,6 @@ def authed(tmp_path):
     yield c, TS
     app.dependency_overrides.clear()
     eng.dispose()
-
-
-@pytest.fixture
-def fake_redis(monkeypatch):
-    import fakeredis
-    r = fakeredis.FakeStrictRedis(decode_responses=True)
-    monkeypatch.setattr("app.realtime.redis_client.get_redis", lambda: r)
-    return r
 
 
 def _capture_publish(monkeypatch) -> list:
@@ -131,49 +124,6 @@ def _seed_pending_event(TS, task_id, *, uid="u1", field="stage", new_value="in_p
 def test_unauth_returns_401():
     c = TestClient(app)
     assert c.get("/api/tasks").status_code == 401
-
-
-# ---------------------------------------------------------------------------
-# Draft: goal -> proposed schema/criteria
-# ---------------------------------------------------------------------------
-
-
-def test_draft_post_202_then_pending_then_ready(authed, fake_redis):
-    c, TS = authed
-    with patch("app.api.tasks.task_engine_tasks.propose_task_draft.apply_async") as mock_apply:
-        r = c.post("/api/tasks/draft", json={"goal": "track my visa application"})
-    assert r.status_code == 202
-    draft_id = r.json()["draft_id"]
-    mock_apply.assert_called_once_with(
-        args=["u1", draft_id, "track my visa application"], countdown=0,
-    )
-
-    pending = c.get(f"/api/tasks/draft/{draft_id}")
-    assert pending.status_code == 202
-    assert pending.json() == {"status": "pending"}
-
-    draft_cache.store_result(
-        draft_id, user_id="u1",
-        payload={"proposal": {"name": "Visa", "state_schema": SINGLETON_SCHEMA,
-                              "description": "d", "keyword_probes": []},
-                "positives": [], "near_misses": []},
-    )
-    ready = c.get(f"/api/tasks/draft/{draft_id}")
-    assert ready.status_code == 200
-    body = ready.json()
-    assert body["status"] == "ready"
-    assert body["proposal"]["name"] == "Visa"
-
-
-def test_draft_get_404_unknown(authed, fake_redis):
-    c, TS = authed
-    assert c.get("/api/tasks/draft/nope").status_code == 404
-
-
-def test_draft_get_403_other_user(authed, fake_redis):
-    c, TS = authed
-    draft_cache.mark_pending("d1", user_id="u2")
-    assert c.get("/api/tasks/draft/d1").status_code == 403
 
 
 # ---------------------------------------------------------------------------
