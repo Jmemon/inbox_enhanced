@@ -15,18 +15,18 @@ function's body instead of a top-level `from app.workers.tasks import ...`.
 No `sync_lock` anywhere in this module. Most tasks here only ever READ
 `inbox_threads`/`inbox_messages`, so there's nothing that can race the sync
 path's `(user_id, gmail_id)` unique constraint (the hazard sync_lock exists
-to guard). The one exception is `_run_bucket_backfill`, which DOES write
-`InboxThread.bucket_id` — still without sync_lock, because it does no Gmail
-I/O of its own and so never touches the unique-constraint hazard the lock
-guards against. That write path has its own, narrower race instead: a
-concurrent poll (holding sync_lock, re-triaging the same thread against
-FRESH content) can commit a different bucket_id while a backfill batch —
-which read the OLD bucket_id as its stability hint before its own
-multi-second `classify.triage()` round-trip — is still mid-flight.
-`_run_bucket_backfill` guards against this optimistically: immediately
-before writing, it re-reads `bucket_id` fresh (a column-level `select()`,
+to guard). Two exceptions are `_run_bucket_backfill` and `retriage_deleted_bucket`,
+which DO write `InboxThread.bucket_id` — still without sync_lock, because
+they do no Gmail I/O of their own and so never touch the unique-constraint
+hazard the lock guards against. Those write paths have their own, narrower
+race instead: a concurrent poll (holding sync_lock, re-triaging the same
+thread against FRESH content) can commit a different bucket_id while a
+backfill/retriage batch — which read the OLD bucket_id as its stability
+hint before its own multi-second `classify.triage()` round-trip — is still
+mid-flight. Both functions guard against this optimistically: immediately
+before writing, they re-read `bucket_id` fresh (a column-level `select()`,
 which always issues a real query rather than resolving from the session's
-identity map) and skips the write — and the `threads_updated` publish — if
+identity map) and skip the write — and the `threads_updated` publish — if
 the row moved since the read that fed `triage()`. Idempotency for the two
 extraction tasks instead comes entirely from
 `transitions.validate_and_stage`'s step 7 (SELECT-first check against
@@ -921,9 +921,10 @@ def retriage_deleted_bucket(user_id: str, job_id: str, deleted_task_id: str) -> 
     the way `_backfill_candidate_pool` needs, since every candidate here is
     already known by construction: it IS the orphaned set, not something to
     search for. A small window may have passed since the delete route's own
-    COUNT query, so this is a fresh read, not a re-use of that count (the
-    job's `total` was already set from that count and is left as-is here;
-    `scanned`/`matched` below are computed against THIS run's own set).
+    COUNT query, so this is a fresh read. On the first batch, `_write_job_progress`
+    self-reconciles the job's `total` with this run's fresh count (overwriting
+    the API-time count); only a fully-empty candidate set leaves that original
+    total untouched. `scanned`/`matched` below are computed against THIS run's own set.
 
     Each `BACKFILL_TRIAGE_BATCH` batch is triaged against `list_active_
     buckets` (resolved once, up front -- same read-once semantics
