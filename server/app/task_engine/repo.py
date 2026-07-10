@@ -28,6 +28,7 @@ enforces them for you:
 
 import uuid
 from datetime import datetime, timezone
+from typing import NamedTuple
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -169,6 +170,24 @@ def soft_delete_task(db: Session, *, task: Task) -> None:
 # ---------------------------------------------------------------------------
 
 
+class LinkUpsert(NamedTuple):
+    """upsert_link's return contract (Phase 5, actions spec 006 Task 3):
+    `link` is the row (or None on the sticky no-op below); `newly_attached`
+    is True iff this call is what put the row into state='attached' —
+    either a fresh INSERT with state='attached', or an UPDATE that
+    transitioned an existing row from absent/'detached' into 'attached'.
+    A confidence/origin refresh of an ALREADY-'attached' row is False (it
+    didn't just become relevant — it already was), and a call that sets
+    state='detached' is always False regardless of the row's prior state.
+    This is the freshness signal app.actions.engine.fire_rules_for_link's
+    callers gate on — only a genuinely new attachment may fire a
+    thread_linked rule, never a refresh or a detach (see that module and
+    this function's callers for the gating)."""
+
+    link: TaskThreadLink | None
+    newly_attached: bool
+
+
 def upsert_link(
     db: Session,
     *,
@@ -178,16 +197,17 @@ def upsert_link(
     origin: str,
     state: str = "attached",
     confidence: int | None = None,
-) -> TaskThreadLink | None:
+) -> LinkUpsert:
     """Insert-or-update the (task_id, thread_id) link (uq_task_thread).
 
     THE sticky rule: if a row already exists with origin='user' and this call
-    passes origin='llm', the call is a no-op — returns None and changes
-    nothing. This is what lets a user's explicit attach/detach survive a
-    later automatic reclassify. Every other combination (no existing row;
-    existing row is origin='llm'; this call is origin='user' regardless of
-    the existing row's origin) inserts or updates state/confidence/origin/
-    updated_at and returns the row.
+    passes origin='llm', the call is a no-op — returns LinkUpsert(None, False)
+    and changes nothing. This is what lets a user's explicit attach/detach
+    survive a later automatic reclassify. Every other combination (no
+    existing row; existing row is origin='llm'; this call is origin='user'
+    regardless of the existing row's origin) inserts or updates state/
+    confidence/origin/updated_at and returns LinkUpsert(row, newly_attached)
+    — see LinkUpsert's own docstring for exactly what newly_attached means.
     """
     row = db.execute(
         select(TaskThreadLink).where(
@@ -197,7 +217,7 @@ def upsert_link(
     ).scalar_one_or_none()
 
     if row is not None and row.origin == "user" and origin == "llm":
-        return None
+        return LinkUpsert(link=None, newly_attached=False)
 
     now = datetime.now(timezone.utc)
     if row is None:
@@ -214,12 +234,15 @@ def upsert_link(
         )
         db.add(row)
         db.flush()
-    else:
-        row.origin = origin
-        row.state = state
-        row.confidence = confidence
-        row.updated_at = now
-    return row
+        return LinkUpsert(link=row, newly_attached=state == "attached")
+
+    was_attached = row.state == "attached"
+    row.origin = origin
+    row.state = state
+    row.confidence = confidence
+    row.updated_at = now
+    newly_attached = state == "attached" and not was_attached
+    return LinkUpsert(link=row, newly_attached=newly_attached)
 
 
 def list_attached_thread_ids(db: Session, *, task_id: str) -> set[str]:

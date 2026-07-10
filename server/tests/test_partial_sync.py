@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from googleapiclient.errors import HttpError
 from sqlalchemy import select, func
+from app.actions import repo as actions_repo
 from app.config import get_settings
 from app.db.models import Base, InboxMessage, InboxThread, User
 from app.gmail.parser import ParsedMessage, ParsedThread
@@ -846,3 +847,86 @@ def test_partial_sync_does_not_overwrite_existing_user_origin_link(db, user, see
     assert link.origin == "user"
     assert link.state == "detached", \
         "sticky rule: an origin='user' detached link must not be re-attached by an llm upsert"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (actions, spec 006 §3): a freshly-attached llm link fires
+# thread_linked rules, right after partial_sync_inbox's own commit.
+# ---------------------------------------------------------------------------
+
+
+def test_partial_sync_fresh_link_fires_thread_linked_rule(db, user, seeded_thread, monkeypatch):
+    task = task_repo.create_task(db, user_id=user.id, name="T", goal="", criteria="",
+                                 state_schema=None)
+    db.commit()
+    actions_repo.create_rule(
+        db, task_id=task.id, trigger="thread_linked", trigger_params=None,
+        action_type="archive_thread", action_params=None, mode="propose",
+    )
+    db.commit()
+
+    published = []
+    monkeypatch.setattr("app.workers.tasks._publish", lambda *a: published.append(a))
+
+    records = [{"messagesAdded": [{"message": {"id": "g-m3", "threadId": "g-t1"}}]}]
+    payload = _fake_thread_payload(tid="g-t1", mid="g-m3", history_id="300")
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    def _fake_triage(threads, buckets, trackers, current, **kw):
+        return [(None, [(task.id, 90)])]
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail), \
+         patch("app.workers.gmail_sync.triage", side_effect=_fake_triage):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="300")
+
+    thread = db.execute(select(InboxThread).where(
+        InboxThread.user_id == user.id, InboxThread.gmail_id == "g-t1")).scalar_one()
+    link = task_repo.get_link(db, task_id=task.id, thread_id=thread.id)
+    assert link is not None
+
+    pending = actions_repo.list_pending_actions_for_user(db, user_id=user.id)
+    assert len(pending) == 1
+    action, _ = pending[0]
+    assert action.source_link_id == link.id
+    assert action.status == "proposed"
+    assert (user.id, "action_updated", {"task_id": task.id}) in published
+
+
+def test_partial_sync_confidence_refresh_of_attached_link_does_not_refire(db, user, seeded_thread, monkeypatch):
+    """upsert_link's newly_attached=False for a mere confidence refresh of an
+    already-'attached' row — a second sync round over the same thread must
+    not fire a second thread_linked action."""
+    task = task_repo.create_task(db, user_id=user.id, name="T", goal="", criteria="",
+                                 state_schema=None)
+    db.commit()
+    # Already attached from a prior sync round.
+    task_repo.upsert_link(db, task_id=task.id, thread_id=seeded_thread.id, user_id=user.id,
+                          origin="llm", state="attached", confidence=70)
+    db.commit()
+    actions_repo.create_rule(
+        db, task_id=task.id, trigger="thread_linked", trigger_params=None,
+        action_type="archive_thread", action_params=None, mode="propose",
+    )
+    db.commit()
+
+    published = []
+    monkeypatch.setattr("app.workers.tasks._publish", lambda *a: published.append(a))
+
+    records = [{"messagesAdded": [{"message": {"id": "g-m3", "threadId": "g-t1"}}]}]
+    payload = _fake_thread_payload(tid="g-t1", mid="g-m3", history_id="300")
+    gmail = MagicMock()
+    gmail.users().threads().get().execute.return_value = payload
+
+    def _fake_triage(threads, buckets, trackers, current, **kw):
+        return [(None, [(task.id, 95)])]  # confidence refresh, still attached
+
+    with patch("app.workers.gmail_sync.get_gmail_client", return_value=gmail), \
+         patch("app.workers.gmail_sync.triage", side_effect=_fake_triage):
+        gmail_sync.partial_sync_inbox(db, user=user, history_records=records,
+                                      new_history_id="300")
+
+    pending = actions_repo.list_pending_actions_for_user(db, user_id=user.id)
+    assert pending == []
+    assert published == []

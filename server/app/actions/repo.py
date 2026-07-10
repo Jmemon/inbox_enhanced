@@ -179,6 +179,44 @@ def _find_existing_action(
     return db.execute(stmt).scalar_one_or_none()
 
 
+def reject_proposed_for_source(
+    db: Session, *, source_event_id: str | None = None, source_link_id: str | None = None,
+) -> int:
+    """Auto-reject substrate for spec §6 invariant 7: every still-'proposed'
+    TaskAction whose source_event_id/source_link_id matches flips to
+    'rejected'. No commit — callers are api/tasks.py's revert_event (source_
+    event_id, one event) and detach_thread (source_link_id for the link
+    itself, plus source_event_id for each applied event detach reverts along
+    the way), which invoke this INSIDE their own existing transaction so the
+    flip lands in the same commit as the revert/detach it accompanies.
+
+    Lives here (not task_engine/repo.py) — and is called directly from the
+    API route layer rather than through a task_engine.repo wrapper — because
+    task_engine/repo.py has no separate "revert_event"/"detach_link"
+    functions of its own to hang this off of; that logic already lives
+    inline in api/tasks.py's routes (revert_event/detach_thread directly
+    flip event.status and call upsert_link). Since those routes already
+    import this module for the fire-rules hooks, calling straight in from
+    there avoids introducing a task_engine -> actions import for logic with
+    exactly one call site.
+
+    Exactly one of source_event_id/source_link_id must be given, mirroring
+    ActionIntent's own XOR contract (insert_intent asserts the same thing on
+    the write side)."""
+    assert (source_event_id is None) != (source_link_id is None), (
+        "reject_proposed_for_source requires exactly one of source_event_id/source_link_id"
+    )
+    stmt = select(TaskAction).where(TaskAction.status == "proposed")
+    if source_event_id is not None:
+        stmt = stmt.where(TaskAction.source_event_id == source_event_id)
+    else:
+        stmt = stmt.where(TaskAction.source_link_id == source_link_id)
+    rows = list(db.execute(stmt).scalars().all())
+    for row in rows:
+        row.status = "rejected"
+    return len(rows)
+
+
 def get_owned_action(db: Session, *, user_id: str, action_id: str) -> TaskAction | None:
     """Fetch one action scoped to its owner via a join through Task — same
     pattern as get_owned_rule (TaskAction has no user_id column either)."""

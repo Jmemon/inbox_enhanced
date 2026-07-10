@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.actions import repo as actions_repo
 from app.auth import sessions
 from app.db.models import Base, User
 from app.db.session import get_db
@@ -1760,3 +1761,214 @@ def test_reviews_entity_display_name_null_when_neither_entity_nor_proposed(authe
     r = c.get("/api/reviews")
     item = next(i for i in r.json()["reviews"] if i["id"] == ev_id)
     assert item["entity_display_name"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (actions, spec 006 Task 3): rule-firing hooks + revert/detach
+# auto-reject. The rules CRUD API itself is T4 — rules are seeded directly
+# via actions_repo here, exactly like the pending-review provenance fields
+# were exercised before their own routes existed.
+# ---------------------------------------------------------------------------
+
+
+def _seed_link_rule(TS, task_id, *, action_type="archive_thread", action_params=None, mode="propose"):
+    db = TS()
+    rule = actions_repo.create_rule(
+        db, task_id=task_id, trigger="thread_linked", trigger_params=None,
+        action_type=action_type, action_params=action_params, mode=mode,
+    )
+    db.commit()
+    rule_id = rule.id
+    db.close()
+    return rule_id
+
+
+def _seed_stage_rule(TS, task_id, *, stage="in_progress", action_type="archive_thread",
+                      action_params=None, mode="propose"):
+    db = TS()
+    rule = actions_repo.create_rule(
+        db, task_id=task_id, trigger="entity_entered_stage", trigger_params={"stage": stage},
+        action_type=action_type, action_params=action_params, mode=mode,
+    )
+    db.commit()
+    rule_id = rule.id
+    db.close()
+    return rule_id
+
+
+def test_attach_thread_fires_thread_linked_rule_propose_mode(authed, monkeypatch):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gRuleA")
+    _seed_link_rule(TS, task_id)
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"):
+        r = c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+    assert r.status_code == 201
+
+    db = TS()
+    pending = actions_repo.list_pending_actions_for_user(db, user_id="u1")
+    assert len(pending) == 1
+    action, _ = pending[0]
+    assert action.status == "proposed"
+    link = task_repo.get_link(db, task_id=task_id, thread_id=thread_id)
+    assert action.source_link_id == link.id
+
+
+def test_attach_thread_fires_thread_linked_rule_auto_mode_enqueues_execute_action(authed, monkeypatch):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gRuleB")
+    _seed_link_rule(TS, task_id, mode="auto")
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"), \
+         patch("app.workers.action_tasks.execute_action.apply_async") as mock_apply:
+        r = c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+    assert r.status_code == 201
+
+    mock_apply.assert_called_once()
+    args, kwargs = mock_apply.call_args
+    assert kwargs["args"][0] == "u1"
+
+
+def test_attach_thread_re_attach_of_already_attached_thread_does_not_refire(authed, monkeypatch):
+    """A second attach call on an already-attached thread is not a fresh
+    attachment (upsert_link's newly_attached=False) — must not fire again."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gRuleC")
+    _seed_link_rule(TS, task_id)
+
+    with patch("app.api.tasks.task_engine_tasks.extract_for_thread.apply_async"):
+        c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+        r2 = c.post(f"/api/tasks/{task_id}/threads", json={"thread_id": thread_id})
+    assert r2.status_code == 201
+
+    db = TS()
+    pending = actions_repo.list_pending_actions_for_user(db, user_id="u1")
+    assert len(pending) == 1  # not two
+
+
+def test_approve_event_fires_entity_entered_stage_rule(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gRuleD")
+    _seed_stage_rule(TS, task_id, stage="in_progress")
+
+    db = TS()
+    task = task_repo.get_owned_task(db, user_id="u1", task_id=task_id)
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    event = task_repo.append_event(
+        db, task=task, entity=entity, origin="llm", status="pending_review",
+        field="stage", new_value="in_progress", evidence_quote="quote",
+        thread_id=thread_id,
+    )
+    db.commit()
+    ev_id = event.id
+    db.close()
+
+    r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/approve")
+    assert r.status_code == 200
+
+    db2 = TS()
+    pending = actions_repo.list_pending_actions_for_user(db2, user_id="u1")
+    assert len(pending) == 1
+    action, _ = pending[0]
+    assert action.source_event_id == ev_id
+
+
+def test_manual_state_edit_does_not_fire_rules_no_thread_to_act_on(authed):
+    """A manual state edit carries no thread_id — there is structurally
+    nothing for an entity_entered_stage rule to act on (archive/label/
+    draft-reply all need a concrete thread), so this must be a deliberate
+    no-op even though the rule itself would otherwise match."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    _seed_stage_rule(TS, task_id, stage="in_progress")
+
+    db = TS()
+    entity = task_repo.get_or_create_entity(
+        db, task_id=task_id, user_id="u1", entity_key="_self", display_name="Self",
+    )
+    db.commit()
+    entity_id = entity.id
+    db.close()
+
+    r = c.post(
+        f"/api/tasks/{task_id}/entities/{entity_id}/state",
+        json={"field": "stage", "value": "in_progress"},
+    )
+    assert r.status_code == 200
+
+    db2 = TS()
+    assert actions_repo.list_pending_actions_for_user(db2, user_id="u1") == []
+
+
+def test_detach_thread_auto_rejects_proposed_link_sourced_action(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    thread_id = _seed_thread(TS, gmail_thread_id="gRuleE")
+
+    db = TS()
+    task_repo.upsert_link(db, task_id=task_id, thread_id=thread_id, user_id="u1",
+                          origin="llm", state="attached")
+    db.commit()
+    link = task_repo.get_link(db, task_id=task_id, thread_id=thread_id)
+    rule = actions_repo.create_rule(
+        db, task_id=task_id, trigger="thread_linked", trigger_params=None,
+        action_type="archive_thread", action_params=None, mode="propose",
+    )
+    from app.actions.rules import ActionIntent
+    action = actions_repo.insert_intent(
+        db, task_id=task_id,
+        intent=ActionIntent(
+            rule_id=rule.id, action_type="archive_thread", action_params=None,
+            source_event_id=None, source_link_id=link.id,
+            thread_id=thread_id, gmail_thread_id="gRuleE",
+        ),
+    )
+    db.commit()
+    action_id = action.id
+    db.close()
+
+    r = c.delete(f"/api/tasks/{task_id}/threads/{thread_id}")
+    assert r.status_code == 204
+
+    db2 = TS()
+    settled = actions_repo.get_owned_action(db2, user_id="u1", action_id=action_id)
+    assert settled.status == "rejected"
+
+
+def test_revert_event_auto_rejects_proposed_event_sourced_action(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_pending_event(TS, task_id)
+    c.post(f"/api/tasks/{task_id}/events/{ev_id}/approve")
+
+    db = TS()
+    rule = actions_repo.create_rule(
+        db, task_id=task_id, trigger="entity_entered_stage", trigger_params={"stage": "in_progress"},
+        action_type="archive_thread", action_params=None, mode="propose",
+    )
+    from app.actions.rules import ActionIntent
+    action = actions_repo.insert_intent(
+        db, task_id=task_id,
+        intent=ActionIntent(
+            rule_id=rule.id, action_type="archive_thread", action_params=None,
+            source_event_id=ev_id, source_link_id=None,
+            thread_id="thread-x", gmail_thread_id="gmail-thread-x",
+        ),
+    )
+    db.commit()
+    action_id = action.id
+    db.close()
+
+    r = c.post(f"/api/tasks/{task_id}/events/{ev_id}/revert")
+    assert r.status_code == 200
+
+    db2 = TS()
+    settled = actions_repo.get_owned_action(db2, user_id="u1", action_id=action_id)
+    assert settled.status == "rejected"

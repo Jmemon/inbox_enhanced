@@ -44,6 +44,7 @@ import logging
 
 from sqlalchemy import select
 
+from app.actions import engine as actions_engine
 from app.config import get_settings
 from app.db.models import InboxThread, User
 from app.db.session import SessionLocal as _AppSessionLocal
@@ -149,12 +150,26 @@ def process_task_updates(user_id: str, thread_ids: list[str]) -> None:
         return
     db = SessionLocal()
     try:
+        from app.workers.tasks import _publish
+
+        # Batch-resolved ONCE for the whole call (not per task/pair) so the
+        # Phase 5 fire_rules_for_event hook below never N+1s a thread lookup
+        # per applied event -- every pair this run might touch is a subset
+        # of `touched`, known up front.
+        threads_by_id = {
+            t.id: t for t in inbox_repo.get_threads_batch(db, user_id=user_id, thread_ids=list(touched))
+        }
+
         for task in task_repo.list_active_trackers(db, user_id=user_id):
             try:
                 attached = task_repo.list_attached_thread_ids(db, task_id=task.id)
                 pairs = sorted(attached & touched)
                 if not pairs:
                     continue
+
+                # Load rules once per task for the Phase 5 firing loop below,
+                # avoiding N+1 queries if this task's extraction applies multiple events.
+                task_rules = actions_engine.actions_repo.list_rules(db, task_id=task.id)
 
                 version_before = task.version
                 any_pending = False
@@ -167,6 +182,20 @@ def process_task_updates(user_id: str, thread_ids: list[str]) -> None:
                     if staged.pending:
                         any_pending = True
                     db.commit()
+
+                    # Phase 5 (actions, spec 006 §3): fire entity_entered_
+                    # stage rules for every event this pair's extraction just
+                    # applied, AFTER the commit above so a firing failure can
+                    # never roll back the applied event itself.
+                    if staged.applied:
+                        thread_row = threads_by_id.get(thread_id)
+                        if thread_row is not None:
+                            for event in staged.applied:
+                                actions_engine.fire_rules_for_event(
+                                    db, user_id=user_id, task=task, event=event,
+                                    thread_id=thread_id, gmail_thread_id=thread_row.gmail_id,
+                                    publish=_publish, rules=task_rules,
+                                )
 
                 if not any_pending and task.version == version_before:
                     log.info(
@@ -218,6 +247,20 @@ def extract_for_thread(user_id: str, task_id: str, thread_id: str) -> None:
         if staged is None:
             return
         db.commit()
+
+        # Phase 5 (actions, spec 006 §3): same hook as process_task_updates,
+        # for this single-pair variant.
+        if staged.applied:
+            thread_row = inbox_repo.get_thread(db, user_id=user_id, thread_id=thread_id)
+            if thread_row is not None:
+                from app.workers.tasks import _publish
+
+                for event in staged.applied:
+                    actions_engine.fire_rules_for_event(
+                        db, user_id=user_id, task=task, event=event,
+                        thread_id=thread_id, gmail_thread_id=thread_row.gmail_id,
+                        publish=_publish,
+                    )
 
         if not staged.pending and task.version == version_before:
             log.info("extract_for_thread: task=%s no change, skipping publish", task.id)
@@ -684,11 +727,16 @@ def _run_tracker_backfill(
         if triples:
             ordered_ids = [tid for tid, _, _ in triples]
             parsed_list = [parsed for _, _, parsed in triples]
+            gmail_id_by_thread = {tid: parsed.gmail_thread_id for tid, _, parsed in triples}
             results = classify.triage(
                 parsed_list, buckets=[], trackers=[task],
                 current_bucket_ids=[None] * len(parsed_list), user_id=user_id,
                 task_id=task.id,
             )
+            # Phase 5 (actions, spec 006 §3): freshly-attached links this
+            # batch, collected for thread_linked rule firing right after the
+            # batch's own commit below.
+            fresh_links: list[tuple] = []
             for thread_id, (_, relevant_tasks) in zip(ordered_ids, results):
                 if not relevant_tasks:
                     continue
@@ -697,13 +745,22 @@ def _run_tracker_backfill(
                 _, confidence = relevant_tasks[0]
                 if confidence < settings.task_link_confidence:
                     continue
-                link = task_repo.upsert_link(
+                link_upsert = task_repo.upsert_link(
                     db, task_id=task.id, thread_id=thread_id, user_id=user_id,
                     origin="llm", state="attached", confidence=confidence,
                 )
-                if link is not None:
+                if link_upsert.link is not None:
                     matched_thread_ids.add(thread_id)
+                    if link_upsert.newly_attached:
+                        fresh_links.append((link_upsert.link, thread_id, gmail_id_by_thread[thread_id]))
             db.commit()
+
+            if fresh_links:
+                for link, thread_id, gmail_thread_id in fresh_links:
+                    actions_engine.fire_rules_for_link(
+                        db, user_id=user_id, task=task, link=link,
+                        thread_id=thread_id, gmail_thread_id=gmail_thread_id, publish=publish,
+                    )
 
         # scanned tracks progress through the whole candidate pool,
         # including ids load_parsed_threads dropped -- those still
@@ -735,6 +792,17 @@ def _run_tracker_backfill(
             if staged is None:
                 continue
             db.commit()
+
+            # Phase 5 (actions, spec 006 §3): same hook as
+            # process_task_updates/extract_for_thread, for backfill's own
+            # extraction phase.
+            if staged.applied:
+                for event in staged.applied:
+                    actions_engine.fire_rules_for_event(
+                        db, user_id=user_id, task=task, event=event,
+                        thread_id=thread.id, gmail_thread_id=thread.gmail_id,
+                        publish=publish,
+                    )
         except Exception:
             log.exception(
                 "backfill_task: task=%s thread=%s extraction failed; continuing",

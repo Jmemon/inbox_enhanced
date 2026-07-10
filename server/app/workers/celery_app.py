@@ -27,7 +27,7 @@ def _build_app() -> Celery:
         "inbox_enhanced",
         broker=settings.redis_url,
         backend=settings.redis_url,
-        include=["app.workers.tasks", "app.workers.task_engine_tasks"],
+        include=["app.workers.tasks", "app.workers.task_engine_tasks", "app.workers.action_tasks"],
     )
     app.conf.update(
         task_serializer="json",

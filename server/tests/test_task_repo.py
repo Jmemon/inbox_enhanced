@@ -130,15 +130,38 @@ def test_upsert_link_inserts_new_row(two_users):
     thread = _mk_thread(two_users)
     two_users.commit()
 
-    link = repo.upsert_link(
+    result = repo.upsert_link(
         two_users, task_id=task.id, thread_id=thread.id, user_id="u1", origin="llm", confidence=80
     )
     two_users.commit()
 
-    assert link is not None
-    assert link.origin == "llm"
-    assert link.state == "attached"
-    assert link.confidence == 80
+    assert result.link is not None
+    assert result.link.origin == "llm"
+    assert result.link.state == "attached"
+    assert result.link.confidence == 80
+    # Fresh insert straight into state='attached' -- newly_attached (Phase 5
+    # actions, spec 006 Task 3): this is exactly the freshness signal
+    # fire_rules_for_link's callers gate a thread_linked rule fire on.
+    assert result.newly_attached is True
+
+
+def test_upsert_link_insert_as_detached_is_not_newly_attached(two_users):
+    """An insert that lands directly in state='detached' (not the common
+    case, but upsert_link's state param defaults to 'attached' rather than
+    being forced) must not report newly_attached -- it never became
+    attached at all."""
+    task = _mk_task(two_users)
+    thread = _mk_thread(two_users)
+    two_users.commit()
+
+    result = repo.upsert_link(
+        two_users, task_id=task.id, thread_id=thread.id, user_id="u1",
+        origin="user", state="detached",
+    )
+    two_users.commit()
+
+    assert result.link is not None
+    assert result.newly_attached is False
 
 
 def test_upsert_link_llm_over_existing_user_row_is_sticky_noop(two_users):
@@ -155,7 +178,10 @@ def test_upsert_link_llm_over_existing_user_row_is_sticky_noop(two_users):
     )
     two_users.commit()
 
-    assert result is None
+    # The sticky no-op resolves to LinkUpsert(None, False) exactly -- both
+    # halves of the tuple, not just the link.
+    assert result.link is None
+    assert result.newly_attached is False
     row = repo.get_link(two_users, task_id=task.id, thread_id=thread.id)
     assert row.origin == "user"
     assert row.state == "attached"
@@ -175,9 +201,12 @@ def test_upsert_link_user_over_existing_llm_row_updates(two_users):
                                origin="user", state="detached")
     two_users.commit()
 
-    assert result is not None
-    assert result.origin == "user"
-    assert result.state == "detached"
+    assert result.link is not None
+    assert result.link.origin == "user"
+    assert result.link.state == "detached"
+    # Transitioning OUT of 'attached' is never newly_attached, regardless of
+    # origin.
+    assert result.newly_attached is False
 
 
 def test_upsert_link_llm_over_existing_llm_row_updates(two_users):
@@ -193,8 +222,31 @@ def test_upsert_link_llm_over_existing_llm_row_updates(two_users):
                                origin="llm", confidence=90)
     two_users.commit()
 
-    assert result is not None
-    assert result.confidence == 90
+    assert result.link is not None
+    assert result.link.confidence == 90
+    # A confidence refresh of an ALREADY-attached row is not a fresh
+    # attachment -- it was already relevant before this call.
+    assert result.newly_attached is False
+
+
+def test_upsert_link_detached_to_attached_is_newly_attached(two_users):
+    """The other half of the transition matrix: a row that WAS detached,
+    re-attached (e.g. a tracker reclassifying a previously-detached thread
+    back in) IS newly_attached -- it just became relevant again."""
+    task = _mk_task(two_users)
+    thread = _mk_thread(two_users)
+    two_users.commit()
+
+    repo.upsert_link(two_users, task_id=task.id, thread_id=thread.id, user_id="u1",
+                      origin="llm", state="detached")
+    two_users.commit()
+
+    result = repo.upsert_link(two_users, task_id=task.id, thread_id=thread.id, user_id="u1",
+                               origin="llm", state="attached", confidence=80)
+    two_users.commit()
+
+    assert result.link is not None
+    assert result.newly_attached is True
 
 
 def test_upsert_link_idempotent_on_uq_task_thread(two_users):
