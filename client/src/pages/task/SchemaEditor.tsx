@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { TaskStateSchema } from '../../lib/api'
 
@@ -64,7 +64,7 @@ export function SchemaEditor({ value, onChange }: {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      <ChipList
+      <PipelineChipList
         label="pipeline stages"
         items={value.pipeline.stages}
         onChange={stages => onChange({ ...value, pipeline: { ...value.pipeline, stages } })}
@@ -185,6 +185,93 @@ function ChipList({ label, items, onChange }: {
   )
 }
 
+// Like ChipList, but for `pipeline.stages`: the array's ORDER is meaningful
+// (it drives board column order and backward-move detection server-side), so
+// this variant renders `→` separators between chips and lets the user
+// reorder — drag-and-drop for mouse users, ◀/▶ buttons as the keyboard/
+// screen-reader-accessible fallback since HTML5 drag-and-drop alone isn't
+// operable without a pointer. Terminal stages have no such order, so they
+// stay on the plain ChipList above, untouched.
+function PipelineChipList({ label, items, onChange }: {
+  label: string; items: string[]; onChange: (items: string[]) => void
+}) {
+  // Index of the chip being dragged, and the chip currently hovered as a
+  // drop target — both null when no drag is in flight. Purely local
+  // interaction state; the array itself only changes on drop/move.
+  const [dragIndex, setDragIndex] = useState<number | null>(null)
+  const [overIndex, setOverIndex] = useState<number | null>(null)
+
+  function update(i: number, v: string) {
+    onChange(items.map((s, idx) => (idx === i ? v : s)))
+  }
+  function remove(i: number) {
+    onChange(items.filter((_, idx) => idx !== i))
+  }
+  // Shared by both drag-drop and the keyboard ◀/▶ buttons: pull the stage
+  // out of `from` and reinsert at `to`. No-ops out of range or onto itself
+  // (dropping a chip on its own slot, or nudging past either end).
+  function move(from: number, to: number) {
+    if (to < 0 || to >= items.length || from === to) return
+    const next = items.slice()
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    onChange(next)
+  }
+  function endDrag() {
+    setDragIndex(null)
+    setOverIndex(null)
+  }
+
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: '#666', marginBottom: 6 }}>{label}</div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+        {items.map((item, i) => (
+          <Fragment key={i}>
+            {i > 0 && <span aria-hidden="true" style={arrowStyle}>→</span>}
+            <div
+              draggable
+              onDragStart={() => setDragIndex(i)}
+              onDragOver={e => { e.preventDefault(); setOverIndex(i) }}
+              onDrop={e => {
+                e.preventDefault()
+                if (dragIndex !== null) move(dragIndex, i)
+                endDrag()
+              }}
+              onDragEnd={endDrag}
+              style={{
+                ...chipStyle,
+                opacity: dragIndex === i ? 0.4 : 1,
+                boxShadow: overIndex === i && dragIndex !== null && dragIndex !== i ? 'inset 0 0 0 2px #6b7cff' : 'none',
+              }}
+            >
+              <button
+                style={{ ...chipMoveStyle, opacity: i === 0 ? 0.3 : 1 }}
+                onClick={() => move(i, i - 1)}
+                disabled={i === 0}
+                aria-label={`move pipeline stage ${i + 1} earlier`}
+              >
+                ◀
+              </button>
+              <input style={chipInputStyle} value={item} onChange={e => update(i, e.target.value)} />
+              <button
+                style={{ ...chipMoveStyle, opacity: i === items.length - 1 ? 0.3 : 1 }}
+                onClick={() => move(i, i + 1)}
+                disabled={i === items.length - 1}
+                aria-label={`move pipeline stage ${i + 1} later`}
+              >
+                ▶
+              </button>
+              <button style={chipRemoveStyle} onClick={() => remove(i)} aria-label={`remove ${label} entry`}>×</button>
+            </div>
+          </Fragment>
+        ))}
+        <button onClick={() => onChange([...items, ''])}>+ add</button>
+      </div>
+    </div>
+  )
+}
+
 const fieldLabelStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 6, fontSize: 14, flex: 1 }
 
 const inputStyle: CSSProperties = {
@@ -205,4 +292,13 @@ const chipInputStyle: CSSProperties = {
 
 const chipRemoveStyle: CSSProperties = {
   border: 'none', background: 'transparent', cursor: 'pointer', color: '#888', fontSize: 14, lineHeight: 1,
+}
+
+// Separator between ordered pipeline-stage chips — deliberately not part of
+// either chip's box (no background/border) so it reads as "then", not a
+// third chip.
+const arrowStyle: CSSProperties = { color: '#aaa', fontSize: 14, userSelect: 'none' }
+
+const chipMoveStyle: CSSProperties = {
+  border: 'none', background: 'transparent', cursor: 'pointer', color: '#888', fontSize: 10, lineHeight: 1, padding: '0 2px',
 }
