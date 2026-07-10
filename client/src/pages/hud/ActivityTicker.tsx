@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getActivity, type FeedItem } from '../../lib/api'
+import { getActivity, type EventFeedItem, type FeedItem } from '../../lib/api'
 import { useTasksStore } from '../../state/TasksProvider'
 
 // Mirrors ReviewFeed.tsx's OriginBadge/originLabel verbatim — duplicated
@@ -9,11 +9,11 @@ import { useTasksStore } from '../../state/TasksProvider'
 // EvidenceQuote for the identical rationale: no shared presentational
 // module exists yet, and these are small enough that extracting one isn't
 // worth it for a single extra consumer).
-function originLabel(origin: FeedItem['origin']): string {
+function originLabel(origin: EventFeedItem['origin']): string {
   return origin === 'llm' ? 'LLM' : 'you'
 }
 
-function OriginBadge({ origin }: { origin: FeedItem['origin'] }) {
+function OriginBadge({ origin }: { origin: EventFeedItem['origin'] }) {
   return (
     <span style={{
       display: 'inline-block', marginRight: 6, padding: '1px 6px', borderRadius: 999,
@@ -30,7 +30,7 @@ function OriginBadge({ origin }: { origin: FeedItem['origin'] }) {
 // → proposed_entity → "unknown"), collapsed to a plain string here since the
 // ticker's one-line template has no room for ReviewTray's "new entity?"
 // annotation.
-function entityLabel(item: FeedItem): string {
+function entityLabel(item: EventFeedItem): string {
   if (item.entity_display_name) return item.entity_display_name
   if (item.proposed_entity) return item.proposed_entity
   return 'unknown'
@@ -62,7 +62,16 @@ function createdAgo(iso: string): string {
 // exhaustive-deps, since the mount effect above already covers first fetch).
 export function ActivityTicker() {
   const { tasks } = useTasksStore()
+  // getActivity() returns the full merged FeedItem union (events + settled
+  // actions, Phase 5) — this component still only renders event lines (T6
+  // adds action lines to the ticker), so proposed/settled action items are
+  // filtered out here rather than left for the render loop to trip over
+  // union fields it doesn't have (action items carry no `origin`/`field`/…).
   const [items, setItems] = useState<FeedItem[]>([])
+  const events = useMemo(
+    () => items.filter((i): i is EventFeedItem => i.type === 'event'),
+    [items],
+  )
 
   const refetch = useCallback(async () => {
     try {
@@ -109,7 +118,7 @@ export function ActivityTicker() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [totalVersion, totalPending])
 
-  if (items.length === 0) {
+  if (events.length === 0) {
     return (
       <section>
         <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Activity</h2>
@@ -122,7 +131,7 @@ export function ActivityTicker() {
     <section>
       <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Activity</h2>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 4 }}>
-        {items.map((item) => (
+        {events.map((item) => (
           <li
             key={item.id}
             style={{ fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}

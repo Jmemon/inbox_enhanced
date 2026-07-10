@@ -18,6 +18,13 @@ export type SseDataEvent =
   // progress ticks), so it covers both the goal->draft->backfill creation
   // flow and delete-retriage jobs.
   | { event: 'job_updated'; job_id: string }
+  // Phase 5 (actions, spec 006): another pure nudge, published directly by
+  // approve/reject/undo (app/api/actions.py) — NOT routed through
+  // _publish_task_updated, since approving/rejecting/undoing one action
+  // doesn't change task.version or pending_count in a way task_updated
+  // describes. No client subscriber yet (Task 5 adds the type only; the
+  // action-card surfaces that consume it land in Task 6).
+  | { event: 'action_updated'; task_id: string }
 
 export type SseConnEvent = { event: '_open' } | { event: '_error' }
 export type SseEvent = SseDataEvent | SseConnEvent

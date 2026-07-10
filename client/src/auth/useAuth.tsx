@@ -1,7 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
 import { getJSON, postEmpty } from '../lib/api'
 
-export type Me = { id: string; email: string; name: string | null }
+// has_write_scopes (Phase 5, spec 006 §1): true only once the user has
+// granted BOTH gmail.modify and gmail.compose — a single flag, not two,
+// since new signups grant both together and the migration-banner story is
+// all-or-nothing (see server/app/api/auth.py's `me` route).
+export type Me = { id: string; email: string; name: string | null; has_write_scopes: boolean }
 
 type AuthState =
   | { status: 'loading' }

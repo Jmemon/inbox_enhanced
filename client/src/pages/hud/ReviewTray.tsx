@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { approveEvent, getReviews, rejectEvent, type FeedItem } from '../../lib/api'
+import { approveEvent, getReviews, rejectEvent, type EventFeedItem, type FeedItem } from '../../lib/api'
 import { useTasksStore } from '../../state/TasksProvider'
 import { pendingReasonCopy } from '../task/pendingReasons'
 
@@ -12,7 +12,7 @@ const BUSY_TIMEOUT_MS = 10_000
 // finally an explicit "unknown" — mirrors ReviewFeed's EntityLabel, but
 // FeedItem already carries the resolved name (see server's
 // _serialize_feed_event) so there's no entitiesById lookup to do here.
-function EntityLabel({ item }: { item: FeedItem }) {
+function EntityLabel({ item }: { item: EventFeedItem }) {
   if (item.entity_display_name) return <span>{item.entity_display_name}</span>
   if (item.proposed_entity) {
     return (
@@ -47,7 +47,16 @@ function EvidenceQuote({ quote }: { quote: string }) {
 // store's state.
 export function ReviewTray() {
   const { tasks } = useTasksStore()
+  // getReviews() returns the full merged FeedItem union (events + proposed
+  // actions, Phase 5) — this component still only renders event cards (T6
+  // adds action cards to the tray), so every pending action card is filtered
+  // out here rather than left for the render loop to trip over union fields
+  // it doesn't have (action items carry no `field`/`entity_display_name`/…).
   const [items, setItems] = useState<FeedItem[]>([])
+  const events = useMemo(
+    () => items.filter((i): i is EventFeedItem => i.type === 'event'),
+    [items],
+  )
 
   const refetch = useCallback(async () => {
     try {
@@ -96,7 +105,7 @@ export function ReviewTray() {
   const busyTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
   useEffect(() => {
-    const stillPending = new Set(items.map((i) => i.id))
+    const stillPending = new Set(events.map((i) => i.id))
     setBusy((prev) => {
       let changed = false
       const next = new Set<string>()
@@ -114,10 +123,10 @@ export function ReviewTray() {
       }
       return changed ? next : prev
     })
-    // Keyed on `items` identity (a fresh array only on an actual refetch) —
+    // Keyed on `events` identity (a fresh array only on an actual refetch) —
     // see ReviewFeed's identical comment on its own [events]-keyed effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items])
+  }, [events])
 
   // On unmount, clear all pending busy timeouts.
   useEffect(() => {
@@ -142,21 +151,21 @@ export function ReviewTray() {
     busyTimersRef.current.set(id, timer)
   }
 
-  const handleApprove = (item: FeedItem) => {
+  const handleApprove = (item: EventFeedItem) => {
     markBusy(item.id)
     void approveEvent(item.task_id, item.id)
       .then(() => refetch())
       .catch((e) => console.error('[ReviewTray] approve failed', e))
   }
 
-  const handleReject = (item: FeedItem) => {
+  const handleReject = (item: EventFeedItem) => {
     markBusy(item.id)
     void rejectEvent(item.task_id, item.id)
       .then(() => refetch())
       .catch((e) => console.error('[ReviewTray] reject failed', e))
   }
 
-  if (items.length === 0) {
+  if (events.length === 0) {
     return (
       <section>
         <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Review</h2>
@@ -167,9 +176,9 @@ export function ReviewTray() {
 
   return (
     <section>
-      <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Needs review ({items.length})</h2>
+      <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Needs review ({events.length})</h2>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 8 }}>
-        {items.map((item) => {
+        {events.map((item) => {
           const isBusy = busy.has(item.id)
           const reason = pendingReasonCopy(item)
           return (
