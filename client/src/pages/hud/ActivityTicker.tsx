@@ -132,9 +132,11 @@ export function ActivityTicker() {
   // this task's own TaskActionsPanel) would otherwise never reach this
   // ticker. Pure nudge (task_id only), same idiom as JobsProvider's
   // job_updated handler.
+  // Also refetch on _open (SSE reconnect) to catch nudges lost during
+  // reconnection, ensuring totalVersion/totalPending proxies stay current.
   useEffect(() => {
     return subscribeSse((e) => {
-      if (e.event === 'action_updated') void refetch()
+      if (e.event === '_open' || e.event === 'action_updated') void refetch()
     })
   }, [refetch])
 

@@ -109,9 +109,11 @@ export function ReviewTray() {
   // fires for a proposed action being approved/rejected from elsewhere
   // (another tab, or this task's own TaskActionsPanel). This is a pure nudge
   // (task_id only, no row), same idiom as JobsProvider's job_updated handler.
+  // Also refetch on _open (SSE reconnect) to catch nudges lost during
+  // reconnection, ensuring totalPending/totalVersion proxies stay current.
   useEffect(() => {
     return subscribeSse((e) => {
-      if (e.event === 'action_updated') void refetch()
+      if (e.event === '_open' || e.event === 'action_updated') void refetch()
     })
   }, [refetch])
 
