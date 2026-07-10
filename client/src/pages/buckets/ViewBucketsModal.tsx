@@ -19,10 +19,31 @@ export function ViewBucketsModal({
   const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null)
   const [confirming, setConfirming] = useState<string | null>(null)
 
+  // `confirming` is a single id — only one bucket can be mid-delete-confirm
+  // at a time — so the confirm block itself renders once, directly under the
+  // header, rather than inline inside whichever <li> happens to own that id.
+  // Previously it rendered per-item below that bucket's (potentially long)
+  // criteria block, which could put the confirm/cancel buttons below the
+  // fold for a bucket further down the list; here it's always visible the
+  // moment "delete" is clicked (design.md §2.5).
+  const confirmingBucket = confirming ? buckets.find(b => b.id === confirming) ?? null : null
+
   return (
     <Backdrop onClose={onClose}>
       <div style={modalStyle}>
         <h3 style={{ margin: 0 }}>buckets</h3>
+        {confirmingBucket && (
+          <div style={{ background: '#fff8e0', padding: 8, marginTop: 12, fontSize: 13 }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>Delete "{confirmingBucket.name}"?</div>
+            {DELETE_COPY}
+            <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+              <button onClick={async () => { await onDelete(confirmingBucket.id); setConfirming(null) }}>
+                delete
+              </button>
+              <button onClick={() => setConfirming(null)}>cancel</button>
+            </div>
+          </div>
+        )}
         <ul style={{ listStyle: 'none', padding: 0, margin: '12px 0 0 0' }}>
           {buckets.map(b => (
             <li key={b.id} style={{ padding: '12px 0', borderBottom: '1px solid #eee' }}>
@@ -46,17 +67,6 @@ export function ViewBucketsModal({
               <pre style={{ fontSize: 12, color: '#666', whiteSpace: 'pre-wrap', marginTop: 8 }}>
                 {b.criteria}
               </pre>
-              {confirming === b.id && (
-                <div style={{ background: '#fff8e0', padding: 8, marginTop: 8, fontSize: 13 }}>
-                  {DELETE_COPY}
-                  <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
-                    <button onClick={async () => { await onDelete(b.id); setConfirming(null) }}>
-                      delete
-                    </button>
-                    <button onClick={() => setConfirming(null)}>cancel</button>
-                  </div>
-                </div>
-              )}
             </li>
           ))}
         </ul>

@@ -9,8 +9,11 @@ import type { Job } from '../lib/api'
 // than lifting it into AppShell — the brief left "chip owns `open`, or a
 // separate JobsIndicator wrapper" as this task's call; a wrapper felt like
 // an extra file for one boolean, so the chip renders its own panel as a
-// sibling instead. `onReview` just threads through to the panel (Task 6
-// wires an actual handler; both this and JobsPanel default it to a no-op).
+// sibling instead. `onReview` is AppShell's real handler now (sets its
+// `reviewJob` state, which mounts <NewTaskWizard reviewJob={...}> in review
+// mode) — this chip closes its own panel the moment Review is clicked
+// (design.md §2.3 leaves that call to this task; closing reads cleaner than
+// stacking the wizard modal on top of the still-open slide-over).
 export function JobsChip({ onReview }: { onReview?: (job: Job) => void }) {
   const { jobs } = useJobsStore()
   const [open, setOpen] = useState(false)
@@ -37,7 +40,12 @@ export function JobsChip({ onReview }: { onReview?: (job: Job) => void }) {
         <span>Jobs {jobs.length}</span>
         {anyNeedsUser && <Dot />}
       </button>
-      {open && <JobsPanel onClose={() => setOpen(false)} onReview={onReview} />}
+      {open && (
+        <JobsPanel
+          onClose={() => setOpen(false)}
+          onReview={job => { setOpen(false); onReview?.(job) }}
+        />
+      )}
     </div>
   )
 }

@@ -1,151 +1,137 @@
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
-import { useNavigate } from 'react-router-dom'
 import type { PreviewExample } from '../../lib/sse'
-import type { TaskStateSchema } from '../../lib/api'
-import { useTasksStore } from '../../state/TasksProvider'
+import type { Job, TaskStateSchema } from '../../lib/api'
+import { useJobsStore } from '../../state/JobsProvider'
 import { SchemaEditor } from './SchemaEditor'
 
-// Step machine: goal form -> draft pending -> review (name/description/
-// schema/examples, seeded from the draft) -> create -> 'creating'
-// (post-create backfill wait).
+// Phase 4.5 Task 6 (specs/005_jobs_surface/design.md §2.4): the wizard is
+// now exactly two user-initiated moments, never anything that opens or
+// persists on its own —
 //
-// Phase 4.5 Task 5: the goal->draft backend this wizard used to drive
-// (POST/GET /api/tasks/draft + the `task_draft_ready` SSE event) is deleted
-// — jobs own that flow now (`api.ts`'s createJob/getJobs + confirmJob,
-// state/JobsProvider.tsx). `startDraft` below is stubbed to an inline error
-// instead of restoring the deleted request — same pattern Phase 4 Task 4
-// used on the now-deleted NewBucketModal (see git history) when ITS backend
-// was cut out from under it a task early. The 'pending'/'review' steps past
-// it are therefore unreachable dead code, kept only because Phase 4.5 Task 6
-// restructures this wizard onto startCreation()/confirmJob and a review step
-// seeded from a job's `payload` instead (specs/005_jobs_surface/design.md
-// §2.4) rather than reintroducing the deleted draft-poll path.
+//   1. start: the goal form -> startCreation(goal, kind) -> onClose()
+//      immediately. There is no in-modal wait for the draft; the header
+//      chip starts spinning and the panel (JobsPanel) carries all progress
+//      from here.
+//   2. review: opened DIRECTLY at the review step by passing `reviewJob` —
+//      a draft_ready job the user picked via JobsPanel's [Review] action
+//      (wired in AppShell). Seeded from `reviewJob.payload`. Confirm ->
+//      confirmJob(reviewJob.id, body) -> onClose() immediately; backfill
+//      progress and the eventual "open task"/"bucket live" affordance live
+//      entirely in the panel now — this modal never watches backfill and
+//      never navigates.
 //
-// Phase 4 Task 5: `kind` gives this wizard a second mode ('bucket', default
-// 'tracker') so bucket creation goes through the same goal->draft->review
-// flow instead of a separate modal. Bucket mode diverges only where the two
-// domains actually differ: no EPS state_schema (the review step skips
-// <SchemaEditor> and always sends `state_schema: null`), and no per-task
-// detail page to hand off to on completion (`onCreated` instead of
-// `navigate`). Every other line here is unchanged, byte-identical tracker
-// behavior — search for `kind ===` to see every divergence point.
+// This retires the old goal->draft->review->creating step machine
+// (`startDraft`'s inline-stub, the draftId/pending wait, the 'creating' step
+// + navigatedRef backfill-watch effect) that Task 5 already cut the backend
+// out from under — see git history for that intermediate stub.
+//
+// `kind`/`reviewJob` together decide the wizard's effective domain:
+// `effectiveKind` is `reviewJob.task_kind` when reviewing (the job already
+// carries its own kind — trusting the prop over it would let a caller typo
+// desync the two), else the plain `kind` prop for start mode. Bucket mode
+// diverges from tracker mode only where the two domains actually differ: no
+// EPS state_schema (skip <SchemaEditor>, always send `state_schema: null`)
+// and no per-task detail page (no navigate — panel owns that for trackers
+// too now). Every other line is shared — search `effectiveKind ===` for
+// every divergence point.
 
 type Choice = 'positive' | 'near_miss' | 'rejected'
 type ExampleState = PreviewExample & { initial: Exclude<Choice, 'rejected'>; choice: Choice }
-type Step = 'form' | 'pending' | 'review' | 'creating'
+type Step = 'form' | 'review'
 
 const HINT = "We recommend confirming at least 2 positives + 2 near-misses before creating the task — but it's not required."
 
-export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
-  onClose: () => void
-  // 'bucket' skips the EPS schema step entirely — buckets carry criteria only,
-  // no pipeline/entity state (see task_engine/repo.create_task).
-  kind?: 'tracker' | 'bucket'
-  // Bucket mode's completion hook — there's no per-task detail page for a
-  // bucket to navigate to, so the caller (InboxPage) refreshes its own bucket
-  // list instead. Unused in tracker mode.
-  onCreated?: (taskId: string) => void
-}) {
-  const navigate = useNavigate()
-  const { createTask, backfill } = useTasksStore()
+function toExampleState(ex: PreviewExample, initial: Exclude<Choice, 'rejected'>): ExampleState {
+  return { ...ex, initial, choice: initial }
+}
 
-  const [step, setStep] = useState<Step>('form')
+export function NewTaskWizard({ onClose, kind = 'tracker', reviewJob }: {
+  onClose: () => void
+  // Start-mode domain. Ignored once `reviewJob` is set — see effectiveKind.
+  kind?: 'tracker' | 'bucket'
+  // When set, the wizard skips the goal form and opens directly at the
+  // review step, seeded from this job's payload (design.md §2.4). Only ever
+  // passed for a draft_ready 'creation' job (JobsPanel's [Review] action, so
+  // `payload` is expected non-null; guarded below anyway with a graceful
+  // inline error rather than a crash, since a job's payload is nullable in
+  // its type and dismiss/backend races are cheap to imagine).
+  reviewJob?: Job
+}) {
+  const { startCreation, confirmJob } = useJobsStore()
+
+  // reviewJob is only ever set for the lifetime of this mount (AppShell
+  // unmounts the wizard by clearing reviewJob rather than swapping it for a
+  // different job while open — see AppShell.tsx), so it's safe to read once
+  // here for every seeded field below rather than re-deriving per-render.
+  const payload = reviewJob?.payload ?? null
+  const proposal = payload?.proposal
+  const effectiveKind: 'tracker' | 'bucket' = reviewJob ? (reviewJob.task_kind ?? 'tracker') : kind
+
+  const [step] = useState<Step>(reviewJob ? 'review' : 'form')
   const [goal, setGoal] = useState('')
 
-  // Seeded from the draft's proposal once it lands; editable from there.
-  // Nothing sets these anymore now that startDraft() is stubbed below — see
-  // this file's top-of-file note — but the review step (Task 6 rewires its
-  // entry point) still reads/edits them, so they stay.
-  const [name, setName] = useState('')
-  const [description, setDescription] = useState('')
-  const [stateSchema, setStateSchema] = useState<TaskStateSchema | null>(null)
-  // No setter destructured — nothing seeds this anymore now that applyDraft
-  // is gone (see top-of-file note); submit() below still reads it.
-  const [keywordProbes] = useState<string[]>([])
-  const [examples, setExamples] = useState<ExampleState[]>([])
+  // Seeded from reviewJob.payload.proposal when opened in review mode;
+  // otherwise blank (start mode never touches these — they're filled in by
+  // whoever reviews the resulting draft_ready job later, in a fresh mount).
+  const [name, setName] = useState(() => proposal?.name ?? '')
+  const [description, setDescription] = useState(() => proposal?.description ?? '')
+  const [stateSchema, setStateSchema] = useState<TaskStateSchema | null>(() => proposal?.state_schema ?? null)
+  // No setter used in the UI (no editing affordance exists for these today,
+  // same as before Task 6) — submitReview below still reads it.
+  const [keywordProbes] = useState<string[]>(() => proposal?.keyword_probes ?? [])
+  const [examples, setExamples] = useState<ExampleState[]>(() => [
+    ...(payload?.positives ?? []).map(ex => toExampleState(ex, 'positive')),
+    ...(payload?.near_misses ?? []).map(ex => toExampleState(ex, 'near_miss')),
+  ])
 
   const [submitting, setSubmitting] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
-  const [taskId, setTaskId] = useState<string | null>(null)
-
-  // Rendered inline on the form step. Was startDraft's POST /api/tasks/draft
-  // failure banner; now just carries the stubbed "unavailable" message (see
-  // startDraft below) since that request no longer exists to fail.
+  // Rendered inline on the form step — startCreation's real failure surface
+  // now (was a stubbed "unavailable" message pre-Task-6).
   const [startError, setStartError] = useState<string | null>(null)
-
-  // Guards the done-navigate effect below so it fires at most once — without
-  // this, a stray backfill progress update after the first navigate (e.g. a
-  // late SSE frame re-rendering `backfill`) would re-run navigate()/onClose().
-  const navigatedRef = useRef(false)
-
-  // Once the task is created, watch its backfill progress for completion and
-  // hand off — to the task's own page in tracker mode, or back to the caller
-  // in bucket mode (there is no per-bucket detail page to navigate to).
-  // Keyed on this task's own progress entry (not the whole `backfill` record)
-  // so unrelated tasks' progress updates don't re-run this effect, and
-  // guarded by navigatedRef so it fires at most once even if `progress`
-  // changes again after done=true.
-  //
-  // This relies on TasksProvider's task_backfill_progress SSE handler
-  // recording `backfill[taskId]` unconditionally by task_id, with no check
-  // against its (tracker-only) task list — confirmed by reading
-  // state/TasksProvider.tsx: `setBackfill(prev => ({ ...prev, [e.task_id]:
-  // ... }))` never consults `byId`/`known`. So a bucket task id — never
-  // present in that list — still gets its progress recorded here, and this
-  // effect's `backfill[taskId]` read works unchanged for bucket mode. (The
-  // handler's `if (e.done) void loadDetail(e.task_id)` follow-up also
-  // resolves fine for a bucket id — GET /api/tasks/{id} has no kind filter —
-  // but is a no-op for the tracker list since `setTasks`'s `.map` only
-  // transforms existing entries, never inserts new ones.)
-  const progress = taskId ? backfill[taskId] : undefined
-  useEffect(() => {
-    if (step !== 'creating' || !taskId || navigatedRef.current) return
-    if (progress?.done) {
-      navigatedRef.current = true
-      if (kind === 'bucket') {
-        onCreated?.(taskId)
-      } else {
-        navigate(`/tasks/${taskId}`)
-      }
-      onClose()
-    }
-  }, [step, taskId, progress?.done, navigate, onClose, kind, onCreated])
-
-  // Stubbed — see this file's top-of-file note. Never advances past 'form';
-  // Task 6 rewires this onto startCreation()/the jobs flow.
-  function startDraft() {
-    setStartError('Task creation is moving to the jobs panel — coming in the next update.')
-  }
 
   function setChoice(threadId: string, choice: Choice) {
     setExamples(prev => prev.map(ex => (ex.thread_id === threadId ? { ...ex, choice } : ex)))
   }
 
-  async function submit() {
-    if (submitting) return
-    // Tracker mode requires a schema (SchemaEditor keeps it non-null past the
-    // review step); bucket mode never has one.
-    if (kind === 'tracker' && !stateSchema) return
+  async function startNew() {
+    if (submitting || !goal.trim()) return
+    setSubmitting(true)
+    setStartError(null)
+    try {
+      await startCreation(goal.trim(), kind)
+      onClose()
+    } catch (e) {
+      // Stay on the form, editable, with the failure inline — no retry
+      // machinery beyond letting the user hit "start" again.
+      setStartError(e instanceof Error ? e.message : String(e))
+      setSubmitting(false)
+    }
+  }
+
+  async function submitReview() {
+    if (submitting || !reviewJob) return
+    // Tracker mode requires a schema (SchemaEditor keeps it non-null past
+    // this point); bucket mode never has one.
+    if (effectiveKind === 'tracker' && !stateSchema) return
     setSubmitting(true)
     setCreateError(null)
     try {
       const positives = examples.filter(e => e.choice === 'positive').map(toExampleIn)
       const negatives = examples.filter(e => e.choice === 'near_miss').map(toExampleIn)
-      const task = await createTask({
-        name, goal: goal.trim(), description, kind,
+      await confirmJob(reviewJob.id, {
+        name, description,
         state_schema: stateSchema ? trimStateSchema(stateSchema) : null,
         keyword_probes: keywordProbes, confirmed_positives: positives, confirmed_negatives: negatives,
       })
-      setTaskId(task.id)
-      setStep('creating')
+      onClose()
     } catch (e) {
-      // 422 (schema invalid after edits) or any other create failure — the
-      // store's createTask rethrows apiCreateTask's Error as-is (no
-      // structured status code). Render its message inline and stay on the
-      // review step so the form is still editable.
+      // 409 (job no longer draft_ready — dismissed or already confirmed
+      // elsewhere) or 422 (schema invalid after edits) — confirmJob's
+      // throwWithDetail (api.ts) surfaces the server's detail string here.
+      // Stay on the review step, editable, same as the old submit() did.
       setCreateError(e instanceof Error ? e.message : String(e))
-    } finally {
       setSubmitting(false)
     }
   }
@@ -153,7 +139,11 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
   return (
     <Backdrop onClose={onClose}>
       <div style={modalStyle}>
-        <h3 style={{ margin: 0 }}>{kind === 'bucket' ? 'New bucket' : 'new task'}</h3>
+        <h3 style={{ margin: 0 }}>
+          {reviewJob
+            ? (effectiveKind === 'bucket' ? 'Review bucket' : 'review task')
+            : (kind === 'bucket' ? 'New bucket' : 'new task')}
+        </h3>
 
         {step === 'form' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 16 }}>
@@ -170,66 +160,52 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
               />
             </label>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button disabled={!goal.trim()} onClick={startDraft}>start</button>
+              <button disabled={!goal.trim() || submitting} onClick={() => void startNew()}>start</button>
               <button onClick={onClose}>cancel</button>
             </div>
           </div>
         )}
 
-        {/* Unreachable now that startDraft() (above) never leaves 'form' —
-            kept only because Task 6 restructures this step onto the jobs
-            flow rather than deleting it outright. */}
-        {step === 'pending' && (
-          <div style={{ marginTop: 16 }}>Reading your goal and scanning your inbox…</div>
-        )}
-
-        {/* Tracker mode's gate: stateSchema is only non-null once something
-            seeds it (Task 6's job-review wiring), so this also holds the
-            step on 'review' until that's happened. Bucket mode never sets
-            stateSchema, so it gates on the step alone. Unreachable for now
-            like the 'pending' step above — nothing currently sets step to
-            'review' either. */}
-        {step === 'review' && (kind === 'bucket' || stateSchema) && (
-          <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 20 }}>
-            {createError && <div style={errorBannerStyle}>{createError}</div>}
-            <label style={fieldLabelStyle}>
-              <span>name</span>
-              <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} />
-            </label>
-            <label style={fieldLabelStyle}>
-              <span>description</span>
-              <textarea
-                style={textareaStyle} rows={3} value={description}
-                onChange={e => setDescription(e.target.value)}
-              />
-            </label>
-
-            {/* Bucket mode skips the EPS schema step entirely — a bucket has
-                no pipeline/entity state, only criteria. */}
-            {kind === 'tracker' && stateSchema && <SchemaEditor value={stateSchema} onChange={setStateSchema} />}
-
-            <div>
-              <div style={{ fontSize: 12, color: '#666', marginBottom: 12 }}>{HINT}</div>
-              {examples.map(ex => (
-                <ExampleRow key={ex.thread_id} ex={ex} onChoice={c => setChoice(ex.thread_id, c)} />
-              ))}
+        {step === 'review' && reviewJob && (
+          payload === null ? (
+            <div style={{ marginTop: 16 }}>
+              <div style={errorBannerStyle}>This job has no draft to review yet.</div>
+              <div style={{ marginTop: 8 }}><button onClick={onClose}>close</button></div>
             </div>
+          ) : (effectiveKind === 'bucket' || stateSchema) && (
+            <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 20 }}>
+              {createError && <div style={errorBannerStyle}>{createError}</div>}
+              <label style={fieldLabelStyle}>
+                <span>name</span>
+                <input style={inputStyle} value={name} onChange={e => setName(e.target.value)} />
+              </label>
+              <label style={fieldLabelStyle}>
+                <span>description</span>
+                <textarea
+                  style={textareaStyle} rows={3} value={description}
+                  onChange={e => setDescription(e.target.value)}
+                />
+              </label>
 
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button disabled={submitting} onClick={() => void submit()}>
-                {kind === 'bucket' ? 'create bucket' : 'create task'}
-              </button>
-              <button onClick={onClose}>cancel</button>
+              {/* Bucket mode skips the EPS schema step entirely — a bucket
+                  has no pipeline/entity state, only criteria. */}
+              {effectiveKind === 'tracker' && stateSchema && <SchemaEditor value={stateSchema} onChange={setStateSchema} />}
+
+              <div>
+                <div style={{ fontSize: 12, color: '#666', marginBottom: 12 }}>{HINT}</div>
+                {examples.map(ex => (
+                  <ExampleRow key={ex.thread_id} ex={ex} onChoice={c => setChoice(ex.thread_id, c)} />
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button disabled={submitting} onClick={() => void submitReview()}>
+                  {effectiveKind === 'bucket' ? 'create bucket' : 'create task'}
+                </button>
+                <button onClick={onClose}>cancel</button>
+              </div>
             </div>
-          </div>
-        )}
-
-        {step === 'creating' && (
-          <div style={{ marginTop: 16 }}>
-            {taskId && backfill[taskId]
-              ? `scanned ${backfill[taskId].scanned} · matched ${backfill[taskId].matched}`
-              : 'starting backfill…'}
-          </div>
+          )
         )}
       </div>
     </Backdrop>
@@ -309,9 +285,8 @@ const textareaStyle: CSSProperties = {
   ...inputStyle, fontFamily: 'inherit', resize: 'vertical',
 }
 
-// Inline error banner — was inline-only on the review step (createError);
-// pulled into a shared constant so the form step's startError renders
-// identically rather than drifting.
+// Inline error banner — shared by the form step's startError and the review
+// step's createError so both render identically rather than drifting.
 const errorBannerStyle: CSSProperties = {
   color: '#8a1c25', fontSize: 13, background: '#fdf0f1', padding: 8, borderRadius: 4,
 }

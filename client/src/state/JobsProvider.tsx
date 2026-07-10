@@ -1,9 +1,10 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   confirmJob as apiConfirmJob, createJob, dismissJob as apiDismissJob, getJobs,
   type ConfirmJobBody, type Job, type TaskDetail,
 } from '../lib/api'
 import { subscribeSse } from '../lib/sse'
+import { useInboxStore } from './InboxProvider'
 
 // Mounted once in AppShell (inside TasksProvider, for the life of the authed
 // session) — same rationale as TasksProvider/InboxProvider: the jobs list
@@ -33,18 +34,50 @@ type JobsStore = {
 const JobsStoreContext = createContext<JobsStore | null>(null)
 
 export function JobsProvider({ children }: { children: ReactNode }) {
+  // Bucket-creation completion has nowhere else to land: bucket mode's old
+  // onCreated callback used to fire `buckets.refresh()` once the wizard saw
+  // its own backfill finish, but the wizard now closes at confirm-time —
+  // long before the job reaches 'done'. useBuckets (pages/buckets/useBuckets)
+  // never subscribes to SSE at all, and TasksProvider's task_updated handler
+  // only ever refetches the TRACKER list (getTasks() with no kind filter),
+  // so nothing else in the app will show a freshly-backfilled bucket without
+  // a manual reload. AppShell nests JobsProvider inside InboxProvider
+  // specifically so a provider in this position can reach another store
+  // (see AppShell.tsx's hook-order note) — that's the seam used here rather
+  // than threading a callback prop down from AppShell.
+  const { buckets: { refresh: refreshBuckets } } = useInboxStore()
   const [jobs, setJobs] = useState<Job[]>([])
+
+  // Previous fetch's jobs, keyed for the done-transition diff below. A ref
+  // (not state) because it's write-only from refresh's own perspective — it
+  // never drives a render itself, only informs the next refresh's diff.
+  const prevJobsRef = useRef<Job[]>([])
 
   const refresh = useCallback(async () => {
     try {
       // active=true (the default) — the panel's normal, always-works poll
       // path (spec §1.4); dismissed/long-stale jobs are excluded server-side.
       const fetched = await getJobs()
+      // Fire buckets.refresh() exactly on a bucket-kind creation job's
+      // transition INTO 'done' (compared against the previous fetch by id),
+      // not on every poll tick while such a job merely sits at 'done' in the
+      // active list — list_jobs keeps terminal jobs active for 7 days, so
+      // without this diff every 15s tick would re-refresh the bucket list
+      // for as long as the done job stays visible.
+      const prevById = new Map(prevJobsRef.current.map(j => [j.id, j]))
+      let shouldRefreshBuckets = false
+      for (const job of fetched) {
+        if (job.kind !== 'creation' || job.task_kind !== 'bucket' || job.stage !== 'done') continue
+        const prev = prevById.get(job.id)
+        if (!prev || prev.stage !== 'done') shouldRefreshBuckets = true
+      }
+      if (shouldRefreshBuckets) refreshBuckets().catch(e => console.error('[JobsProvider] bucket refresh failed', e))
+      prevJobsRef.current = fetched
       setJobs(fetched)
     } catch (e) {
       console.error('[JobsProvider] refresh failed', e)
     }
-  }, [])
+  }, [refreshBuckets])
 
   // Initial catch-up fetch. Not redundant with the `_open` handler below —
   // see TasksProvider's identical comment: `_open` only fires for handlers
