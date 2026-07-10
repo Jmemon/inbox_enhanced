@@ -15,18 +15,18 @@ function's body instead of a top-level `from app.workers.tasks import ...`.
 No `sync_lock` anywhere in this module. Most tasks here only ever READ
 `inbox_threads`/`inbox_messages`, so there's nothing that can race the sync
 path's `(user_id, gmail_id)` unique constraint (the hazard sync_lock exists
-to guard). The one exception is `_run_bucket_backfill`, which DOES write
-`InboxThread.bucket_id` — still without sync_lock, because it does no Gmail
-I/O of its own and so never touches the unique-constraint hazard the lock
-guards against. That write path has its own, narrower race instead: a
-concurrent poll (holding sync_lock, re-triaging the same thread against
-FRESH content) can commit a different bucket_id while a backfill batch —
-which read the OLD bucket_id as its stability hint before its own
-multi-second `classify.triage()` round-trip — is still mid-flight.
-`_run_bucket_backfill` guards against this optimistically: immediately
-before writing, it re-reads `bucket_id` fresh (a column-level `select()`,
+to guard). Two exceptions are `_run_bucket_backfill` and `retriage_deleted_bucket`,
+which DO write `InboxThread.bucket_id` — still without sync_lock, because
+they do no Gmail I/O of their own and so never touch the unique-constraint
+hazard the lock guards against. Those write paths have their own, narrower
+race instead: a concurrent poll (holding sync_lock, re-triaging the same
+thread against FRESH content) can commit a different bucket_id while a
+backfill/retriage batch — which read the OLD bucket_id as its stability
+hint before its own multi-second `classify.triage()` round-trip — is still
+mid-flight. Both functions guard against this optimistically: immediately
+before writing, they re-read `bucket_id` fresh (a column-level `select()`,
 which always issues a real query rather than resolving from the session's
-identity map) and skips the write — and the `threads_updated` publish — if
+identity map) and skip the write — and the `threads_updated` publish — if
 the row moved since the read that fed `triage()`. Idempotency for the two
 extraction tasks instead comes entirely from
 `transitions.validate_and_stage`'s step 7 (SELECT-first check against
@@ -903,6 +903,155 @@ def _record_job_failure(*, user_id: str, job_id: str, error: str) -> None:
         )
     finally:
         fail_db.close()
+
+
+@celery_app.task(name="app.workers.task_engine_tasks.retriage_deleted_bucket")
+def retriage_deleted_bucket(user_id: str, job_id: str, deleted_task_id: str) -> None:
+    """Re-triage the threads orphaned by deleting a bucket-kind task (Phase
+    4.5 Task 4, spec 005 §1.5) -- enqueued by `api/tasks.py`'s `delete_task`
+    route immediately after the soft-delete's own commit, and only when that
+    bucket still had >=1 thread pointing at it. Unlike `backfill_task`,
+    `job_id` here is never optional -- the caller always creates the job row
+    before enqueuing this task, so a missing job row means something is
+    already wrong (see the defensive early-return below), not an intentional
+    "run without job tracking" mode.
+
+    The thread set is derived fresh at run start with a plain `select` over
+    `(user_id, bucket_id=deleted_task_id)` -- no FTS/candidate-pool resolver
+    the way `_backfill_candidate_pool` needs, since every candidate here is
+    already known by construction: it IS the orphaned set, not something to
+    search for. A small window may have passed since the delete route's own
+    COUNT query, so this is a fresh read. On the first batch, `_write_job_progress`
+    self-reconciles the job's `total` with this run's fresh count (overwriting
+    the API-time count); only a fully-empty candidate set leaves that original
+    total untouched. `scanned`/`matched` below are computed against THIS run's own set.
+
+    Each `BACKFILL_TRIAGE_BATCH` batch is triaged against `list_active_
+    buckets` (resolved once, up front -- same read-once semantics
+    `_run_bucket_backfill` uses) with `trackers=[]` and each thread's OWN
+    bucket_id (== `deleted_task_id`, by construction, modulo the same kind of
+    race `_run_bucket_backfill` already tolerates) as the stability hint.
+    `classify.triage()`'s no-fit fallback (`_triage_one`: `bucket_id =
+    current_bucket_id` when `parse_response` found no match) therefore falls
+    back to the DELETED bucket's own id, not a live one -- `list_active_
+    buckets` already excludes it (its `is_deleted` flag was flipped by the
+    caller one commit before this task was even enqueued), so there is
+    nothing extra to filter here. That fallback pick, and a bare `None`
+    (only reachable if `list_active_buckets` comes back empty -- `triage()`'s
+    own empty-buckets-and-trackers short-circuit returns `(None, [])` for
+    every thread without even calling the LLM), both resolve to `bucket_id=
+    NULL` (unclassified) -- see the inline `resolved =` line below. Any OTHER
+    pick is a genuine live bucket and gets written as-is. `matched` counts
+    only threads that landed in a REAL bucket (`resolved is not None`) --
+    every surviving orphan here "changes" by construction (its stored value
+    was the now-dead bucket, which `resolved` can never reproduce), so
+    `changed` (the `threads_updated` publish set) is the broader of the two.
+
+    Write discipline mirrors `_run_bucket_backfill` exactly: write only when
+    `resolved` differs from the thread's own stability-hint value, guarded by
+    the same optimistic re-read (a fresh, identity-map-bypassing `select
+    (InboxThread.bucket_id)`) immediately before writing -- a concurrent poll
+    that already moved the thread off its stability hint wins, and this write
+    (and that thread's inclusion in the `threads_updated` publish) is
+    skipped.
+
+    Progress/completion signals: per-batch `_write_job_progress` (commit-
+    then-publish `job_updated`), a `threads_updated` publish for every
+    rewritten thread once the loop finishes, then a terminal `job_updated`
+    via `_write_job_done` -- no `task_backfill_progress`/`task_updated` here
+    at all (there is no live task-engine board/event state on a bucket-kind
+    task, deleted or not, for a client to refetch via either signal).
+
+    A top-level try/except mirrors `backfill_task`'s: any exception marks the
+    job `failed` (via `_record_job_failure`, on a FRESH session -- see that
+    function's docstring) and re-raises so Celery still records the run as
+    FAILED.
+    """
+    from app.workers.tasks import _publish, _publish_thread_ids
+
+    db = SessionLocal()
+    try:
+        job = jobs_repo.get_owned_job(db, user_id=user_id, job_id=job_id)
+        if job is None:
+            log.warning(
+                "retriage_deleted_bucket: job=%s not found for user=%s, skipping",
+                job_id, user_id,
+            )
+            return
+
+        candidate_ids = [
+            row[0] for row in db.execute(
+                select(InboxThread.id).where(
+                    InboxThread.user_id == user_id,
+                    InboxThread.bucket_id == deleted_task_id,
+                )
+            ).all()
+        ]
+        buckets = task_repo.list_active_buckets(db, user_id=user_id)
+        total = len(candidate_ids)
+
+        scanned = 0
+        matched_thread_ids: set[str] = set()
+        changed_thread_ids: set[str] = set()
+
+        for i in range(0, len(candidate_ids), BACKFILL_TRIAGE_BATCH):
+            batch_ids = candidate_ids[i : i + BACKFILL_TRIAGE_BATCH]
+            triples = inbox_repo.load_parsed_threads(db, user_id=user_id, internal_ids=batch_ids)
+            if triples:
+                ordered_ids = [tid for tid, _, _ in triples]
+                current_bucket_ids = [bid for _, bid, _ in triples]
+                parsed_list = [parsed for _, _, parsed in triples]
+                results = classify.triage(
+                    parsed_list, buckets=buckets, trackers=[],
+                    current_bucket_ids=current_bucket_ids, user_id=user_id,
+                    task_id=deleted_task_id,
+                )
+                for thread_id, old_bucket, (pick, _relevant_tasks) in zip(
+                    ordered_ids, current_bucket_ids, results,
+                ):
+                    # The deleted bucket is never a valid destination -- a
+                    # pick that stayed there (the no-fit fallback) or a bare
+                    # None (empty active-bucket set) both mean "unclassified".
+                    resolved = None if pick in (deleted_task_id, None) else pick
+                    if resolved == old_bucket:
+                        continue
+                    fresh_bucket = db.execute(
+                        select(InboxThread.bucket_id).where(InboxThread.id == thread_id)
+                    ).scalar_one_or_none()
+                    if fresh_bucket != old_bucket:
+                        log.info(
+                            "retriage_deleted_bucket: job=%s thread=%s bucket_id moved "
+                            "(%r -> %r) since triage read; skipping stale write",
+                            job_id, thread_id, old_bucket, fresh_bucket,
+                        )
+                        continue
+                    thread_row = db.get(InboxThread, thread_id)
+                    if thread_row is not None:
+                        thread_row.bucket_id = resolved
+                        changed_thread_ids.add(thread_id)
+                        if resolved is not None:
+                            matched_thread_ids.add(thread_id)
+                db.commit()
+
+            scanned += len(batch_ids)
+            _write_job_progress(
+                db, job=job, scanned=scanned, matched=len(matched_thread_ids), total=total,
+                user_id=user_id, job_id=job_id, publish=_publish,
+            )
+
+        _publish_thread_ids(user_id, list(changed_thread_ids))
+        _write_job_done(db, job=job, user_id=user_id, job_id=job_id, publish=_publish)
+    except Exception as exc:
+        log.exception("retriage_deleted_bucket: job=%s failed", job_id)
+        # Guard rollback so it can't replace the original exception if connection drops.
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("retriage_deleted_bucket: rollback failed; original error takes precedence")
+        _record_job_failure(user_id=user_id, job_id=job_id, error=str(exc))
+        raise
+    finally:
+        db.close()
 
 
 @celery_app.task(name="app.workers.task_engine_tasks.backfill_task")

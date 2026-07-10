@@ -28,14 +28,16 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.inbox import _serialize_thread
-from app.db.models import User
+from app.db.models import InboxThread, User
 from app.db.session import get_db
 from app.deps import get_current_user
 from app.inbox import inbox_repo
 from app.task_engine import criteria as criteria_mod
+from app.task_engine import jobs_repo
 from app.task_engine import repo as task_repo
 from app.task_engine import schema as schema_mod
 from app.workers import task_engine_tasks
@@ -402,6 +404,32 @@ def delete_task(task_id: str, user: User = Depends(get_current_user),
         task_repo.bump_version(db, task=task)
         db.commit()
         _publish_task_updated(db, user_id=user.id, task=task)
+
+        # Phase 4.5 Task 4 (spec 005 §1.5): a deleted bucket may still have
+        # threads pointing at it (bucket_id set before the delete). Left
+        # alone, those threads would sit permanently unclassified -- kick off
+        # a background re-triage job instead. Trackers carry no bucket_id
+        # relationship, so this is a no-op for them; zero orphans is also a
+        # no-op (no job for a delete that touched nothing).
+        if task.kind == "bucket":
+            orphan_count = db.execute(
+                select(func.count()).select_from(InboxThread).where(
+                    InboxThread.user_id == user.id, InboxThread.bucket_id == task.id,
+                )
+            ).scalar_one()
+            if orphan_count > 0:
+                job = jobs_repo.create_job(
+                    db, user_id=user.id, kind="delete_retriage",
+                    goal=f"reclassify after deleting {task.name}",
+                )
+                job.task_id = task.id
+                job.total = orphan_count
+                db.commit()
+                task_engine_tasks.retriage_deleted_bucket.apply_async(
+                    args=[user.id, job.id, task.id], countdown=0,
+                )
+                tasks._publish(user.id, "job_updated", {"job_id": job.id})
+
         return
 
     existing = task_repo.get_owned_task_any_status(db, user_id=user.id, task_id=task_id)

@@ -26,6 +26,7 @@ from app.db.models import Base, User
 from app.db.session import get_db
 from app.inbox import inbox_repo
 from app.main import app
+from app.task_engine import jobs_repo
 from app.task_engine import repo as task_repo
 
 SINGLETON_SCHEMA = {
@@ -87,10 +88,11 @@ def _mk_task(TS, *, uid="u1", name="Tracker", status="active",
     return task_id
 
 
-def _seed_thread(TS, *, uid="u1", gmail_thread_id, internal_date=1, subject="hi") -> str:
+def _seed_thread(TS, *, uid="u1", gmail_thread_id, internal_date=1, subject="hi",
+                 bucket_id=None) -> str:
     db = TS()
     thread = inbox_repo.upsert_thread(
-        db, user_id=uid, gmail_thread_id=gmail_thread_id, subject=subject, bucket_id=None,
+        db, user_id=uid, gmail_thread_id=gmail_thread_id, subject=subject, bucket_id=bucket_id,
     )
     inbox_repo.upsert_message(
         db, user_id=uid, gmail_thread_id=gmail_thread_id,
@@ -649,6 +651,88 @@ def test_delete_other_user_404(authed):
 def test_delete_nonexistent_404(authed):
     c, TS = authed
     assert c.delete("/api/tasks/does-not-exist").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# DELETE -> delete_retriage job (Phase 4.5 Task 4, spec 005 §1.5): deleting a
+# bucket-kind task with orphaned threads (still pointing at it) kicks off a
+# background re-triage instead of leaving them permanently unclassified.
+# ---------------------------------------------------------------------------
+
+
+def test_delete_bucket_with_orphans_creates_delete_retriage_job_and_enqueues_worker(
+    authed, monkeypatch,
+):
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Receipts", kind="bucket")
+    _seed_thread(TS, gmail_thread_id="g1", bucket_id=bucket_id)
+    _seed_thread(TS, gmail_thread_id="g2", bucket_id=bucket_id)
+    captured = _capture_publish(monkeypatch)
+
+    with patch("app.api.tasks.task_engine_tasks.retriage_deleted_bucket.apply_async") as mock_apply:
+        r = c.delete(f"/api/tasks/{bucket_id}")
+    assert r.status_code == 204
+
+    db = TS()
+    jobs = jobs_repo.list_jobs(db, user_id="u1", active_only=False)
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.kind == "delete_retriage"
+    assert job.task_id == bucket_id
+    assert job.total == 2
+    assert job.stage == "running"
+    job_id = job.id
+    db.close()
+
+    mock_apply.assert_called_once_with(args=["u1", job_id, bucket_id], countdown=0)
+
+    job_events = [p for _, e, p in captured if e == "job_updated"]
+    assert job_events == [{"job_id": job_id}]
+
+
+def test_delete_bucket_zero_orphans_creates_no_job(authed):
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Receipts", kind="bucket")
+
+    with patch("app.api.tasks.task_engine_tasks.retriage_deleted_bucket.apply_async") as mock_apply:
+        r = c.delete(f"/api/tasks/{bucket_id}")
+    assert r.status_code == 204
+
+    mock_apply.assert_not_called()
+    db = TS()
+    assert jobs_repo.list_jobs(db, user_id="u1", active_only=False) == []
+    db.close()
+
+
+def test_delete_tracker_creates_no_job(authed):
+    c, TS = authed
+    task_id = _mk_task(TS, name="Tracker")
+
+    with patch("app.api.tasks.task_engine_tasks.retriage_deleted_bucket.apply_async") as mock_apply:
+        r = c.delete(f"/api/tasks/{task_id}")
+    assert r.status_code == 204
+
+    mock_apply.assert_not_called()
+    db = TS()
+    assert jobs_repo.list_jobs(db, user_id="u1", active_only=False) == []
+    db.close()
+
+
+def test_delete_second_call_is_idempotent_no_second_job(authed):
+    c, TS = authed
+    bucket_id = _mk_schemaless_task(TS, name="Receipts", kind="bucket")
+    _seed_thread(TS, gmail_thread_id="g1", bucket_id=bucket_id)
+
+    with patch("app.api.tasks.task_engine_tasks.retriage_deleted_bucket.apply_async") as mock_apply:
+        assert c.delete(f"/api/tasks/{bucket_id}").status_code == 204
+        # idempotent no-op branch (already soft-deleted) — must not create a
+        # second job or enqueue a second retriage.
+        assert c.delete(f"/api/tasks/{bucket_id}").status_code == 204
+
+    assert mock_apply.call_count == 1
+    db = TS()
+    assert len(jobs_repo.list_jobs(db, user_id="u1", active_only=False)) == 1
+    db.close()
 
 
 # ---------------------------------------------------------------------------
