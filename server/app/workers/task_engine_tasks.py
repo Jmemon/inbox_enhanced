@@ -33,10 +33,11 @@ extraction tasks instead comes entirely from
 `(task_id, message_id, field)`, backed by the migrated DB's partial unique
 index as a race backstop) — re-running either against the same (task,
 thread) pair is always safe and produces no duplicate events.
-`propose_task_draft` is read-only end to end (goal in, a cached draft +
-one SSE push out) so idempotency isn't a concern for it at all — re-running
-it against the same draft_id just overwrites the cache entry with a fresh
-(possibly different) proposal.
+`propose_task_draft` writes only its own job row's `payload`/`stage`
+(Phase 4.5 Task 3 — no more Redis draft_cache), so re-running it against the
+same job_id just overwrites the row with a fresh (possibly different)
+proposal — same "no duplicate side effects on replay" property, just a
+Postgres row instead of a Redis cache entry.
 """
 
 import logging
@@ -50,7 +51,6 @@ from app.inbox import inbox_repo, search_repo
 from app.llm import classify
 from app.llm import client as llm_client
 from app.llm.prompts import propose_task
-from app.task_engine import draft_cache
 from app.task_engine import jobs_repo
 from app.task_engine import repo as task_repo
 from app.task_engine import schema as schema_mod
@@ -267,13 +267,15 @@ def _candidate_from_thread(db, *, user_id: str, thread) -> dict:
 
 
 @celery_app.task(name="app.workers.task_engine_tasks.propose_task_draft")
-def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
+def propose_task_draft(user_id: str, job_id: str, goal: str) -> None:
     """Goal -> proposed task draft: one Sonnet-class propose call, EPS
-    validation, FTS-prefiltered candidate scoring, and a cache-then-publish
-    so the modal's poll fallback always has somewhere to land.
+    validation, FTS-prefiltered candidate scoring, and a commit-then-publish
+    write into the job row's `payload` (Phase 4.5 Task 3 -- replaces the
+    old Redis draft_cache, whose 600s TTL could strand a client mid-review;
+    a job row never expires).
 
     1. LLM propose (`propose_task.build_user_message`/`parse_response`).
-       Exactly ONE retry total is ever spent per draft, no matter which of
+       Exactly ONE retry total is ever spent per job, no matter which of
        the two ways the first attempt can fail:
          - Unparseable (`parse_response` returned None -- no valid JSON in
            the required shape at all; this is also what a transient
@@ -285,10 +287,10 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
            `state_schema`): retried once with the validator's exact error
            message appended, so the model gets one shot at fixing precisely
            what it got wrong.
-       Whichever branch fires first consumes the draft's one retry; the
+       Whichever branch fires first consumes the job's one retry; the
        retry's response is checked once more and then we stop -- there is
        no second retry, so at most 2 LLM propose calls ever happen for one
-       draft. In particular, if the first attempt was unparseable and the
+       job. In particular, if the first attempt was unparseable and the
        retry comes back parseable-but-schema-invalid, that schema failure
        does NOT get its own retry -- it falls straight through to the
        fallback schema below (this is the mixed case the naive
@@ -305,6 +307,9 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
        further to a bare name/description carved out of the goal itself and
        an empty probe list -- which naturally trips the probes-miss
        fallback in step 2 below rather than needing its own special case.
+       None of this counts as job failure -- a degraded-but-present draft
+       still reaches `draft_ready` for the user to edit; see the top-level
+       try/except below for what DOES mark the job `failed`.
     2. Candidate examples: union of `search_repo.search_threads()` over the
        proposal's `keyword_probes` (cap PROPOSE_CANDIDATE_CAP unique threads
        across all probes, PROPOSE_SEARCH_LIMIT_PER_PROBE per probe) -- the
@@ -316,10 +321,21 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
        EXISTING `tasks._score_all` -- the same 0-10 rubric bucket drafts use,
        just against a tracker's would-be name/description instead of a
        bucket's.
-    4. Cache the result BEFORE publishing task_draft_ready (mirrors
-       `draft_preview_bucket`'s cache-before-publish rationale in
-       workers/tasks.py: a client polling GET .../draft/{draft_id} between
-       the two must see the ready payload, never a stale "pending").
+    4. Write the proposal into the job row (`jobs_repo.set_payload` +
+       `update_stage("draft_ready")`), commit, THEN publish `job_updated`
+       -- commit-before-publish, same ordering rationale the retired
+       draft_cache's cache-before-publish had: a client polling
+       `GET /api/jobs/{job_id}` between the two must see the row already in
+       `draft_ready`, never a stale `proposing`.
+
+    A top-level try/except wraps this entire body (Phase 4.5 Task 3, mirrors
+    `backfill_task`'s identical guard): ANY exception -- an LLM client bug, a
+    DB error, anything -- marks the job `failed` with the error text (via
+    `_record_job_failure`, on a fresh session -- see that function's
+    docstring) and publishes `job_updated`, then re-raises so Celery still
+    records the run as FAILED. Without this, a job whose worker crashed
+    would sit in `proposing` forever with no signal to the user, the exact
+    "stranded popup" failure mode this whole jobs surface exists to fix.
 
     `_publish`/`_read_candidates`/`_score_all`/the score thresholds are all
     late-imported from `app.workers.tasks` -- see this module's docstring for
@@ -331,7 +347,7 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
         _publish, _read_candidates, _score_all,
     )
 
-    log.info("propose_task_draft: user=%s draft=%s", user_id, draft_id)
+    log.info("propose_task_draft: user=%s job=%s", user_id, job_id)
     settings = get_settings()
 
     db = SessionLocal()
@@ -341,8 +357,16 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
         user = db.get(User, user_id)
         if user is None:
             log.info(
-                "propose_task_draft: draft=%s user=%s not found, skipping",
-                draft_id, user_id,
+                "propose_task_draft: job=%s user=%s not found, skipping",
+                job_id, user_id,
+            )
+            return
+
+        job = jobs_repo.get_owned_job(db, user_id=user_id, job_id=job_id)
+        if job is None:
+            log.warning(
+                "propose_task_draft: job=%s not found for user=%s, skipping",
+                job_id, user_id,
             )
             return
 
@@ -351,8 +375,8 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
 
         if raw is None:
             log.info(
-                "propose_task_draft: draft=%s first attempt unparseable; retrying once",
-                draft_id,
+                "propose_task_draft: job=%s first attempt unparseable; retrying once",
+                job_id,
             )
             raw = _llm_propose(
                 goal=goal, user_id=user_id, model=settings.llm_extract_model,
@@ -366,20 +390,20 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
                 schema = schema_mod.validate_schema(raw["state_schema"])
             except ValueError as exc:
                 if retried:
-                    # Already spent this draft's one retry on an unparseable
+                    # Already spent this job's one retry on an unparseable
                     # first attempt -- do not spend a second one here; fall
                     # through to the fallback schema below instead.
                     log.info(
-                        "propose_task_draft: draft=%s schema invalid on the "
+                        "propose_task_draft: job=%s schema invalid on the "
                         "post-retry response (%s); retry budget spent, using "
                         "fallback schema",
-                        draft_id, exc,
+                        job_id, exc,
                     )
                 else:
                     log.info(
-                        "propose_task_draft: draft=%s schema invalid on first "
+                        "propose_task_draft: job=%s schema invalid on first "
                         "attempt (%s); retrying once",
-                        draft_id, exc,
+                        job_id, exc,
                     )
                     retry_context = (
                         f"Your previous state_schema was invalid: {exc}\n"
@@ -395,9 +419,9 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
                             schema = schema_mod.validate_schema(raw["state_schema"])
                         except ValueError as exc2:
                             log.info(
-                                "propose_task_draft: draft=%s schema invalid on "
+                                "propose_task_draft: job=%s schema invalid on "
                                 "retry too (%s); using fallback schema",
-                                draft_id, exc2,
+                                job_id, exc2,
                             )
 
         if raw is None:
@@ -433,8 +457,8 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
             ]
         else:
             log.info(
-                "propose_task_draft: draft=%s probes found nothing, falling back to recency pool",
-                draft_id,
+                "propose_task_draft: job=%s probes found nothing, falling back to recency pool",
+                job_id,
             )
             candidates = _read_candidates(
                 db, user_id=user_id, exclude=set(), limit=PROPOSE_READ_CANDIDATES_LIMIT,
@@ -465,10 +489,19 @@ def propose_task_draft(user_id: str, draft_id: str, goal: str) -> None:
             "near_misses": near,
         }
 
-        # Cache before publish -- see draft_preview_bucket's identical
-        # rationale in workers/tasks.py.
-        draft_cache.store_result(draft_id, user_id=user_id, payload=payload)
-        _publish(user_id, "task_draft_ready", {"draft_id": draft_id})
+        jobs_repo.set_payload(db, job=job, payload=payload)
+        jobs_repo.update_stage(db, job=job, stage="draft_ready")
+        db.commit()
+        _publish(user_id, "job_updated", {"job_id": job_id})
+    except Exception as exc:
+        log.exception("propose_task_draft: job=%s failed", job_id)
+        # Guard rollback so it can't replace the original exception if connection drops.
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("propose_task_draft: rollback failed; original error takes precedence")
+        _record_job_failure(user_id=user_id, job_id=job_id, error=str(exc))
+        raise
     finally:
         db.close()
 
@@ -838,8 +871,9 @@ def _run_bucket_backfill(
 
 
 def _record_job_failure(*, user_id: str, job_id: str, error: str) -> None:
-    """Best-effort terminal failure write for `backfill_task`'s top-level
-    except clause (Phase 4.5 Task 2). Deliberately opens a BRAND-NEW session
+    """Best-effort terminal failure write, shared by `backfill_task`'s (Phase
+    4.5 Task 2) and `propose_task_draft`'s (Task 3) top-level except clauses.
+    Deliberately opens a BRAND-NEW session
     rather than reusing the run's own `db` -- that session may be poisoned
     by whatever just raised (a failed mid-batch commit, a dropped
     connection, an error thrown from deep inside triage/extraction with the

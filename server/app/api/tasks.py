@@ -1,12 +1,18 @@
-"""Task-engine HTTP API: the goal->draft flow, tracker CRUD, the board/events
-feed, and the human-correction endpoints (attach/detach, approve/reject/
-revert, manual state edit, merge).
+"""Task-engine HTTP API: tracker/bucket CRUD, the board/events feed, and the
+human-correction endpoints (attach/detach, approve/reject/revert, manual
+state edit, merge).
 
 Mirrors app/api/buckets.py's shape (ownership 404s via repo.get_owned_task —
 no 403-vs-404 split, so a wrong-user id and a nonexistent id look identical
 on the wire; pydantic request bodies; small `_serialize_*` helpers; the
-caller commits, not the repo) and app/api/inbox.py's draft-poll pattern
-(mark_pending BEFORE enqueue so a fast-polling client never races a 404).
+caller commits, not the repo).
+
+Phase 4.5 Task 3: the old goal->draft flow (`POST/GET /tasks/draft*`, backed
+by the Redis `task_engine/draft_cache.py`) retired in favor of the jobs
+surface (`app/api/jobs.py`) — a goal now starts a persisted `Job` row via
+`POST /api/jobs` instead. `_create_task_from_fields` below is the piece of
+`create_task` shared with `jobs.py`'s confirm route (both need identical
+kind-aware 422 validation + criteria formulation + the task_repo insert).
 
 Every mutating route commits, THEN calls `_publish_task_updated` with values
 read fresh off the just-committed row (`task.version` may have been bumped
@@ -17,11 +23,10 @@ own `_publish_task_updated` helper of the same shape.
 """
 
 import logging
-import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -31,7 +36,6 @@ from app.db.session import get_db
 from app.deps import get_current_user
 from app.inbox import inbox_repo
 from app.task_engine import criteria as criteria_mod
-from app.task_engine import draft_cache
 from app.task_engine import repo as task_repo
 from app.task_engine import schema as schema_mod
 from app.workers import task_engine_tasks
@@ -196,53 +200,6 @@ def _require_owned_task(db: Session, *, user_id: str, task_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Draft: goal -> proposed schema/criteria (mirrors buckets' draft/preview)
-# ---------------------------------------------------------------------------
-
-
-class _DraftBody(BaseModel):
-    goal: str = Field(min_length=1)
-
-
-@router.post("/tasks/draft", status_code=202)
-def post_task_draft(body: _DraftBody, user: User = Depends(get_current_user)) -> dict:
-    """Enqueue a goal -> proposed task draft and return a draft_id.
-
-    Same two delivery paths as bucket draft/preview: an SSE `task_draft_ready`
-    push for the fast case, and this draft_id as the polling fallback key.
-    """
-    draft_id = uuid.uuid4().hex
-    # mark pending BEFORE enqueueing so a fast-polling client never races the
-    # worker's first redis write and sees a 404.
-    draft_cache.mark_pending(draft_id, user_id=user.id)
-    task_engine_tasks.propose_task_draft.apply_async(
-        args=[user.id, draft_id, body.goal], countdown=0,
-    )
-    return {"draft_id": draft_id}
-
-
-@router.get("/tasks/draft/{draft_id}")
-def get_task_draft(draft_id: str, response: Response,
-                   user: User = Depends(get_current_user)) -> dict:
-    """200 ready payload | 202 {"status":"pending"} | 404 | 403 — mirrors
-    GET /api/buckets/draft/preview/{draft_id} exactly."""
-    entry = draft_cache.load(draft_id)
-    if entry is None:
-        raise HTTPException(404, "not found")
-    if entry.get("user_id") != user.id:
-        raise HTTPException(403, "not your draft")
-    if entry.get("status") == "pending":
-        response.status_code = 202
-        return {"status": "pending"}
-    return {
-        "status": "ready",
-        "proposal": entry.get("proposal"),
-        "positives": entry.get("positives", []),
-        "near_misses": entry.get("near_misses", []),
-    }
-
-
-# ---------------------------------------------------------------------------
 # CRUD
 # ---------------------------------------------------------------------------
 
@@ -296,30 +253,61 @@ def list_tasks(
     return {"tasks": [_serialize_task_list_item(db, t) for t in rows]}
 
 
+def _create_task_from_fields(
+    db: Session, *, user_id: str, name: str, goal: str, description: str, kind: str,
+    state_schema: dict | None,
+    confirmed_positives: list["_ExampleIn"], confirmed_negatives: list["_ExampleIn"],
+):
+    """Shared core of task creation: kind-aware `state_schema` 422 rules,
+    criteria formulation, and the `task_repo` insert. Used by both
+    `create_task` below (`POST /api/tasks`, direct creation) and
+    `app.api.jobs.confirm_job` (`POST /api/jobs/{id}/confirm`, Phase 4.5
+    Task 3 — the jobs-surface review step creates its task through this same
+    path so the 422 rules and criteria grammar can never drift between the
+    two entry points).
+
+    Returns a flushed-but-UNCOMMITTED Task (matches `task_repo.create_task`'s
+    own contract — repos never commit, see this module's docstring). The
+    caller commits: `create_task` commits alone, but `confirm_job` folds this
+    insert into the SAME commit as its own job-row updates (`task_id`,
+    `stage`), so committing here would split that into two transactions.
+    For the same reason, enqueuing the backfill and publishing `task_updated`
+    are also left to each caller — the backfill call differs (confirm_job
+    passes a `job_id` kwarg) and the response shape differs (task detail
+    alone vs. `{"task": ..., "job": ...}`), so nothing is gained by pulling
+    either into this helper.
+    """
+    if kind == "tracker":
+        if state_schema is None:
+            raise HTTPException(422, "state_schema is required for tracker tasks")
+        try:
+            schema = schema_mod.validate_schema(state_schema)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        validated_schema = schema.model_dump()
+    else:  # kind == "bucket"
+        if state_schema is not None:
+            raise HTTPException(422, "bucket tasks cannot have a state_schema")
+        validated_schema = None
+
+    criteria = criteria_mod.formulate_criteria(
+        description=description,
+        confirmed_positives=[e.model_dump() for e in confirmed_positives],
+        confirmed_negatives=[e.model_dump() for e in confirmed_negatives],
+    )
+    return task_repo.create_task(
+        db, user_id=user_id, name=name, goal=goal, criteria=criteria,
+        state_schema=validated_schema, kind=kind,
+    )
+
+
 @router.post("/tasks", status_code=201)
 def create_task(body: _CreateTaskBody, user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)) -> dict:
-    if body.kind == "tracker":
-        if body.state_schema is None:
-            raise HTTPException(422, "state_schema is required for tracker tasks")
-        try:
-            schema = schema_mod.validate_schema(body.state_schema)
-        except ValueError as exc:
-            raise HTTPException(422, str(exc))
-        state_schema = schema.model_dump()
-    else:  # kind == "bucket"
-        if body.state_schema is not None:
-            raise HTTPException(422, "bucket tasks cannot have a state_schema")
-        state_schema = None
-
-    criteria = criteria_mod.formulate_criteria(
-        description=body.description,
-        confirmed_positives=[e.model_dump() for e in body.confirmed_positives],
-        confirmed_negatives=[e.model_dump() for e in body.confirmed_negatives],
-    )
-    task = task_repo.create_task(
-        db, user_id=user.id, name=body.name, goal=body.goal, criteria=criteria,
-        state_schema=state_schema, kind=body.kind,
+    task = _create_task_from_fields(
+        db, user_id=user.id, name=body.name, goal=body.goal, description=body.description,
+        kind=body.kind, state_schema=body.state_schema,
+        confirmed_positives=body.confirmed_positives, confirmed_negatives=body.confirmed_negatives,
     )
     db.commit()
     # Async — the user gets 201 immediately; a newly created task (tracker OR

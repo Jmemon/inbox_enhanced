@@ -88,7 +88,8 @@ def test_delete_is_idempotent(authed):
 def test_draft_preview_routes_deleted(authed):
     """Phase 4 Task 3: the draft-preview machinery (POST/GET .../draft/
     preview*) and its preview_cache backing are gone entirely, superseded by
-    the task engine's own goal->draft flow (POST /api/tasks/draft). Neither
+    the task engine's own goal->draft flow -- itself since retired in favor
+    of the jobs surface (POST /api/jobs, Phase 4.5 Task 3). Neither
     path matches any surviving route in app/api/buckets.py -- the POST falls
     through to app.main's GET-only SPA catch-all, which matches the path but
     not the method (405, Starlette's standard "path exists, wrong verb"

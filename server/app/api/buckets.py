@@ -6,7 +6,9 @@ Delete in Phase 5.
 Four routes: GET / POST / PATCH / DELETE. The draft-preview routes (POST
 /buckets/draft/preview, GET /buckets/draft/preview/{id}) and their
 preview_cache/draft_preview_bucket machinery are gone -- superseded by the
-task engine's own goal->draft flow (POST /api/tasks/draft). A stale
+task engine's own goal->draft flow, itself since moved to the jobs surface
+(POST /api/jobs, app/api/jobs.py, Phase 4.5 Task 3 -- the task-engine's own
+POST /api/tasks/draft this comment used to point to is gone too). A stale
 pre-deploy client tab that still calls either deleted route gets a plain
 404; NewBucketModal's existing `gone` polling handler already treats any
 404 that way.

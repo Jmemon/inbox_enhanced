@@ -231,10 +231,11 @@ class Job(Base):
     # Denormalized: true only while stage='draft_ready' — the header chip's
     # blue-dot query reads this instead of re-deriving it from stage.
     needs_user: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
-    # The proposed draft (creation jobs): {name, description, criteria,
-    # state_schema, keyword_probes, positives, near_misses}. none_as_null=True
-    # for the same reason as Task.state_schema — a Python None must persist as
-    # SQL NULL, not the JSON scalar 'null'.
+    # The proposed draft (creation jobs): {"proposal": {name, description,
+    # state_schema, keyword_probes}, "positives": [...], "near_misses": [...]}.
+    # Criteria is only formulated at confirm time from description+examples.
+    # none_as_null=True for the same reason as Task.state_schema — a Python None
+    # must persist as SQL NULL, not the JSON scalar 'null'.
     payload: Mapped[dict | None] = mapped_column(
         JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
     )

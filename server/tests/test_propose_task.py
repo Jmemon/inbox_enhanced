@@ -1,17 +1,19 @@
-"""Task 8: the goal -> proposed task draft flow.
+"""Task 8 (+ Phase 4.5 Task 3 rework): the goal -> proposed task draft flow.
 
-Covers three things:
+Covers two things:
  - `llm/prompts/propose_task.py`'s pure build_user_message/parse_response
    shape checks (no database, mirrors test_extract_prompt.py's pattern).
- - `task_engine/draft_cache.py`'s pending/ready/load contract (mirrors
-   preview_cache's own test conventions, just a different key prefix).
  - `workers/task_engine_tasks.propose_task_draft`'s worker flow: canned LLM
-   JSON -> cache-before-publish ordering, the invalid-schema retry-once path
-   (asserting the retry's user message contains the first error), the
-   double-invalid -> fallback-schema path, and the probes-miss ->
-   `tasks._read_candidates` fallback path. Uses eager celery + a file-backed
-   sqlite session_factory + fakeredis + a monkeypatched `llm_client.
-   call_messages`, matching test_task_engine_tasks.py's conventions exactly.
+   JSON -> commit-before-publish ordering into the job row's `payload`/
+   `stage` (Phase 4.5 Task 3 -- replaces the retired Redis draft_cache), the
+   invalid-schema retry-once path (asserting the retry's user message
+   contains the first error), the double-invalid -> fallback-schema path,
+   the probes-miss -> `tasks._read_candidates` fallback path, the unknown-
+   user/unknown-job skip-without-LLM-spend paths, and the new top-level
+   exception -> `mark_failed` + re-raise guard. Uses eager celery + a
+   file-backed sqlite session_factory + a monkeypatched `llm_client.
+   call_messages`, matching test_task_engine_tasks.py's conventions exactly
+   (job seeding via `jobs_repo` instead of the retired draft_cache/fakeredis).
 """
 
 import os
@@ -26,11 +28,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.config import get_settings
-from app.db.models import Base, User
+from app.db.models import Base, Job, User
 from app.inbox import inbox_repo
 from app.llm import client as llm_client
 from app.llm.prompts import propose_task
-from app.task_engine import draft_cache
+from app.task_engine import jobs_repo
 from app.workers import task_engine_tasks
 from app.workers import tasks as tasks_mod
 
@@ -140,39 +142,6 @@ def test_parse_response_strips_code_fences():
 
 
 # ---------------------------------------------------------------------------
-# draft_cache — mirrors preview_cache's own contract
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def fake_redis(monkeypatch):
-    import fakeredis
-    r = fakeredis.FakeStrictRedis(decode_responses=True)
-    monkeypatch.setattr("app.realtime.redis_client.get_redis", lambda: r)
-    return r
-
-
-def test_draft_cache_load_missing_key_returns_none(fake_redis):
-    assert draft_cache.load("nope") is None
-
-
-def test_draft_cache_mark_pending_then_load(fake_redis):
-    draft_cache.mark_pending("d1", user_id=USER_ID)
-    cached = draft_cache.load("d1")
-    assert cached == {"status": "pending", "user_id": USER_ID}
-
-
-def test_draft_cache_store_result_overwrites_pending_and_spreads_payload(fake_redis):
-    draft_cache.mark_pending("d1", user_id=USER_ID)
-    draft_cache.store_result("d1", user_id=USER_ID, payload={"proposal": {"name": "X"}, "positives": []})
-    cached = draft_cache.load("d1")
-    assert cached == {
-        "status": "ready", "user_id": USER_ID,
-        "proposal": {"name": "X"}, "positives": [],
-    }
-
-
-# ---------------------------------------------------------------------------
 # propose_task_draft worker — fixtures + seeding helpers
 # ---------------------------------------------------------------------------
 
@@ -201,6 +170,22 @@ def _seed_user(session_factory, user_id=USER_ID):
     db.add(User(id=user_id, email=f"{user_id}@x.com", created_at=datetime.now(timezone.utc)))
     db.commit()
     db.close()
+
+
+def _seed_job(session_factory, *, user_id=USER_ID, task_kind="tracker", goal="goal text") -> str:
+    db = session_factory()
+    job = jobs_repo.create_job(db, user_id=user_id, kind="creation", task_kind=task_kind, goal=goal)
+    db.commit()
+    job_id = job.id
+    db.close()
+    return job_id
+
+
+def _get_job(session_factory, job_id, user_id=USER_ID):
+    db = session_factory()
+    job = jobs_repo.get_owned_job(db, user_id=user_id, job_id=job_id)
+    db.close()
+    return job
 
 
 def _seed_thread(
@@ -253,12 +238,12 @@ def _fake_call_messages(propose_responses: list[str], score_response: str =
 
 
 # ---------------------------------------------------------------------------
-# Happy path: canned JSON -> cache-before-publish, positives populated
+# Happy path: canned JSON -> commit-before-publish, positives populated
 # ---------------------------------------------------------------------------
 
 
-def test_propose_task_draft_happy_path_caches_before_publishing(
-    session_factory, fake_redis, monkeypatch,
+def test_propose_task_draft_happy_path_commits_before_publishing(
+    session_factory, monkeypatch,
 ):
     _seed_user(session_factory)
     _seed_thread(session_factory, gmail_thread_id="g1", subject="Interview scheduled",
@@ -267,20 +252,17 @@ def test_propose_task_draft_happy_path_caches_before_publishing(
     _seed_thread(session_factory, gmail_thread_id="g2", subject="Grocery receipt",
                 body="Thanks for your order of milk and eggs",
                 from_addr="store@example.com")
-
-    order: list[str] = []
-    orig_store = draft_cache.store_result
-
-    def _record_store(*a, **kw):
-        order.append("cache")
-        return orig_store(*a, **kw)
-
-    monkeypatch.setattr(draft_cache, "store_result", _record_store)
+    job_id = _seed_job(session_factory, goal="help me land a new job")
 
     published: list[tuple] = []
 
     def _record_publish(user_id, event, payload):
-        order.append("publish")
+        # commit-before-publish: a FRESH session (separate sqlite connection)
+        # must already see the job row in its post-write state by the time
+        # this fires, or the write hadn't actually committed yet.
+        row = _get_job(session_factory, job_id)
+        assert row.stage == "draft_ready"
+        assert row.payload is not None
         published.append((user_id, event, payload))
 
     monkeypatch.setattr(tasks_mod, "_publish", _record_publish)
@@ -291,15 +273,13 @@ def test_propose_task_draft_happy_path_caches_before_publishing(
     )
     monkeypatch.setattr(llm_client, "call_messages", fake)
 
-    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "draft-1", "help me land a new job"])
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, job_id, "help me land a new job"])
 
-    # cache-write-before-publish ordering, asserted via the recording fakes above.
-    assert order == ["cache", "publish"]
     assert len(published) == 1
     user_id, event, payload = published[0]
     assert user_id == USER_ID
-    assert event == "task_draft_ready"
-    assert payload == {"draft_id": "draft-1"}
+    assert event == "job_updated"
+    assert payload == {"job_id": job_id}
 
     settings = get_settings()
     propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
@@ -311,10 +291,10 @@ def test_propose_task_draft_happy_path_caches_before_publishing(
     score_calls = [c for c in fake.calls if c.get("stage") == "score"]
     assert score_calls and score_calls[0]["model"] == settings.llm_classify_model
 
-    cached = draft_cache.load("draft-1")
-    assert cached["status"] == "ready"
-    assert cached["user_id"] == USER_ID
-    proposal = cached["proposal"]
+    row = _get_job(session_factory, job_id)
+    assert row.stage == "draft_ready"
+    assert row.needs_user is True
+    proposal = row.payload["proposal"]
     assert proposal["name"] == "Job hunt"
     assert proposal["keyword_probes"] == ["interview"]
     assert proposal["state_schema"] == {
@@ -322,9 +302,9 @@ def test_propose_task_draft_happy_path_caches_before_publishing(
         "pipeline": {"stages": ["applied", "interview"], "terminal": ["offer", "rejected"]},
     }
     # only the "interview" thread matched the probe -> only it was scored
-    assert len(cached["positives"]) == 1
-    assert cached["positives"][0]["thread_id"]
-    assert cached["near_misses"] == []
+    assert len(row.payload["positives"]) == 1
+    assert row.payload["positives"][0]["thread_id"]
+    assert row.payload["near_misses"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +313,13 @@ def test_propose_task_draft_happy_path_caches_before_publishing(
 
 
 def test_propose_task_draft_retries_once_on_invalid_schema_then_succeeds(
-    session_factory, fake_redis, monkeypatch,
+    session_factory, monkeypatch,
 ):
     _seed_user(session_factory)
     _seed_thread(session_factory, gmail_thread_id="g1", subject="Interview scheduled",
                 body="Your onsite interview is confirmed", from_addr="recruiter@acme.co")
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+    job_id = _seed_job(session_factory, goal="help me land a new job")
 
     invalid_schema = {"version": 1, "entity": None,
                       "pipeline": {"stages": [], "terminal": ["done"]}}
@@ -348,15 +329,15 @@ def test_propose_task_draft_retries_once_on_invalid_schema_then_succeeds(
     fake = _fake_call_messages([bad, good])
     monkeypatch.setattr(llm_client, "call_messages", fake)
 
-    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "draft-2", "help me land a new job"])
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, job_id, "help me land a new job"])
 
     propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
     assert len(propose_calls) == 2
     # the retry's user message carries the first attempt's validator error
     assert "pipeline must declare at least one stage" in propose_calls[1]["user"]
 
-    cached = draft_cache.load("draft-2")
-    assert cached["proposal"]["state_schema"] == {
+    row = _get_job(session_factory, job_id)
+    assert row.payload["proposal"]["state_schema"] == {
         "version": 1, "entity": None,
         "pipeline": {"stages": ["applied", "interview"], "terminal": ["offer", "rejected"]},
     }
@@ -368,12 +349,13 @@ def test_propose_task_draft_retries_once_on_invalid_schema_then_succeeds(
 
 
 def test_propose_task_draft_falls_back_to_default_schema_after_second_invalid_attempt(
-    session_factory, fake_redis, monkeypatch,
+    session_factory, monkeypatch,
 ):
     _seed_user(session_factory)
     _seed_thread(session_factory, gmail_thread_id="g1", subject="Interview scheduled",
                 body="Your onsite interview is confirmed", from_addr="recruiter@acme.co")
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+    job_id = _seed_job(session_factory, goal="help me land a new job")
 
     invalid_schema_1 = {"version": 1, "entity": None,
                         "pipeline": {"stages": [], "terminal": ["done"]}}
@@ -386,13 +368,13 @@ def test_propose_task_draft_falls_back_to_default_schema_after_second_invalid_at
     fake = _fake_call_messages([bad1, bad2])
     monkeypatch.setattr(llm_client, "call_messages", fake)
 
-    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "draft-3", "help me land a new job"])
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, job_id, "help me land a new job"])
 
     propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
     assert len(propose_calls) == 2  # no third attempt -- fallback kicks in immediately
 
-    cached = draft_cache.load("draft-3")
-    proposal = cached["proposal"]
+    row = _get_job(session_factory, job_id)
+    proposal = row.payload["proposal"]
     assert proposal["state_schema"] == {
         "version": 1, "entity": None,
         "pipeline": {"stages": ["in_progress"], "terminal": ["done"]},
@@ -404,19 +386,20 @@ def test_propose_task_draft_falls_back_to_default_schema_after_second_invalid_at
 
 # ---------------------------------------------------------------------------
 # Unparseable first response -> retry once (symmetry with the schema-invalid
-# retry above). propose_task_draft spends exactly one retry total per draft,
+# retry above). propose_task_draft spends exactly one retry total per job,
 # regardless of which of the two failure shapes (unparseable vs.
 # schema-invalid) fires first.
 # ---------------------------------------------------------------------------
 
 
 def test_propose_task_draft_retries_once_on_unparseable_first_response_then_succeeds(
-    session_factory, fake_redis, monkeypatch,
+    session_factory, monkeypatch,
 ):
     _seed_user(session_factory)
     _seed_thread(session_factory, gmail_thread_id="g1", subject="Interview scheduled",
                 body="Your onsite interview is confirmed", from_addr="recruiter@acme.co")
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+    job_id = _seed_job(session_factory, goal="help me land a new job")
 
     # "" mirrors call_messages' own degrade-on-error behavior (client.py:
     # "call_messages returns \"\" on any error") -- a transient API failure,
@@ -425,7 +408,7 @@ def test_propose_task_draft_retries_once_on_unparseable_first_response_then_succ
     fake = _fake_call_messages(["", good])
     monkeypatch.setattr(llm_client, "call_messages", fake)
 
-    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "draft-5", "help me land a new job"])
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, job_id, "help me land a new job"])
 
     propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
     assert len(propose_calls) == 2
@@ -434,8 +417,8 @@ def test_propose_task_draft_retries_once_on_unparseable_first_response_then_succ
     # never parsed at all.
     assert "valid JSON" in propose_calls[1]["user"]
 
-    cached = draft_cache.load("draft-5")
-    proposal = cached["proposal"]
+    row = _get_job(session_factory, job_id)
+    proposal = row.payload["proposal"]
     assert proposal["name"] == "Job hunt"
     assert proposal["keyword_probes"] == ["interview"]
     assert proposal["state_schema"] == {
@@ -444,28 +427,31 @@ def test_propose_task_draft_retries_once_on_unparseable_first_response_then_succ
     }
     # full-quality draft: the fallback schema was never needed, and scoring
     # ran against the real (retry) proposal's name/description.
-    assert len(cached["positives"]) == 1
+    assert len(row.payload["positives"]) == 1
 
 
 def test_propose_task_draft_falls_back_when_both_attempts_unparseable(
-    session_factory, fake_redis, monkeypatch,
+    session_factory, monkeypatch,
 ):
     _seed_user(session_factory)
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+    job_id = _seed_job(session_factory, goal="help me plan a wedding")
 
     fake = _fake_call_messages(["", ""])
     monkeypatch.setattr(llm_client, "call_messages", fake)
 
     task_engine_tasks.propose_task_draft.apply(
-        args=[USER_ID, "draft-6", "help me plan a wedding"],
+        args=[USER_ID, job_id, "help me plan a wedding"],
     )
 
     propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
     assert len(propose_calls) == 2  # no third attempt
 
-    cached = draft_cache.load("draft-6")
-    proposal = cached["proposal"]
-    # synthetic draft carved from the goal itself
+    row = _get_job(session_factory, job_id)
+    proposal = row.payload["proposal"]
+    # synthetic draft carved from the goal itself -- this is a degraded but
+    # still-successful draft_ready outcome, NOT a job failure.
+    assert row.stage == "draft_ready"
     assert proposal["name"] == "help me plan a wedding"[:40]
     assert proposal["description"] == "help me plan a wedding"
     assert proposal["keyword_probes"] == []
@@ -476,16 +462,17 @@ def test_propose_task_draft_falls_back_when_both_attempts_unparseable(
 
 
 def test_propose_task_draft_falls_back_when_unparseable_then_schema_invalid(
-    session_factory, fake_redis, monkeypatch,
+    session_factory, monkeypatch,
 ):
-    """Mixed failure shapes: first attempt unparseable (spends the draft's
-    one retry), retry attempt parses but has an invalid schema. Must NOT
-    spend a third LLM call -- the retry budget was already used on the
-    first attempt's unparseable response, so a schema-invalid retry
-    response goes straight to the fallback schema instead of triggering its
-    own second retry."""
+    """Mixed failure shapes: first attempt unparseable (spends the job's one
+    retry), retry attempt parses but has an invalid schema. Must NOT spend a
+    third LLM call -- the retry budget was already used on the first
+    attempt's unparseable response, so a schema-invalid retry response goes
+    straight to the fallback schema instead of triggering its own second
+    retry."""
     _seed_user(session_factory)
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+    job_id = _seed_job(session_factory, goal="help me land a new job")
 
     invalid_schema = {"version": 1, "entity": None,
                       "pipeline": {"stages": [], "terminal": ["done"]}}
@@ -495,14 +482,14 @@ def test_propose_task_draft_falls_back_when_unparseable_then_schema_invalid(
     monkeypatch.setattr(llm_client, "call_messages", fake)
 
     task_engine_tasks.propose_task_draft.apply(
-        args=[USER_ID, "draft-7", "help me land a new job"],
+        args=[USER_ID, job_id, "help me land a new job"],
     )
 
     propose_calls = [c for c in fake.calls if c.get("stage") == "propose"]
     assert len(propose_calls) == 2  # no third attempt
 
-    cached = draft_cache.load("draft-7")
-    proposal = cached["proposal"]
+    row = _get_job(session_factory, job_id)
+    proposal = row.payload["proposal"]
     # name/description/probes still come from the retry's parseable (if
     # schema-invalid) response -- only the schema itself falls back.
     assert proposal["name"] == "Recovered name"
@@ -514,22 +501,37 @@ def test_propose_task_draft_falls_back_when_unparseable_then_schema_invalid(
 
 
 # ---------------------------------------------------------------------------
-# Unknown user -> skip entirely, no LLM spend (parity with draft_preview_bucket)
+# Unknown user / unknown job -> skip entirely, no LLM spend (parity with
+# draft_preview_bucket)
 # ---------------------------------------------------------------------------
 
 
-def test_propose_task_draft_skips_for_unknown_user(session_factory, fake_redis, monkeypatch):
+def test_propose_task_draft_skips_for_unknown_user(session_factory, monkeypatch):
     # deliberately never seed a User row
     fake = _fake_call_messages([_proposal_json()])
     monkeypatch.setattr(llm_client, "call_messages", fake)
     published: list[bool] = []
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: published.append(True))
 
-    task_engine_tasks.propose_task_draft.apply(args=["no-such-user", "draft-8", "some goal"])
+    task_engine_tasks.propose_task_draft.apply(args=["no-such-user", "no-such-job", "some goal"])
 
     assert fake.calls == []  # no LLM spend for a bogus user
     assert published == []
-    assert draft_cache.load("draft-8") is None
+
+
+def test_propose_task_draft_skips_for_unknown_job(session_factory, monkeypatch):
+    # user exists, but the job_id doesn't -- e.g. dismissed-and-since-purged,
+    # or simply a bad id. Must not spend an LLM call either.
+    _seed_user(session_factory)
+    fake = _fake_call_messages([_proposal_json()])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    published: list[bool] = []
+    monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: published.append(True))
+
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "no-such-job", "some goal"])
+
+    assert fake.calls == []
+    assert published == []
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +540,7 @@ def test_propose_task_draft_skips_for_unknown_user(session_factory, fake_redis, 
 
 
 def test_propose_task_draft_falls_back_to_read_candidates_when_probes_find_nothing(
-    session_factory, fake_redis, monkeypatch,
+    session_factory, monkeypatch,
 ):
     _seed_user(session_factory)
     _seed_thread(session_factory, gmail_thread_id="g1", subject="Interview scheduled",
@@ -546,6 +548,7 @@ def test_propose_task_draft_falls_back_to_read_candidates_when_probes_find_nothi
     _seed_thread(session_factory, gmail_thread_id="g2", subject="Grocery receipt",
                 body="milk and eggs", from_addr="store@example.com")
     monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+    job_id = _seed_job(session_factory, goal="some goal")
 
     fake = _fake_call_messages(
         [_proposal_json(keyword_probes=["zzznomatchterm"])],
@@ -557,7 +560,7 @@ def test_propose_task_draft_falls_back_to_read_candidates_when_probes_find_nothi
     spy = MagicMock(side_effect=real_read_candidates)
     monkeypatch.setattr(tasks_mod, "_read_candidates", spy)
 
-    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, "draft-4", "some goal"])
+    task_engine_tasks.propose_task_draft.apply(args=[USER_ID, job_id, "some goal"])
 
     spy.assert_called_once()
     assert spy.call_args.kwargs == {
@@ -565,6 +568,81 @@ def test_propose_task_draft_falls_back_to_read_candidates_when_probes_find_nothi
         "limit": task_engine_tasks.PROPOSE_READ_CANDIDATES_LIMIT,
     }
 
-    cached = draft_cache.load("draft-4")
+    row = _get_job(session_factory, job_id)
     # both seeded threads came back through the recency-pool fallback and scored
-    assert len(cached["positives"]) == 2
+    assert len(row.payload["positives"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Top-level exception -> mark_failed + re-raise (Phase 4.5 Task 3, mirrors
+# backfill_task's identical guard)
+# ---------------------------------------------------------------------------
+
+
+def test_propose_task_draft_exception_marks_job_failed_and_reraises(
+    session_factory, monkeypatch,
+):
+    _seed_user(session_factory)
+    job_id = _seed_job(session_factory, goal="help me plan a wedding")
+
+    published: list[tuple] = []
+    monkeypatch.setattr(
+        tasks_mod, "_publish",
+        lambda user_id, event, payload: published.append((user_id, event, payload)),
+    )
+
+    fake = _fake_call_messages([_proposal_json()])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("disk on fire")
+
+    # Force the final write step to blow up -- exercises the top-level
+    # try/except regardless of which retry path the LLM mock took.
+    monkeypatch.setattr(task_engine_tasks.jobs_repo, "set_payload", _boom)
+
+    with pytest.raises(RuntimeError, match="disk on fire"):
+        task_engine_tasks.propose_task_draft.apply(
+            args=[USER_ID, job_id, "help me plan a wedding"],
+        )
+
+    row = _get_job(session_factory, job_id)
+    assert row.stage == "failed"
+    assert "disk on fire" in row.error
+    assert row.needs_user is False
+
+    assert published == [(USER_ID, "job_updated", {"job_id": job_id})]
+
+
+def test_propose_task_draft_missing_job_row_while_recording_failure_is_swallowed(
+    session_factory, monkeypatch,
+):
+    """If the job row vanishes between the main run's fetch and the failure
+    write (e.g. a concurrent hard-delete), `_record_job_failure` must log and
+    swallow rather than let a secondary exception mask the original one, and
+    the ORIGINAL exception must still propagate."""
+    _seed_user(session_factory)
+    job_id = _seed_job(session_factory, goal="help me plan a wedding")
+
+    fake = _fake_call_messages([_proposal_json()])
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+    monkeypatch.setattr(tasks_mod, "_publish", lambda *a, **kw: None)
+
+    def _boom_after_deleting_job(db, *, job, payload):
+        # Delete the row for real, on a SEPARATE session/connection, right
+        # before raising -- by the time _record_job_failure opens its own
+        # fresh session, get_owned_job genuinely finds nothing.
+        del_db = session_factory()
+        row = del_db.get(Job, job.id)
+        if row is not None:
+            del_db.delete(row)
+            del_db.commit()
+        del_db.close()
+        raise RuntimeError("original failure")
+
+    monkeypatch.setattr(task_engine_tasks.jobs_repo, "set_payload", _boom_after_deleting_job)
+
+    with pytest.raises(RuntimeError, match="original failure"):
+        task_engine_tasks.propose_task_draft.apply(
+            args=[USER_ID, job_id, "help me plan a wedding"],
+        )
