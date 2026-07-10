@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../../auth/useAuth'
 import { getSyncStatus, type SyncStatus, type Task } from '../../lib/api'
 import { InboxList } from '../inbox/InboxList'
 import { SearchBar } from '../search/SearchBar'
@@ -64,11 +65,19 @@ const statusChipStyle = (status: Task['status']) => ({
 export default function HudPage() {
   const { buckets, inbox } = useInboxStore()
   const { tasks, backfill } = useTasksStore()
+  const { state: authState } = useAuth()
   const search = useInboxSearch()
   const navigate = useNavigate()
   const [status, setStatus] = useState<SyncStatus | null>(null)
   const [, forceTick] = useState(0)
   const [showWizard, setShowWizard] = useState(false)
+  // Scope-migration banner (spec 006 §1/§5): session-dismissable only —
+  // plain useState, not persisted anywhere, so it reappears on the next full
+  // load/reload. That's deliberate: the banner's job is to get an existing
+  // account re-consented, and a dismiss that survived reloads could hide it
+  // from a user who never gets around to reconnecting for weeks.
+  const [scopeBannerDismissed, setScopeBannerDismissed] = useState(false)
+  const showScopeBanner = authState.status === 'authed' && !authState.user.has_write_scopes && !scopeBannerDismissed
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -116,6 +125,31 @@ export default function HudPage() {
         </main>
       ) : (
         <main style={{ padding: '16px 24px', display: 'grid', gap: 24 }}>
+          {showScopeBanner && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px',
+              background: '#fff2e0', border: '1px solid #f5dcb3', borderRadius: 8,
+              fontSize: 13, color: '#a06a00',
+            }}>
+              <span style={{ flex: 1 }}>Re-connect Gmail to enable actions</span>
+              <a
+                href="/auth/login"
+                style={{
+                  fontSize: 12, fontWeight: 500, padding: '6px 10px', borderRadius: 6,
+                  background: '#a06a00', color: 'white', textDecoration: 'none', whiteSpace: 'nowrap',
+                }}
+              >
+                Reconnect Gmail
+              </a>
+              <button
+                onClick={() => setScopeBannerDismissed(true)}
+                aria-label="dismiss"
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: '#a06a00', lineHeight: 1 }}
+              >
+                ×
+              </button>
+            </div>
+          )}
           <section>
             <div style={{ fontSize: 12, color: '#888', marginBottom: 8 }}>
               synced {agoLabel(status?.last_synced_at ?? null)}
