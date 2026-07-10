@@ -65,6 +65,20 @@ def list_rules(db: Session, *, task_id: str, include_deleted: bool = False) -> l
     return list(db.execute(stmt).scalars().all())
 
 
+def get_rules_by_ids(db: Session, *, rule_ids: set[str]) -> dict[str, TaskActionRule]:
+    """Batch-resolve rule_id -> TaskActionRule in ONE query (no N+1) -- the
+    aggregate feeds' rule_summary field (api/tasks.py's get_reviews/
+    get_activity) is derived from this. Deliberately INCLUDES soft-deleted
+    rules (unlike list_rules) -- a historical TaskAction's rule may since
+    have been edited or deleted, and the feed still needs to describe what
+    fired it, mirroring task_engine.repo.get_entity_display_names's own
+    include-what-you-can-find posture."""
+    if not rule_ids:
+        return {}
+    stmt = select(TaskActionRule).where(TaskActionRule.id.in_(rule_ids))
+    return {r.id: r for r in db.execute(stmt).scalars().all()}
+
+
 def get_owned_rule(db: Session, *, user_id: str, rule_id: str) -> TaskActionRule | None:
     """Fetch one rule scoped to its owner via a join through Task (a rule has
     no user_id column of its own) — same no-enumeration-split rationale as

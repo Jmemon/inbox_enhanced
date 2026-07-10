@@ -875,40 +875,120 @@ def _serialize_feed_event(event, *, task, display_names: dict[str, str]) -> dict
         entity_display_name = event.proposed_entity
     return {
         **_serialize_event(event),
+        "type": "event",
         "task_id": task.id,
         "task_name": task.name,
         "entity_display_name": entity_display_name,
     }
 
 
+def _rule_summary(rule) -> str:
+    """Human trigger-summary string for a feed action item (Phase 5 Task 4).
+    `rule` may be None -- a rule can be edited/soft-deleted after it already
+    fired one of the actions in this feed, and the frozen TaskAction row
+    outlives it (see actions_repo.get_rules_by_ids's docstring)."""
+    if rule is None:
+        return "rule deleted"
+    if rule.trigger == "entity_entered_stage":
+        stage = (rule.trigger_params or {}).get("stage", "?")
+        return f"when entity enters '{stage}'"
+    return "when a thread is linked"
+
+
+def _serialize_feed_action(
+    action, *, task, rules_by_id: dict, thread_subjects: dict[str, str | None],
+) -> dict:
+    """Action counterpart to _serialize_feed_event -- same cross-task fields
+    (task_id/task_name) plus what the review/activity cards need to render:
+    a human rule_summary (batch-resolved rule, see _rule_summary) and the
+    target thread's subject (batch-resolved via inbox_repo.get_threads_batch
+    in the caller, no N+1)."""
+    rule = rules_by_id.get(action.rule_id)
+    return {
+        "type": "action",
+        "action_id": action.id,
+        "task_id": task.id,
+        "task_name": task.name,
+        "action_type": action.action_type,
+        "action_params": action.action_params,
+        "status": action.status,
+        "rule_summary": _rule_summary(rule),
+        "thread_subject": thread_subjects.get(action.thread_id) if action.thread_id else None,
+        "created_at": action.created_at,
+    }
+
+
+def _action_feed_extras(
+    db: Session, *, user_id: str, pairs: list[tuple],
+) -> tuple[dict, dict[str, str | None]]:
+    """Shared batched lookups for a list of (TaskAction, Task) pairs: rules
+    keyed by rule_id (get_rules_by_ids) and thread subjects keyed by
+    thread_id (inbox_repo.get_threads_batch) -- one query each, regardless of
+    how many actions are in the feed."""
+    rule_ids = {action.rule_id for action, _task in pairs}
+    rules_by_id = actions_repo.get_rules_by_ids(db, rule_ids=rule_ids)
+    thread_ids = [action.thread_id for action, _task in pairs if action.thread_id]
+    threads = inbox_repo.get_threads_batch(db, user_id=user_id, thread_ids=thread_ids)
+    thread_subjects = {t.id: t.subject for t in threads}
+    return rules_by_id, thread_subjects
+
+
+def _merge_feed_items(events: list[dict], actions: list[dict], *, limit: int) -> list[dict]:
+    """Merge-sort two already-serialized feed lists by created_at desc, then
+    truncate to `limit`. Fetching up to `limit` items from EACH source before
+    merging (done by the caller) is what makes truncating after the merge
+    correct -- the worst case where all `limit` winners come from a single
+    source still has enough candidates from that source alone."""
+    merged = events + actions
+    merged.sort(key=lambda item: item["created_at"], reverse=True)
+    return merged[:limit]
+
+
 @router.get("/reviews")
 def get_reviews(limit: int = Query(default=_REVIEWS_LIMIT_DEFAULT),
                 user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
-    """Unified review tray: every still-pending_review event across all of
-    this user's non-deleted tasks, newest first, regardless of task.
-    limit is clamped (never 422'd) to [1, 200]."""
+    """Unified review tray: every still-pending_review event PLUS every
+    still-'proposed' action (Phase 5 Task 4) across all of this user's
+    non-deleted tasks, newest first by created_at, regardless of task or
+    type. limit is clamped (never 422'd) to [1, 200] and applies to the
+    MERGED result -- each source query is independently capped at the same
+    limit first (see _merge_feed_items's docstring for why that's required
+    for a correct post-merge truncation, not just an optimization)."""
     limit = max(_REVIEWS_LIMIT_MIN, min(_REVIEWS_LIMIT_MAX, limit))
-    pairs = task_repo.list_pending_events_for_user(db, user_id=user.id, limit=limit)
-    display_names = _entity_display_names_for(db, pairs)
-    return {
-        "reviews": [_serialize_feed_event(event, task=task, display_names=display_names)
-                   for event, task in pairs],
-    }
+    event_pairs = task_repo.list_pending_events_for_user(db, user_id=user.id, limit=limit)
+    display_names = _entity_display_names_for(db, event_pairs)
+    events = [_serialize_feed_event(event, task=task, display_names=display_names)
+             for event, task in event_pairs]
+
+    action_pairs = actions_repo.list_pending_actions_for_user(db, user_id=user.id, limit=limit)
+    rules_by_id, thread_subjects = _action_feed_extras(db, user_id=user.id, pairs=action_pairs)
+    actions = [_serialize_feed_action(action, task=task, rules_by_id=rules_by_id, thread_subjects=thread_subjects)
+              for action, task in action_pairs]
+
+    return {"reviews": _merge_feed_items(events, actions, limit=limit)}
 
 
 @router.get("/activity")
 def get_activity(limit: int = Query(default=_ACTIVITY_LIMIT_DEFAULT),
                  user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
     """Activity ticker: every non-pending_review event (applied/rejected/
-    reverted) across this user's non-deleted tasks, newest first. limit is
-    clamped (never 422'd) to [1, 100]."""
+    reverted) PLUS every settled action (executed/rejected/undone/failed,
+    Phase 5 Task 4) across this user's non-deleted tasks, newest first by
+    created_at, regardless of type. limit is clamped (never 422'd) to
+    [1, 100] and applies to the MERGED result -- see get_reviews's docstring
+    for the same per-source-then-merge rationale."""
     limit = max(_ACTIVITY_LIMIT_MIN, min(_ACTIVITY_LIMIT_MAX, limit))
-    pairs = task_repo.list_recent_events_for_user(db, user_id=user.id, limit=limit)
-    display_names = _entity_display_names_for(db, pairs)
-    return {
-        "activity": [_serialize_feed_event(event, task=task, display_names=display_names)
-                     for event, task in pairs],
-    }
+    event_pairs = task_repo.list_recent_events_for_user(db, user_id=user.id, limit=limit)
+    display_names = _entity_display_names_for(db, event_pairs)
+    events = [_serialize_feed_event(event, task=task, display_names=display_names)
+             for event, task in event_pairs]
+
+    action_pairs = actions_repo.list_recent_actions_for_user(db, user_id=user.id, limit=limit)
+    rules_by_id, thread_subjects = _action_feed_extras(db, user_id=user.id, pairs=action_pairs)
+    actions = [_serialize_feed_action(action, task=task, rules_by_id=rules_by_id, thread_subjects=thread_subjects)
+              for action, task in action_pairs]
+
+    return {"activity": _merge_feed_items(events, actions, limit=limit)}
 
 
 @router.post("/tasks/{task_id}/entities/{entity_id}/merge", status_code=204)
