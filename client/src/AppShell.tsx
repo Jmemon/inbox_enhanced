@@ -3,6 +3,8 @@ import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from './auth/useAuth'
 import { InboxProvider } from './state/InboxProvider'
 import { TasksProvider } from './state/TasksProvider'
+import { JobsProvider } from './state/JobsProvider'
+import { JobsChip } from './jobs/JobsChip'
 import { subscribeSse } from './lib/sse'
 
 // Auth-death escape (see lib/sse.ts backoff): an expired session cookie
@@ -51,30 +53,38 @@ export function AppShell() {
   if (state.status !== 'authed') return null
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif', minHeight: '100vh' }}>
-      <header style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        padding: '12px 24px', borderBottom: '1px solid #eee',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-          <div style={{ fontWeight: 600 }}>inbox concierge</div>
-          <nav style={{ display: 'flex', gap: 6 }}>
-            <NavLink to="/" end style={navStyle}>HUD</NavLink>
-            <NavLink to="/inbox" style={navStyle}>Inbox</NavLink>
-          </nav>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ fontSize: 14, color: '#444' }}>{state.user.name ?? state.user.email}</span>
-          <button onClick={signOut} style={{ fontSize: 13, padding: '6px 10px' }}>sign out</button>
-        </div>
-      </header>
-      {/* Hook-order note: InboxProvider outer, TasksProvider inner — both are
-          permanent, session-lifetime providers (mirroring their SSE
-          subscriptions), so nesting order has no remount implications; inner
-          just means TasksProvider's own state/effects run after InboxProvider's
-          on every render. */}
+      {/* Hook-order note: InboxProvider outer, TasksProvider middle,
+          JobsProvider inner — all three are permanent, session-lifetime
+          providers (mirroring their SSE subscriptions), so nesting order has
+          no remount implications; inner just means that provider's own
+          state/effects run after the outer ones on every render.
+          Phase 4.5 Task 5: the header moved inside this nesting (it used to
+          sit above it, as InboxProvider/TasksProvider's sibling) so JobsChip,
+          rendered in the header, can read useJobsStore() — the header itself
+          doesn't consume InboxProvider/TasksProvider, so this has no other
+          behavioral effect. */}
       <InboxProvider>
         <TasksProvider>
-          <Outlet />
+          <JobsProvider>
+            <header style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '12px 24px', borderBottom: '1px solid #eee',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+                <div style={{ fontWeight: 600 }}>inbox concierge</div>
+                <nav style={{ display: 'flex', gap: 6 }}>
+                  <NavLink to="/" end style={navStyle}>HUD</NavLink>
+                  <NavLink to="/inbox" style={navStyle}>Inbox</NavLink>
+                </nav>
+                <JobsChip />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <span style={{ fontSize: 14, color: '#444' }}>{state.user.name ?? state.user.email}</span>
+                <button onClick={signOut} style={{ fontSize: 13, padding: '6px 10px' }}>sign out</button>
+              </div>
+            </header>
+            <Outlet />
+          </JobsProvider>
         </TasksProvider>
       </InboxProvider>
     </div>

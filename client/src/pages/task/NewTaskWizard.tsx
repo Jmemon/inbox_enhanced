@@ -1,16 +1,26 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { subscribeSse, type PreviewExample } from '../../lib/sse'
-import { postTaskDraft, getTaskDraft, type TaskStateSchema, type TaskDraftProposal } from '../../lib/api'
+import type { PreviewExample } from '../../lib/sse'
+import type { TaskStateSchema } from '../../lib/api'
 import { useTasksStore } from '../../state/TasksProvider'
 import { SchemaEditor } from './SchemaEditor'
 
-// Step machine: goal form -> draft pending (SSE `task_draft_ready` fast path +
-// 5s-poll fallback) -> review (name/description/schema/examples, seeded from
-// the draft) -> create -> 'creating' (post-create backfill wait). Per-draft
-// idempotency (appliedRef), unmount guard, and Backdrop/modal styles below
-// follow the same shape as the bucket draft-preview flow this superseded.
+// Step machine: goal form -> draft pending -> review (name/description/
+// schema/examples, seeded from the draft) -> create -> 'creating'
+// (post-create backfill wait).
+//
+// Phase 4.5 Task 5: the goal->draft backend this wizard used to drive
+// (POST/GET /api/tasks/draft + the `task_draft_ready` SSE event) is deleted
+// — jobs own that flow now (`api.ts`'s createJob/getJobs + confirmJob,
+// state/JobsProvider.tsx). `startDraft` below is stubbed to an inline error
+// instead of restoring the deleted request — same pattern Phase 4 Task 4
+// used on the now-deleted NewBucketModal (see git history) when ITS backend
+// was cut out from under it a task early. The 'pending'/'review' steps past
+// it are therefore unreachable dead code, kept only because Phase 4.5 Task 6
+// restructures this wizard onto startCreation()/confirmJob and a review step
+// seeded from a job's `payload` instead (specs/005_jobs_surface/design.md
+// §2.4) rather than reintroducing the deleted draft-poll path.
 //
 // Phase 4 Task 5: `kind` gives this wizard a second mode ('bucket', default
 // 'tracker') so bucket creation goes through the same goal->draft->review
@@ -20,15 +30,6 @@ import { SchemaEditor } from './SchemaEditor'
 // detail page to hand off to on completion (`onCreated` instead of
 // `navigate`). Every other line here is unchanged, byte-identical tracker
 // behavior — search for `kind ===` to see every divergence point.
-//
-// Other differences from the old bucket-draft-preview modal it replaces:
-// - One extra step ('creating') for the post-create backfill wait (both
-//   kinds backfill now — see workers/task_engine_tasks.py's kind branch).
-// - The SSE payload (`task_draft_ready`) carries only the draft_id, not the
-//   proposal — unlike the old `bucket_draft_preview`, which inlined
-//   positives/near_misses directly. The fast path here does event ->
-//   getTaskDraft(id) -> apply.
-// - No "more examples" affordance (the plan doesn't call for one here).
 
 type Choice = 'positive' | 'near_miss' | 'rejected'
 type ExampleState = PreviewExample & { initial: Exclude<Choice, 'rejected'>; choice: Choice }
@@ -51,130 +52,32 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
 
   const [step, setStep] = useState<Step>('form')
   const [goal, setGoal] = useState('')
-  const [draftId, setDraftId] = useState<string | null>(null)
-  // Set when the poll fallback observes `gone` (draft TTL expired in redis
-  // before a result arrived) while sitting on the `pending` step — otherwise
-  // that step just... sits there forever with no way out but closing the
-  // whole wizard. Rendered as an inline error with a Back button; cleared on
-  // the next startDraft() attempt.
-  const [draftError, setDraftError] = useState<string | null>(null)
 
   // Seeded from the draft's proposal once it lands; editable from there.
+  // Nothing sets these anymore now that startDraft() is stubbed below — see
+  // this file's top-of-file note — but the review step (Task 6 rewires its
+  // entry point) still reads/edits them, so they stay.
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [stateSchema, setStateSchema] = useState<TaskStateSchema | null>(null)
-  const [keywordProbes, setKeywordProbes] = useState<string[]>([])
+  // No setter destructured — nothing seeds this anymore now that applyDraft
+  // is gone (see top-of-file note); submit() below still reads it.
+  const [keywordProbes] = useState<string[]>([])
   const [examples, setExamples] = useState<ExampleState[]>([])
 
   const [submitting, setSubmitting] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [taskId, setTaskId] = useState<string | null>(null)
 
-  // startDraft's POST /api/tasks/draft failure (network/5xx/etc) — rendered
-  // inline on the form step, same error-banner style as createError on the
-  // review step, so a failed "start" doesn't just silently do nothing.
+  // Rendered inline on the form step. Was startDraft's POST /api/tasks/draft
+  // failure banner; now just carries the stubbed "unavailable" message (see
+  // startDraft below) since that request no longer exists to fail.
   const [startError, setStartError] = useState<string | null>(null)
-
-  // Idempotent apply: a result for a given draft_id can arrive via SSE OR via
-  // the polling fallback (or both, in either order). appliedRef ensures we
-  // only push the proposal + examples and flip step once per draft_id.
-  const appliedRef = useRef<Set<string>>(new Set())
-
-  // Guards the fast-path's async getTaskDraft() fetch (kicked off from inside
-  // an SSE handler, which has no cancellation closure of its own the way the
-  // poll effect below does) from applying state after unmount.
-  const unmountedRef = useRef(false)
-  useEffect(() => () => { unmountedRef.current = true }, [])
 
   // Guards the done-navigate effect below so it fires at most once — without
   // this, a stray backfill progress update after the first navigate (e.g. a
   // late SSE frame re-rendering `backfill`) would re-run navigate()/onClose().
   const navigatedRef = useRef(false)
-
-  function applyDraft(forDraftId: string, proposal: TaskDraftProposal,
-                       positives: PreviewExample[], nearMisses: PreviewExample[]) {
-    if (appliedRef.current.has(forDraftId)) return
-    appliedRef.current.add(forDraftId)
-    setName(proposal.name)
-    setDescription(proposal.description)
-    // Bucket mode never seeds/edits/sends a schema — the draft proposal's
-    // state_schema (the endpoint is shared across both kinds) is discarded
-    // rather than applied, so `stateSchema` stays null for the review-step
-    // gating and submit() below.
-    setStateSchema(kind === 'bucket' ? null : proposal.state_schema)
-    // keyword_probes are kept for both kinds — bucket backfill uses them for
-    // its FTS prefilter same as tracker backfill does.
-    setKeywordProbes(proposal.keyword_probes)
-    setExamples([
-      ...positives.map(ex => ({ ...ex, initial: 'positive' as const, choice: 'positive' as const })),
-      ...nearMisses.map(ex => ({ ...ex, initial: 'near_miss' as const, choice: 'near_miss' as const })),
-    ])
-    setStep('review')
-  }
-
-  // Fast path: SSE push when the worker publishes. Unlike bucket_draft_preview,
-  // task_draft_ready carries only the draft_id, so this still needs a fetch
-  // before there's anything to apply.
-  useEffect(() => {
-    return subscribeSse((e) => {
-      if (e.event !== 'task_draft_ready' || e.draft_id !== draftId) return
-      if (appliedRef.current.has(e.draft_id)) return
-      const forId = e.draft_id
-      getTaskDraft(forId)
-        .then(r => {
-          if (unmountedRef.current || appliedRef.current.has(forId)) return
-          if (r.status === 'ready') applyDraft(forId, r.proposal, r.positives, r.near_misses)
-          // pending/gone here: leave it to the poll fallback below.
-        })
-        .catch(err => console.error('[task draft] fast-path fetch failed', err))
-    })
-  }, [draftId])
-
-  // Safety net: poll the cache every 5s while pending. A `cancelled` flag
-  // closed over per-effect-run plus clearTimeout on cleanup, checked at both
-  // async boundaries. Stops on success, on draftId change, on step change, or
-  // on unmount.
-  useEffect(() => {
-    if (step !== 'pending' || !draftId) return
-    const localId = draftId
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-
-    async function tick() {
-      if (cancelled || appliedRef.current.has(localId)) return
-      try {
-        const r = await getTaskDraft(localId)
-        if (cancelled) return
-        if (r.status === 'ready') {
-          applyDraft(localId, r.proposal, r.positives, r.near_misses)
-          return
-        }
-        if (r.status === 'gone') {
-          // The redis draft-preview cache TTL'd out before a result arrived.
-          // Previously this just console.warn'd and left the user stranded
-          // on the "pending" step forever with no way out but closing the
-          // whole wizard. Surface it inline instead — stay on `pending` (so
-          // the Back button below has somewhere to render) and let the user
-          // retry from the form step with their goal text intact.
-          console.warn('[task draft] cache expired before result arrived')
-          setDraftError('The draft expired — go back and try again')
-          return  // give up polling; user drives the retry via Back
-        }
-      } catch (e) {
-        console.error('[task draft] poll failed', e)
-      }
-      timer = setTimeout(tick, 5000)
-    }
-
-    // Start at 5s — let SSE win on the happy path, and only burn HTTP
-    // requests if SSE doesn't deliver.
-    timer = setTimeout(tick, 5000)
-
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [draftId, step])
 
   // Once the task is created, watch its backfill progress for completion and
   // hand off — to the task's own page in tracker mode, or back to the caller
@@ -209,28 +112,10 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
     }
   }, [step, taskId, progress?.done, navigate, onClose, kind, onCreated])
 
-  async function startDraft() {
-    setStartError(null)
-    try {
-      const { draft_id } = await postTaskDraft(goal)
-      setDraftId(draft_id)
-      setStep('pending')
-    } catch (e) {
-      // Previously an unhandled rejection here left the user on the form
-      // step with no feedback at all (button just... didn't do anything).
-      // Render the failure inline instead, same as the review step's
-      // createError banner, and stay on `form` so goal text is preserved.
-      setStartError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  // Return to the form step after a draft expiry (see the poll effect's
-  // `gone` handling above) — clears the stale draft/pending state but keeps
-  // `goal` untouched so the user doesn't have to retype it.
-  function backToForm() {
-    setDraftError(null)
-    setDraftId(null)
-    setStep('form')
+  // Stubbed — see this file's top-of-file note. Never advances past 'form';
+  // Task 6 rewires this onto startCreation()/the jobs flow.
+  function startDraft() {
+    setStartError('Task creation is moving to the jobs panel — coming in the next update.')
   }
 
   function setChoice(threadId: string, choice: Choice) {
@@ -240,7 +125,7 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
   async function submit() {
     if (submitting) return
     // Tracker mode requires a schema (SchemaEditor keeps it non-null past the
-    // review step); bucket mode never has one — see applyDraft.
+    // review step); bucket mode never has one.
     if (kind === 'tracker' && !stateSchema) return
     setSubmitting(true)
     setCreateError(null)
@@ -285,32 +170,25 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
               />
             </label>
             <div style={{ display: 'flex', gap: 8 }}>
-              <button disabled={!goal.trim()} onClick={() => void startDraft()}>start</button>
+              <button disabled={!goal.trim()} onClick={startDraft}>start</button>
               <button onClick={onClose}>cancel</button>
             </div>
           </div>
         )}
 
+        {/* Unreachable now that startDraft() (above) never leaves 'form' —
+            kept only because Task 6 restructures this step onto the jobs
+            flow rather than deleting it outright. */}
         {step === 'pending' && (
-          <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {draftError ? (
-              <>
-                <div style={errorBannerStyle}>{draftError}</div>
-                <div style={{ display: 'flex', gap: 8 }}>
-                  <button onClick={backToForm}>back</button>
-                  <button onClick={onClose}>cancel</button>
-                </div>
-              </>
-            ) : (
-              'Reading your goal and scanning your inbox…'
-            )}
-          </div>
+          <div style={{ marginTop: 16 }}>Reading your goal and scanning your inbox…</div>
         )}
 
-        {/* Tracker mode's gate is unchanged: stateSchema is only non-null once
-            applyDraft has run, so this also holds the step on 'review' until
-            a draft has actually landed. Bucket mode never sets stateSchema
-            (see applyDraft), so it gates on the step alone. */}
+        {/* Tracker mode's gate: stateSchema is only non-null once something
+            seeds it (Task 6's job-review wiring), so this also holds the
+            step on 'review' until that's happened. Bucket mode never sets
+            stateSchema, so it gates on the step alone. Unreachable for now
+            like the 'pending' step above — nothing currently sets step to
+            'review' either. */}
         {step === 'review' && (kind === 'bucket' || stateSchema) && (
           <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 20 }}>
             {createError && <div style={errorBannerStyle}>{createError}</div>}
@@ -327,7 +205,7 @@ export function NewTaskWizard({ onClose, kind = 'tracker', onCreated }: {
             </label>
 
             {/* Bucket mode skips the EPS schema step entirely — a bucket has
-                no pipeline/entity state, only criteria (see applyDraft). */}
+                no pipeline/entity state, only criteria. */}
             {kind === 'tracker' && stateSchema && <SchemaEditor value={stateSchema} onChange={setStateSchema} />}
 
             <div>
@@ -432,8 +310,8 @@ const textareaStyle: CSSProperties = {
 }
 
 // Inline error banner — was inline-only on the review step (createError);
-// pulled into a shared constant so the form step (startError) and the
-// pending step (draftError) render it identically rather than drifting.
+// pulled into a shared constant so the form step's startError renders
+// identically rather than drifting.
 const errorBannerStyle: CSSProperties = {
   color: '#8a1c25', fontSize: 13, background: '#fdf0f1', padding: 8, borderRadius: 4,
 }
