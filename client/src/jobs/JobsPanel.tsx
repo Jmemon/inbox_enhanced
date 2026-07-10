@@ -36,7 +36,7 @@ export function JobsPanel({ onClose, onReview }: { onClose: () => void; onReview
             key={job.id}
             job={job}
             onReview={onReview}
-            onDismiss={() => void dismissJob(job.id)}
+            onDismiss={() => dismissJob(job.id).catch(e => console.error('[JobsPanel] dismiss failed', e))}
           />
         ))}
       </div>

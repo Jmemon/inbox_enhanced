@@ -483,5 +483,7 @@ export async function dismissJob(id: string): Promise<void> {
   const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/dismiss`, {
     method: 'POST', credentials: 'same-origin',
   })
-  if (r.status !== 204) throw new Error(`dismiss job: ${r.status}`)
+  if (r.status !== 204) {
+    await throwWithDetail(r, `dismiss job: ${r.status}`)
+  }
 }

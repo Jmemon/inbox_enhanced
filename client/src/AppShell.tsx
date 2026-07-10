@@ -1,10 +1,12 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from './auth/useAuth'
 import { InboxProvider } from './state/InboxProvider'
 import { TasksProvider } from './state/TasksProvider'
 import { JobsProvider } from './state/JobsProvider'
 import { JobsChip } from './jobs/JobsChip'
+import { NewTaskWizard } from './pages/task/NewTaskWizard'
+import type { Job } from './lib/api'
 import { subscribeSse } from './lib/sse'
 
 // Auth-death escape (see lib/sse.ts backoff): an expired session cookie
@@ -35,6 +37,15 @@ export function AppShell() {
 
   const consecutiveErrorsRef = useRef(0)
   const lastRecheckAtRef = useRef(0)
+
+  // Owned here (not JobsChip/JobsPanel) because it drives a wizard mount
+  // that's a sibling of the header, not a child of the panel — set by
+  // JobsPanel's [Review] action (threaded down through JobsChip's onReview),
+  // cleared on the wizard's onClose. Only ever one job under review at a
+  // time; JobsChip closes its own panel the moment this is set (see
+  // jobs/JobsChip.tsx), so there's no path that swaps this from one job
+  // straight to another without an unmount in between.
+  const [reviewJob, setReviewJob] = useState<Job | null>(null)
 
   useEffect(() => subscribeSse((e) => {
     if (e.event === '_open') {
@@ -76,7 +87,7 @@ export function AppShell() {
                   <NavLink to="/" end style={navStyle}>HUD</NavLink>
                   <NavLink to="/inbox" style={navStyle}>Inbox</NavLink>
                 </nav>
-                <JobsChip />
+                <JobsChip onReview={setReviewJob} />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                 <span style={{ fontSize: 14, color: '#444' }}>{state.user.name ?? state.user.email}</span>
@@ -84,6 +95,18 @@ export function AppShell() {
               </div>
             </header>
             <Outlet />
+            {/* Review-mode wizard (design.md §2.3/§2.4): mounted here, inside
+                JobsProvider, so it can call useJobsStore() for confirmJob.
+                reviewJob.task_kind is the domain source of truth for the
+                wizard's `kind` prop — trusting it over a caller-supplied kind
+                avoids a second place this could drift out of sync. */}
+            {reviewJob && (
+              <NewTaskWizard
+                reviewJob={reviewJob}
+                kind={reviewJob.task_kind ?? 'tracker'}
+                onClose={() => setReviewJob(null)}
+              />
+            )}
           </JobsProvider>
         </TasksProvider>
       </InboxProvider>

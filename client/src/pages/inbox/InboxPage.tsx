@@ -57,14 +57,16 @@ export default function InboxPage() {
 
       {showView && <ViewBucketsModal buckets={buckets.buckets} onClose={() => setShowView(false)}
                                        onRename={buckets.rename} onDelete={buckets.softDelete} />}
-      {/* Bucket creation goes through the task wizard (Phase 4 Task 5) — no
-          more watchdog resync here: bucket backfill (workers/task_engine_tasks.py's
-          kind='bucket' branch) publishes threads_updated deterministically on
-          completion, unlike the old fire-and-forget reclassify_user_inbox this
-          replaced. */}
-      {showNew && (
-        <NewTaskWizard kind="bucket" onCreated={() => buckets.refresh()} onClose={() => setShowNew(false)} />
-      )}
+      {/* Bucket creation goes through the jobs surface now (Phase 4.5 Task 6)
+          — this is start-mode only (goal form -> startCreation -> close);
+          the wizard never waits on backfill here. Reviewing the resulting
+          draft_ready job and refreshing this page's bucket list once it's
+          live are both handled elsewhere: JobsPanel's [Review] action (see
+          AppShell.tsx) opens a separate review-mode wizard instance, and
+          JobsProvider itself calls buckets.refresh() on a bucket-creation
+          job's done transition (state/JobsProvider.tsx) — this component no
+          longer needs an onCreated hook to bridge that gap. */}
+      {showNew && <NewTaskWizard kind="bucket" onClose={() => setShowNew(false)} />}
     </>
   )
 }
