@@ -188,6 +188,39 @@ def label_thread(db: Session, user: User, gmail_thread_id: str, label_name: str)
     return {"added_label_ids": [label_id], "label_id": label_id, "label_name": label_name}
 
 
+def modify_thread_labels(
+    db: Session, user: User, gmail_thread_id: str, *, add: list[str] | None = None, remove: list[str] | None = None,
+) -> dict:
+    """Generic label add/remove -- the inverse capability undo (Phase 5 Task
+    4) replays against: re-adding exactly the label ids a prior
+    archive_thread removed (`result["removed_label_ids"]`), or removing
+    exactly the label ids a prior label_thread added
+    (`result["added_label_ids"]`). Deliberately generic (one method, not
+    separate "unarchive"/"unlabel" ones) since both undos are the same Gmail
+    call shape with the add/remove sets swapped; archive_thread/label_thread
+    themselves are untouched, this is additive.
+
+    Preflights WRITE_SCOPE_MODIFY; raises MissingScopesError if absent.
+    Returns {"added_label_ids": [...], "removed_label_ids": [...]} (empty
+    lists for whichever side wasn't requested).
+    """
+    missing = _require_scopes_missing(user, WRITE_SCOPE_MODIFY)
+    if missing:
+        raise MissingScopesError(missing)
+
+    add = list(add or [])
+    remove = list(remove or [])
+    body: dict = {}
+    if add:
+        body["addLabelIds"] = add
+    if remove:
+        body["removeLabelIds"] = remove
+
+    gmail = get_gmail_client(db, user)
+    gmail.users().threads().modify(userId="me", id=gmail_thread_id, body=body).execute()
+    return {"added_label_ids": add, "removed_label_ids": remove}
+
+
 def create_draft(db: Session, user: User, gmail_thread_id: str, body_text: str) -> dict:
     """Creates a Gmail **draft** reply on a thread -- never sends anything
     (no gmail.send scope or code path exists anywhere in this app).

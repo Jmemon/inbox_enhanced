@@ -1972,3 +1972,239 @@ def test_revert_event_auto_rejects_proposed_event_sourced_action(authed):
     db2 = TS()
     settled = actions_repo.get_owned_action(db2, user_id="u1", action_id=action_id)
     assert settled.status == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (actions, spec 006 Task 4): typed reviews/activity feeds -- every
+# item gains "type": "event"|"action", and pending/settled TaskActions merge
+# in alongside the pre-existing TaskEvent items. The rules CRUD/action
+# lifecycle routes themselves live in test_actions_api.py; this section only
+# covers how api/tasks.py's two feed routes merge actions in.
+# ---------------------------------------------------------------------------
+
+
+def _seed_task_link(TS, task_id, *, uid="u1", thread_id) -> str:
+    """A real, attached TaskThreadLink row (not just a fake string id) --
+    needed so a link-sourced TaskAction's source_link_id has a genuine row
+    behind it, mirroring the existing rule-firing tests' own setup (e.g.
+    test_detach_thread_auto_rejects_proposed_link_sourced_action above)."""
+    db = TS()
+    task_repo.upsert_link(db, task_id=task_id, thread_id=thread_id, user_id=uid, origin="llm", state="attached")
+    db.commit()
+    link = task_repo.get_link(db, task_id=task_id, thread_id=thread_id)
+    link_id = link.id
+    db.close()
+    return link_id
+
+
+def _seed_task_action(
+    TS, task_id, *, rule_id, action_type="archive_thread", action_params=None,
+    source_event_id=None, source_link_id=None, thread_id=None, gmail_thread_id="g-thread",
+    status=None, result=None, created_at=None,
+) -> str:
+    from app.actions.rules import ActionIntent
+
+    db = TS()
+    intent = ActionIntent(
+        rule_id=rule_id, action_type=action_type, action_params=action_params,
+        source_event_id=source_event_id, source_link_id=source_link_id,
+        thread_id=thread_id, gmail_thread_id=gmail_thread_id,
+    )
+    action = actions_repo.insert_intent(db, task_id=task_id, intent=intent)
+    if status is not None:
+        actions_repo.set_status(db, action=action, status=status, result=result)
+    if created_at is not None:
+        action.created_at = created_at
+    db.commit()
+    action_id = action.id
+    db.close()
+    return action_id
+
+
+def test_reviews_event_items_carry_type_event(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id)
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i["id"] == ev_id)
+    assert item["type"] == "event"
+
+
+def test_activity_event_items_carry_type_event(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id, status="applied")
+
+    r = c.get("/api/activity")
+    item = next(i for i in r.json()["activity"] if i["id"] == ev_id)
+    assert item["type"] == "event"
+
+
+def test_reviews_includes_proposed_action_with_full_shape(authed):
+    c, TS = authed
+    task_id = _mk_task(TS, name="Shape Task")
+    rule_id = _seed_link_rule(TS, task_id)
+    thread_id = _seed_thread(TS, gmail_thread_id="gShape", subject="Ping about invoice")
+    link_id = _seed_task_link(TS, task_id, thread_id=thread_id)
+    action_id = _seed_task_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id,
+        thread_id=thread_id, gmail_thread_id="gShape",
+    )
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i.get("action_id") == action_id)
+    assert item["type"] == "action"
+    assert item["task_id"] == task_id
+    assert item["task_name"] == "Shape Task"
+    assert item["action_type"] == "archive_thread"
+    assert item["status"] == "proposed"
+    assert item["rule_summary"] == "when a thread is linked"
+    assert item["thread_subject"] == "Ping about invoice"
+    for key in ("action_id", "task_id", "task_name", "action_type", "action_params",
+               "status", "rule_summary", "thread_subject", "created_at"):
+        assert key in item
+
+
+def test_reviews_excludes_settled_actions(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_stage_rule(TS, task_id, stage="won")
+    ev_id, _ = _seed_event(TS, task_id, status="applied", new_value="won")
+    action_id = _seed_task_action(
+        TS, task_id, rule_id=rule_id, source_event_id=ev_id,
+        status="executed", result={"removed_label_ids": ["INBOX"]},
+    )
+
+    r = c.get("/api/reviews")
+    action_ids = [i.get("action_id") for i in r.json()["reviews"]]
+    assert action_id not in action_ids
+
+
+def test_activity_includes_settled_action_with_entity_entered_stage_summary(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_stage_rule(TS, task_id, stage="won")
+    ev_id, _ = _seed_event(TS, task_id, status="applied", new_value="won")
+    action_id = _seed_task_action(
+        TS, task_id, rule_id=rule_id, source_event_id=ev_id,
+        status="executed", result={"removed_label_ids": ["INBOX"]},
+    )
+
+    r = c.get("/api/activity")
+    item = next(i for i in r.json()["activity"] if i.get("action_id") == action_id)
+    assert item["type"] == "action"
+    assert item["status"] == "executed"
+    assert item["rule_summary"] == "when entity enters 'won'"
+
+
+def test_activity_excludes_proposed_actions(authed):
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_link_rule(TS, task_id)
+    thread_id = _seed_thread(TS, gmail_thread_id="gActNoProp")
+    link_id = _seed_task_link(TS, task_id, thread_id=thread_id)
+    action_id = _seed_task_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id,
+        thread_id=thread_id, gmail_thread_id="gActNoProp",
+    )  # left 'proposed'
+
+    r = c.get("/api/activity")
+    action_ids = [i.get("action_id") for i in r.json()["activity"]]
+    assert action_id not in action_ids
+
+
+def test_reviews_merges_events_and_actions_newest_first(authed):
+    c, TS = authed
+    t0 = datetime.now(timezone.utc)
+    task_id = _mk_task(TS)
+    ev_id, _ = _seed_event(TS, task_id, created_at=t0)
+    rule_id = _seed_link_rule(TS, task_id)
+    thread_id = _seed_thread(TS, gmail_thread_id="gMergeA")
+    link_id = _seed_task_link(TS, task_id, thread_id=thread_id)
+    action_id = _seed_task_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id,
+        thread_id=thread_id, gmail_thread_id="gMergeA",
+        created_at=t0 + timedelta(seconds=1),
+    )
+
+    r = c.get("/api/reviews")
+    items = r.json()["reviews"]
+    keys = [(i["type"], i.get("id") or i.get("action_id")) for i in items]
+    assert keys == [("action", action_id), ("event", ev_id)]  # newest (action) first
+
+
+def test_reviews_excludes_other_users_actions(authed):
+    c, TS = authed
+    mine = _mk_task(TS, uid="u1")
+    theirs = _mk_task(TS, uid="u2")
+    my_rule = _seed_link_rule(TS, mine)
+    their_rule = _seed_link_rule(TS, theirs)
+    my_thread = _seed_thread(TS, uid="u1", gmail_thread_id="gMineA")
+    their_thread = _seed_thread(TS, uid="u2", gmail_thread_id="gTheirsA")
+    my_link = _seed_task_link(TS, mine, uid="u1", thread_id=my_thread)
+    their_link = _seed_task_link(TS, theirs, uid="u2", thread_id=their_thread)
+    my_action = _seed_task_action(
+        TS, mine, rule_id=my_rule, source_link_id=my_link,
+        thread_id=my_thread, gmail_thread_id="gMineA",
+    )
+    their_action = _seed_task_action(
+        TS, theirs, rule_id=their_rule, source_link_id=their_link,
+        thread_id=their_thread, gmail_thread_id="gTheirsA",
+    )
+
+    r = c.get("/api/reviews")
+    action_ids = [i.get("action_id") for i in r.json()["reviews"] if i["type"] == "action"]
+    assert my_action in action_ids
+    assert their_action not in action_ids
+
+
+def test_activity_excludes_other_users_actions(authed):
+    c, TS = authed
+    mine = _mk_task(TS, uid="u1")
+    theirs = _mk_task(TS, uid="u2")
+    my_rule = _seed_stage_rule(TS, mine, stage="won")
+    their_rule = _seed_stage_rule(TS, theirs, stage="won")
+    my_ev, _ = _seed_event(TS, mine, uid="u1", status="applied", new_value="won")
+    their_ev, _ = _seed_event(TS, theirs, uid="u2", status="applied", new_value="won")
+    my_action = _seed_task_action(
+        TS, mine, rule_id=my_rule, source_event_id=my_ev,
+        status="executed", result={"removed_label_ids": ["INBOX"]},
+    )
+    their_action = _seed_task_action(
+        TS, theirs, rule_id=their_rule, source_event_id=their_ev,
+        status="executed", result={"removed_label_ids": ["INBOX"]},
+    )
+
+    r = c.get("/api/activity")
+    action_ids = [i.get("action_id") for i in r.json()["activity"] if i["type"] == "action"]
+    assert my_action in action_ids
+    assert their_action not in action_ids
+
+
+def test_action_item_rule_summary_falls_back_when_rule_row_gone(authed):
+    """Defensive fallback: a TaskAction outlives its rule if the rule row is
+    ever hard-deleted out from under it (soft-delete alone still resolves
+    normally -- get_rules_by_ids deliberately includes soft-deleted rows, see
+    its docstring; this simulates the row being truly gone)."""
+    from app.db.models import TaskActionRule
+    from sqlalchemy import delete as sa_delete
+
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_link_rule(TS, task_id)
+    thread_id = _seed_thread(TS, gmail_thread_id="gFeedGone")
+    link_id = _seed_task_link(TS, task_id, thread_id=thread_id)
+    action_id = _seed_task_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id,
+        thread_id=thread_id, gmail_thread_id="gFeedGone",
+    )
+
+    db = TS()
+    db.execute(sa_delete(TaskActionRule).where(TaskActionRule.id == rule_id))
+    db.commit()
+    db.close()
+
+    r = c.get("/api/reviews")
+    item = next(i for i in r.json()["reviews"] if i.get("action_id") == action_id)
+    assert item["rule_summary"] == "rule deleted"
