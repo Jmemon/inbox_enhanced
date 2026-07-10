@@ -28,6 +28,11 @@ class MissingScopesError(Exception):
     the error ("needs permission: ...").
     """
 
+    def __init__(self, missing: list[str]):
+        self.missing = list(missing)
+        message = f"needs permission: missing {', '.join(missing)}"
+        super().__init__(message)
+
 
 def ensure_fresh_access_token(db: Session, user: User) -> str:
     """Returns a usable access token, refreshing and persisting if needed."""
@@ -114,6 +119,15 @@ def require_scopes(user: User, *needed: str) -> str | None:
     return f"needs permission: missing {', '.join(missing)}"
 
 
+def _require_scopes_missing(user: User, *needed: str) -> list[str] | None:
+    """Internal helper: returns the structured list of missing scopes for
+    MissingScopesError construction, or None if all scopes are granted.
+    """
+    granted = set(user.gmail_granted_scopes or [])
+    missing = [scope for scope in needed if scope not in granted]
+    return missing if missing else None
+
+
 def _header(message: dict, name: str) -> str | None:
     headers = message.get("payload", {}).get("headers", [])
     return next((h["value"] for h in headers if h["name"].lower() == name.lower()), None)
@@ -126,9 +140,9 @@ def archive_thread(db: Session, user: User, gmail_thread_id: str) -> dict:
     Returns {"removed_label_ids": [...]} -- exactly what task_actions.result
     needs to construct the inverse for undo.
     """
-    error = require_scopes(user, WRITE_SCOPE_MODIFY)
-    if error:
-        raise MissingScopesError(error)
+    missing = _require_scopes_missing(user, WRITE_SCOPE_MODIFY)
+    if missing:
+        raise MissingScopesError(missing)
 
     gmail = get_gmail_client(db, user)
     gmail.users().threads().modify(
@@ -146,16 +160,25 @@ def label_thread(db: Session, user: User, gmail_thread_id: str, label_name: str)
     enough for task_actions.result to drive undo (remove the same id) without
     a second name lookup.
     """
-    error = require_scopes(user, WRITE_SCOPE_MODIFY)
-    if error:
-        raise MissingScopesError(error)
+    missing = _require_scopes_missing(user, WRITE_SCOPE_MODIFY)
+    if missing:
+        raise MissingScopesError(missing)
 
     gmail = get_gmail_client(db, user)
     existing = gmail.users().labels().list(userId="me").execute().get("labels", [])
-    match = next((lbl for lbl in existing if lbl["name"].lower() == label_name.lower()), None)
+    # Only match against user labels, never system labels (SPAM, TRASH, UNREAD,
+    # STARRED, IMPORTANT, etc.). A rule param must never be able to silently
+    # alias SPAM or move threads to trash.
+    match = next(
+        (lbl for lbl in existing if lbl["type"] == "user" and lbl["name"].lower() == label_name.lower()),
+        None,
+    )
     if match is not None:
         label_id = match["id"]
     else:
+        # No matching user label; create a new one. Gmail forbids creating
+        # names colliding with system display names; if the create call fails,
+        # let the error propagate to the caller's failure handling.
         created = gmail.users().labels().create(userId="me", body={"name": label_name}).execute()
         label_id = created["id"]
 
@@ -177,9 +200,9 @@ def create_draft(db: Session, user: User, gmail_thread_id: str, body_text: str) 
     Preflights WRITE_SCOPE_COMPOSE; raises MissingScopesError if absent.
     Returns {"draft_id": ...}.
     """
-    error = require_scopes(user, WRITE_SCOPE_COMPOSE)
-    if error:
-        raise MissingScopesError(error)
+    missing = _require_scopes_missing(user, WRITE_SCOPE_COMPOSE)
+    if missing:
+        raise MissingScopesError(missing)
 
     gmail = get_gmail_client(db, user)
     thread = gmail.users().threads().get(

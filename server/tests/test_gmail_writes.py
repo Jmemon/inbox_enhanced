@@ -89,9 +89,11 @@ def test_archive_thread_missing_scope_raises_without_touching_api(db):
     gmail = MagicMock()
 
     with patch("app.gmail.client.get_gmail_client", return_value=gmail) as get_client:
-        with pytest.raises(MissingScopesError):
+        with pytest.raises(MissingScopesError) as exc_info:
             archive_thread(db, user, "gmail-thread-1")
 
+    # MissingScopesError must carry the structured list
+    assert exc_info.value.missing == [WRITE_SCOPE_MODIFY]
     get_client.assert_not_called()
     gmail.users().threads().modify.assert_not_called()
 
@@ -103,7 +105,9 @@ def test_archive_thread_missing_scope_raises_without_touching_api(db):
 def test_label_thread_creates_new_label_when_not_found(db):
     user = _user(db, granted_scopes=_both_scopes())
     gmail = MagicMock()
-    gmail.users().labels().list().execute.return_value = {"labels": [{"id": "Label_1", "name": "Other"}]}
+    gmail.users().labels().list().execute.return_value = {
+        "labels": [{"id": "Label_1", "name": "Other", "type": "user"}]
+    }
     gmail.users().labels().create().execute.return_value = {"id": "Label_new"}
     gmail.users().threads().modify().execute.return_value = {}
 
@@ -121,7 +125,7 @@ def test_label_thread_reuses_existing_label_case_insensitive(db):
     user = _user(db, granted_scopes=_both_scopes())
     gmail = MagicMock()
     gmail.users().labels().list().execute.return_value = {
-        "labels": [{"id": "Label_1", "name": "important"}]
+        "labels": [{"id": "Label_1", "name": "important", "type": "user"}]
     }
     gmail.users().threads().modify().execute.return_value = {}
 
@@ -135,14 +139,42 @@ def test_label_thread_reuses_existing_label_case_insensitive(db):
     )
 
 
+def test_label_thread_ignores_system_labels_and_creates_new(db):
+    """System label matching (e.g., "Spam") should never be used; create a new
+    user label instead. This prevents a rule param from silently aliasing SPAM.
+    """
+    user = _user(db, granted_scopes=_both_scopes())
+    gmail = MagicMock()
+    gmail.users().labels().list().execute.return_value = {
+        "labels": [
+            {"id": "SPAM", "name": "Spam", "type": "system"},
+            {"id": "Label_1", "name": "Other", "type": "user"},
+        ]
+    }
+    gmail.users().labels().create().execute.return_value = {"id": "Label_new"}
+    gmail.users().threads().modify().execute.return_value = {}
+
+    with patch("app.gmail.client.get_gmail_client", return_value=gmail):
+        result = label_thread(db, user, "gmail-thread-1", "Spam")
+
+    # Must create a new user label, not use SPAM system label
+    assert result == {"added_label_ids": ["Label_new"], "label_id": "Label_new", "label_name": "Spam"}
+    gmail.users().labels().create.assert_called_with(userId="me", body={"name": "Spam"})
+    gmail.users().threads().modify.assert_called_with(
+        userId="me", id="gmail-thread-1", body={"addLabelIds": ["Label_new"]}
+    )
+
+
 def test_label_thread_missing_scope_raises_without_touching_api(db):
     user = _user(db, granted_scopes=[WRITE_SCOPE_COMPOSE])  # modify missing
     gmail = MagicMock()
 
     with patch("app.gmail.client.get_gmail_client", return_value=gmail) as get_client:
-        with pytest.raises(MissingScopesError):
+        with pytest.raises(MissingScopesError) as exc_info:
             label_thread(db, user, "gmail-thread-1", "Important")
 
+    # MissingScopesError must carry the structured list
+    assert exc_info.value.missing == [WRITE_SCOPE_MODIFY]
     get_client.assert_not_called()
     gmail.users().labels().list.assert_not_called()
 
@@ -215,9 +247,11 @@ def test_create_draft_missing_scope_raises_without_touching_api(db):
     gmail = MagicMock()
 
     with patch("app.gmail.client.get_gmail_client", return_value=gmail) as get_client:
-        with pytest.raises(MissingScopesError):
+        with pytest.raises(MissingScopesError) as exc_info:
             create_draft(db, user, "gmail-thread-1", "body")
 
+    # MissingScopesError must carry the structured list
+    assert exc_info.value.missing == [WRITE_SCOPE_COMPOSE]
     get_client.assert_not_called()
     gmail.users().threads().get.assert_not_called()
 
