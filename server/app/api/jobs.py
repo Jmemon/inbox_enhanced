@@ -151,7 +151,8 @@ def confirm_job(job_id: str, body: _ConfirmJobBody, user: User = Depends(get_cur
     (parity with direct creation) and `job_updated`.
     """
     job = _require_owned_job(db, user_id=user.id, job_id=job_id)
-    if job.stage != "draft_ready":
+    # Spec invariant: a dismissed draft_ready job simply never confirms
+    if job.dismissed_at is not None or job.stage != "draft_ready":
         raise HTTPException(409, "job is not awaiting review")
 
     task = _create_task_from_fields(

@@ -227,6 +227,31 @@ def test_confirm_409_when_already_backfilling(authed):
     assert r.status_code == 409
 
 
+def test_confirm_409_dismissed_draft_ready_job(authed, monkeypatch):
+    """A dismissed draft_ready job must never confirm (spec invariant: dismissed
+    draft_ready jobs simply never confirm). Prevents invisible revival of discarded
+    jobs across tab boundaries."""
+    c, TS = authed
+    _capture_publish(monkeypatch)  # Capture publish events
+
+    job_id = _mk_job(TS, uid="u1", stage="draft_ready", task_kind="tracker")
+
+    # Dismiss it
+    db = TS()
+    job = jobs_repo.get_owned_job(db, user_id="u1", job_id=job_id)
+    jobs_repo.dismiss(db, job=job)
+    db.commit()
+    db.close()
+
+    # Confirm should reject the dismissed job
+    with patch("app.api.jobs.task_engine_tasks.backfill_task.apply_async"):
+        r = c.post(f"/api/jobs/{job_id}/confirm", json={
+            "name": "X", "description": "d", "state_schema": SINGLETON_SCHEMA,
+        })
+    assert r.status_code == 409
+    assert r.json()["detail"] == "job is not awaiting review"
+
+
 def test_confirm_tracker_missing_schema_422(authed):
     c, TS = authed
     job_id = _mk_job(TS, uid="u1", stage="draft_ready", task_kind="tracker")
