@@ -201,6 +201,14 @@ function PipelineChipList({ label, items, onChange }: {
   const [dragIndex, setDragIndex] = useState<number | null>(null)
   const [overIndex, setOverIndex] = useState<number | null>(null)
 
+  // Refs to track move button elements (left/right pair per chip) and pending
+  // focus after reordering. Flat array: moveBtnRefs[2*i] = left (◀),
+  // moveBtnRefs[2*i+1] = right (▶). When user presses ◀/▶, pendingFocusRef
+  // tracks the new index and direction; useEffect then focuses the target
+  // button as the array updates, so focus follows the moved stage.
+  const moveBtnRefs = useRef<(HTMLButtonElement | null)[]>([])
+  const pendingFocusRef = useRef<{index: number, dir: 'left'|'right'} | null>(null)
+
   function update(i: number, v: string) {
     onChange(items.map((s, idx) => (idx === i ? v : s)))
   }
@@ -222,6 +230,25 @@ function PipelineChipList({ label, items, onChange }: {
     setOverIndex(null)
   }
 
+  // After items array changes (drag-drop or button move), if a move just
+  // happened, focus follows the moved stage. If the target button is disabled
+  // (stage reached end), focus the opposite button so focus never drops to body.
+  useEffect(() => {
+    if (!pendingFocusRef.current) return
+
+    const {index, dir} = pendingFocusRef.current
+    const targetBtnIdx = 2 * index + (dir === 'left' ? 0 : 1)
+    let targetBtn = moveBtnRefs.current[targetBtnIdx]
+
+    if (targetBtn?.disabled) {
+      const oppositeBtnIdx = 2 * index + (dir === 'left' ? 1 : 0)
+      targetBtn = moveBtnRefs.current[oppositeBtnIdx]
+    }
+
+    if (targetBtn) targetBtn.focus()
+    pendingFocusRef.current = null
+  }, [items])
+
   return (
     <div>
       <div style={{ fontSize: 12, color: '#666', marginBottom: 6 }}>{label}</div>
@@ -231,7 +258,11 @@ function PipelineChipList({ label, items, onChange }: {
             {i > 0 && <span aria-hidden="true" style={arrowStyle}>→</span>}
             <div
               draggable
-              onDragStart={() => setDragIndex(i)}
+              onDragStart={e => {
+                e.dataTransfer.setData('text/plain', String(i))
+                e.dataTransfer.effectAllowed = 'move'
+                setDragIndex(i)
+              }}
               onDragOver={e => { e.preventDefault(); setOverIndex(i) }}
               onDrop={e => {
                 e.preventDefault()
@@ -241,13 +272,18 @@ function PipelineChipList({ label, items, onChange }: {
               onDragEnd={endDrag}
               style={{
                 ...chipStyle,
+                cursor: 'grab',
                 opacity: dragIndex === i ? 0.4 : 1,
                 boxShadow: overIndex === i && dragIndex !== null && dragIndex !== i ? 'inset 0 0 0 2px #6b7cff' : 'none',
               }}
             >
               <button
+                ref={el => { moveBtnRefs.current[2 * i] = el }}
                 style={{ ...chipMoveStyle, opacity: i === 0 ? 0.3 : 1 }}
-                onClick={() => move(i, i - 1)}
+                onClick={() => {
+                  pendingFocusRef.current = {index: i - 1, dir: 'left'}
+                  move(i, i - 1)
+                }}
                 disabled={i === 0}
                 aria-label={`move pipeline stage ${i + 1} earlier`}
               >
@@ -255,8 +291,12 @@ function PipelineChipList({ label, items, onChange }: {
               </button>
               <input style={chipInputStyle} value={item} onChange={e => update(i, e.target.value)} />
               <button
+                ref={el => { moveBtnRefs.current[2 * i + 1] = el }}
                 style={{ ...chipMoveStyle, opacity: i === items.length - 1 ? 0.3 : 1 }}
-                onClick={() => move(i, i + 1)}
+                onClick={() => {
+                  pendingFocusRef.current = {index: i + 1, dir: 'right'}
+                  move(i, i + 1)
+                }}
                 disabled={i === items.length - 1}
                 aria-label={`move pipeline stage ${i + 1} later`}
               >
