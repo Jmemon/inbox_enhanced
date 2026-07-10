@@ -77,6 +77,106 @@ def test_callback_happy_path_creates_user_and_session_then_me_returns_user(clien
     assert body["email"] == "alice@example.com" and body["name"] == "Alice"
 
 
+def test_callback_stores_exactly_googles_returned_scopes(client):
+    c, TestSession = client
+    login = c.get("/auth/login", follow_redirects=False)
+    state_in_url = _extract_state(login.headers["location"])
+
+    granted = [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.modify",
+        "https://www.googleapis.com/auth/gmail.compose",
+    ]
+    fake_exchange = google_oauth.ExchangedTokens(
+        access_token="ya29.fake",
+        refresh_token="1//fake-refresh",
+        expires_at=datetime(2026, 5, 1, 12, tzinfo=timezone.utc),
+        email="bob@example.com",
+        name="Bob",
+        granted_scopes=granted,
+    )
+    with patch("app.api.auth.google_oauth.exchange_code", return_value=fake_exchange):
+        c.get(f"/auth/callback?code=x&state={state_in_url}", follow_redirects=False)
+
+    with TestSession() as db:
+        u = db.query(User).filter_by(email="bob@example.com").one()
+        # Stores exactly what Google returned -- never the requested SCOPES list.
+        assert u.gmail_granted_scopes == granted
+
+    me = c.get("/auth/me")
+    assert me.json()["has_write_scopes"] is True
+
+
+def test_callback_overwrites_scopes_on_recall(client):
+    """Re-consent (or a scope downgrade) must overwrite, not merge with, the
+    previously-stored list -- every callback writes exactly what Google just
+    returned."""
+    c, TestSession = client
+    login = c.get("/auth/login", follow_redirects=False)
+    state_in_url = _extract_state(login.headers["location"])
+    first = google_oauth.ExchangedTokens(
+        access_token="ya29.fake",
+        refresh_token="1//fake-refresh",
+        expires_at=datetime(2026, 5, 1, 12, tzinfo=timezone.utc),
+        email="carol@example.com",
+        name="Carol",
+        granted_scopes=[
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.compose",
+        ],
+    )
+    with patch("app.api.auth.google_oauth.exchange_code", return_value=first):
+        c.get(f"/auth/callback?code=x&state={state_in_url}", follow_redirects=False)
+
+    login2 = c.get("/auth/login", follow_redirects=False)
+    state2 = _extract_state(login2.headers["location"])
+    second = google_oauth.ExchangedTokens(
+        access_token="ya29.fake2",
+        refresh_token="1//fake-refresh",
+        expires_at=datetime(2026, 5, 1, 12, tzinfo=timezone.utc),
+        email="carol@example.com",
+        name="Carol",
+        granted_scopes=["https://www.googleapis.com/auth/gmail.modify"],  # compose revoked
+    )
+    with patch("app.api.auth.google_oauth.exchange_code", return_value=second):
+        c.get(f"/auth/callback?code=y&state={state2}", follow_redirects=False)
+
+    with TestSession() as db:
+        u = db.query(User).filter_by(email="carol@example.com").one()
+        assert u.gmail_granted_scopes == ["https://www.googleapis.com/auth/gmail.modify"]
+
+    me = c.get("/auth/me")
+    assert me.json()["has_write_scopes"] is False
+
+
+def test_me_has_write_scopes_false_when_scopes_null(client):
+    """NULL gmail_granted_scopes (pre-migration accounts, or never re-consented)
+    reads as no write scopes granted -- never a crash, never assumed-true."""
+    c, TestSession = client
+    login = c.get("/auth/login", follow_redirects=False)
+    state_in_url = _extract_state(login.headers["location"])
+    fake_exchange = google_oauth.ExchangedTokens(
+        access_token="ya29.fake",
+        refresh_token="1//fake-refresh",
+        expires_at=datetime(2026, 5, 1, 12, tzinfo=timezone.utc),
+        email="dave@example.com",
+        name="Dave",
+    )
+    with patch("app.api.auth.google_oauth.exchange_code", return_value=fake_exchange):
+        c.get(f"/auth/callback?code=x&state={state_in_url}", follow_redirects=False)
+
+    # Force the column to NULL directly -- distinct from "[]" (both read as
+    # false, but NULL is the actual pre-migration/no-callback-yet state).
+    with TestSession() as db:
+        u = db.query(User).filter_by(email="dave@example.com").one()
+        u.gmail_granted_scopes = None
+        db.commit()
+
+    me = c.get("/auth/me")
+    assert me.status_code == 200
+    assert me.json()["has_write_scopes"] is False
+
+
 def test_callback_with_google_error_redirects_with_authError(client):
     c, _ = client
     r = c.get("/auth/callback?error=access_denied", follow_redirects=False)
