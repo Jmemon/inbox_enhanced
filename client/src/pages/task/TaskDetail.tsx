@@ -309,7 +309,7 @@ export default function TaskDetail() {
             onReject={handleReject}
             onRevert={handleRevert}
           />
-          <TaskActionsPanel taskId={taskId} />
+          {detail.kind === 'tracker' && <TaskActionsPanel taskId={taskId} />}
         </div>
       </div>
 

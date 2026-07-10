@@ -140,6 +140,24 @@ export function TaskActionsPanel({ taskId }: { taskId: string }) {
   const undoBusyTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const [undoErrors, setUndoErrors] = useState<Map<string, string>>(new Map())
 
+  // React Router does NOT remount this component on taskId param change (navigating
+  // straight from one task's page to another's — a route param change without
+  // unmounting the route itself). Reset all local state synchronously before the
+  // refetch, mirrors TaskDetail.tsx:52-60's reset-on-param-change pattern.
+  useEffect(() => {
+    setPending([])
+    setActivity([])
+    setBusy(new Set())
+    setFailedOverrides(new Map())
+    setUndoBusy(new Set())
+    setUndoErrors(new Map())
+    // Clear any pending timers to avoid state updates after navigation
+    for (const timer of busyTimersRef.current.values()) clearTimeout(timer)
+    busyTimersRef.current.clear()
+    for (const timer of undoBusyTimersRef.current.values()) clearTimeout(timer)
+    undoBusyTimersRef.current.clear()
+  }, [taskId])
+
   useEffect(() => {
     const stillUndoable = new Set(activity.filter((a) => a.status === 'executed').map((a) => a.action_id))
     setUndoBusy((prev) => {
