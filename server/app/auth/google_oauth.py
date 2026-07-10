@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from google.oauth2.credentials import Credentials
@@ -8,11 +8,17 @@ from googleapiclient.discovery import build
 from app.config import get_settings
 
 
+# Phase 5 (actions, spec 006 §1): full write scopes at signup — the GCP
+# consent screen already lists gmail.modify + gmail.compose. NO gmail.send:
+# its absence here is a tested invariant (test_gmail_writes.py), not an
+# oversight — the app never sends mail on the user's behalf, only drafts.
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.compose",
 ]
 
 
@@ -23,6 +29,10 @@ class ExchangedTokens:
     expires_at: datetime
     email: str
     name: str | None
+    # The token response's actual granted scopes (never the requested SCOPES
+    # list) -- see exchange_code(). Defaults to [] so call sites/tests that
+    # don't care about scopes (login/profile flows) need no changes.
+    granted_scopes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -80,12 +90,19 @@ def exchange_code(*, code: str) -> ExchangedTokens:
     userinfo = _fetch_userinfo(creds)
     expiry = creds.expiry  # naive UTC per google library
     expires_at = expiry.replace(tzinfo=timezone.utc) if expiry.tzinfo is None else expiry
+    # google-auth populates Credentials.granted_scopes from the token response's
+    # own `scope` field (google_auth_oauthlib.helpers.credentials_from_session),
+    # which can differ from what we requested (partial consent) or be omitted
+    # entirely by the token endpoint when it matches the request exactly. Either
+    # way we store only what came back, never SCOPES itself.
+    granted_scopes = list(creds.granted_scopes) if creds.granted_scopes else []
     return ExchangedTokens(
         access_token=creds.token,
         refresh_token=creds.refresh_token,
         expires_at=expires_at,
         email=userinfo["email"],
         name=userinfo.get("name"),
+        granted_scopes=granted_scopes,
     )
 
 

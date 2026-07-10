@@ -8,6 +8,7 @@ from app.db.models import User
 from app.db.session import get_db
 from app.deps import get_current_user
 from app.auth import crypto, google_oauth, sessions, state_cookie
+from app.gmail.client import WRITE_SCOPE_COMPOSE, WRITE_SCOPE_MODIFY
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -94,6 +95,11 @@ def callback(
         user.gmail_refresh_token = crypto.encrypt(tokens.refresh_token)
     user.gmail_access_token = crypto.encrypt(tokens.access_token)
     user.gmail_access_token_expires_at = tokens.expires_at
+    # Phase 5 (actions, spec 006 §1): record exactly what Google granted on
+    # EVERY callback (login and re-consent alike) -- never the requested
+    # SCOPES list. Drives has_write_scopes below and every Gmail-write
+    # preflight (app.gmail.client.require_scopes).
+    user.gmail_granted_scopes = tokens.granted_scopes
     if tokens.name and not user.name:
         user.name = tokens.name
     db.commit()
@@ -110,7 +116,17 @@ def callback(
 
 @router.get("/me")
 def me(user: User = Depends(get_current_user)) -> dict:
-    return {"id": user.id, "email": user.email, "name": user.name}
+    # One flag, not two: the migration banner story is all-or-nothing since
+    # new signups grant both write scopes together (spec 006 §1). NULL
+    # granted-scopes (pre-migration, or never re-consented) reads as false.
+    granted = set(user.gmail_granted_scopes or [])
+    has_write_scopes = WRITE_SCOPE_MODIFY in granted and WRITE_SCOPE_COMPOSE in granted
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "has_write_scopes": has_write_scopes,
+    }
 
 
 @router.post("/logout", status_code=204)
