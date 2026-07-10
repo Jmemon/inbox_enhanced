@@ -562,12 +562,16 @@ def _backfill_candidate_pool(db, *, user_id: str, keyword_probes: list[str] | No
     BACKFILL_RECENCY_LIMIT threads (`inbox_repo.list_threads(...,
     include_archived=True)`). Both sources use include_archived=True --
     backfill's whole point (tracker OR bucket) is to scan everything stored,
-    not just what's currently in the live inbox view. A bucket backfill is
-    always invoked with `keyword_probes=[]` (buckets have no LLM-proposed
-    search terms the way a tracker wizard does) -- the FTS half then
-    contributes nothing and this degrades to exactly the recency-window
-    pool, the "empty probes -> recent-window fallback" every caller relies
-    on.
+    not just what's currently in the live inbox view. Probes may be
+    non-empty for a bucket backfill too -- POST /api/jobs/{id}/confirm
+    forwards the draft's keyword_probes regardless of kind (the propose
+    worker has no task_kind param, so it always generates probes; they drive
+    the FTS prefilter for both kinds). The empty-probes case -- where the
+    FTS half contributes nothing and this degrades to exactly the
+    recency-window pool, the "empty probes -> recent-window fallback" some
+    callers rely on -- comes from the legacy POST /api/buckets shim
+    (hardcodes `keyword_probes=[]`) and direct POST /api/tasks creates
+    (kind='bucket' with no probes supplied).
     """
     seen: set[str] = set()
     candidate_ids: list[str] = []

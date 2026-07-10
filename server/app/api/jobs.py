@@ -105,8 +105,9 @@ def list_jobs(
 ) -> dict:
     """The panel's always-works poll path. `active=1` (default) is the
     panel's normal view (non-dismissed, non-terminal-or-recently-terminal —
-    see `jobs_repo.list_jobs`'s active-window semantics); `active=0` returns
-    every non-dismissed job regardless of age."""
+    see `jobs_repo.list_jobs`'s active-window semantics); `active=0` applies
+    no filter at all — every job for this user, dismissed or not, of any
+    age."""
     jobs = jobs_repo.list_jobs(db, user_id=user.id, active_only=bool(active))
     return {"jobs": [_serialize_job(j) for j in jobs]}
 

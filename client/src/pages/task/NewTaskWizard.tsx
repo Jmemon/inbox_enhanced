@@ -76,7 +76,14 @@ export function NewTaskWizard({ onClose, kind = 'tracker', reviewJob }: {
   // whoever reviews the resulting draft_ready job later, in a fresh mount).
   const [name, setName] = useState(() => proposal?.name ?? '')
   const [description, setDescription] = useState(() => proposal?.description ?? '')
-  const [stateSchema, setStateSchema] = useState<TaskStateSchema | null>(() => proposal?.state_schema ?? null)
+  // The propose worker has no task_kind param, so it always generates a
+  // schema — a bucket review's proposal.state_schema is non-null too. Force
+  // null here for bucket mode rather than trusting the proposal, since a
+  // bucket task can never carry a state_schema (server rejects it, see
+  // submitReview below).
+  const [stateSchema, setStateSchema] = useState<TaskStateSchema | null>(
+    () => (effectiveKind === 'bucket' ? null : proposal?.state_schema ?? null)
+  )
   // No setter used in the UI (no editing affordance exists for these today,
   // same as before Task 6) — submitReview below still reads it.
   const [keywordProbes] = useState<string[]>(() => proposal?.keyword_probes ?? [])
@@ -122,7 +129,7 @@ export function NewTaskWizard({ onClose, kind = 'tracker', reviewJob }: {
       const negatives = examples.filter(e => e.choice === 'near_miss').map(toExampleIn)
       await confirmJob(reviewJob.id, {
         name, description,
-        state_schema: stateSchema ? trimStateSchema(stateSchema) : null,
+        state_schema: effectiveKind === 'tracker' && stateSchema ? trimStateSchema(stateSchema) : null,
         keyword_probes: keywordProbes, confirmed_positives: positives, confirmed_negatives: negatives,
       })
       onClose()
