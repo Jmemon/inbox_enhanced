@@ -27,12 +27,13 @@ spent — and a 404-triggered full_sync_inbox amplifies that waste up to 200x.
 """
 
 import logging
+from typing import NamedTuple
 
 from googleapiclient.errors import HttpError
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from app.config import get_settings
-from app.db.models import InboxMessage, InboxThread, User
+from app.db.models import InboxMessage, InboxThread, Task, TaskThreadLink, User
 from app.inbox import inbox_repo, bucket_repo
 from app.llm.classify import triage
 from app.task_engine import repo as task_repo
@@ -127,9 +128,26 @@ def _triage_batch(
     return triage(parsed_list, buckets, trackers, current, user_id=user_id)
 
 
+class _LinkWriteResult(NamedTuple):
+    """_write_task_links' return contract. `wrote` preserves this function's
+    ORIGINAL boolean meaning exactly ("at least one upsert_link call this
+    round actually wrote/updated a row, i.e. wasn't a sticky-rule no-op") —
+    extend_inbox_history's new_link_ids still gates on this alone, unchanged.
+    `fresh` is the Phase 5 (actions, spec 006 §3) addition: the narrower
+    subset of those writes where upsert_link's own `newly_attached` flag was
+    True — i.e. this call is what put the link into state='attached' for the
+    FIRST time (or re-attached it from detached), as opposed to merely
+    refreshing an already-attached row's confidence. Only `fresh` entries may
+    ever fire a thread_linked rule (see the three callers below, each of
+    which fires AFTER its own commit)."""
+
+    wrote: bool
+    fresh: list[tuple[str, TaskThreadLink]]
+
+
 def _write_task_links(
     db: Session, *, user_id: str, thread_id: str, tasks: list[tuple[str, int]],
-) -> bool:
+) -> _LinkWriteResult:
     """Dual-write half of the triage contract: for every (task_id, confidence)
     triage returned at or above TASK_LINK_CONFIDENCE, upsert an origin='llm'
     link. task_engine.repo.upsert_link's sticky rule protects any existing
@@ -138,23 +156,61 @@ def _write_task_links(
     (partial_sync_inbox / full_sync_inbox / extend_inbox_history) commits
     once at the end, same as every other write in this module.
 
-    Returns True if at least one upsert_link call actually wrote/updated a row
-    (i.e. wasn't a sticky-rule no-op). extend_inbox_history uses this to know
-    which threads it just linked, so it can route exactly those into
-    extraction — see its own docstring for why that routing exists.
+    Returns a _LinkWriteResult — see its own docstring for `wrote` vs.
+    `fresh`.
     """
     settings = get_settings()
     wrote = False
+    fresh: list[tuple[str, TaskThreadLink]] = []
     for task_id, confidence in tasks:
         if confidence < settings.task_link_confidence:
             continue
-        link = task_repo.upsert_link(
+        result = task_repo.upsert_link(
             db, task_id=task_id, thread_id=thread_id, user_id=user_id,
             origin="llm", state="attached", confidence=confidence,
         )
-        if link is not None:
+        if result.link is not None:
             wrote = True
-    return wrote
+            if result.newly_attached:
+                fresh.append((task_id, result.link))
+    return _LinkWriteResult(wrote=wrote, fresh=fresh)
+
+
+def _fire_link_rules(
+    db: Session, *, user_id: str,
+    fresh_links: list[tuple[str, TaskThreadLink, str, str]],
+) -> None:
+    """Phase 5 (actions, spec 006 §3): fire thread_linked rules for every
+    freshly-attached link one of this module's three orchestration functions
+    just committed this round. `fresh_links` entries are
+    (task_id, link, internal_thread_id, gmail_thread_id).
+
+    Late-imports _publish from workers.tasks — this module is imported BY
+    workers/tasks.py at ITS top level (`from app.workers import gmail_sync,
+    task_engine_tasks`), so importing it back here at OUR top level would
+    form a cycle; same late-import convention workers/task_engine_tasks.py
+    already uses for the identical reason. Called AFTER the caller's own
+    db.commit() (partial_sync_inbox/full_sync_inbox/extend_inbox_history) —
+    fire_rules_for_link does its OWN commit for the TaskAction inserts,
+    deliberately separate so a failure there can never roll back the link
+    write itself.
+    """
+    from app.actions import engine as actions_engine
+    from app.workers.tasks import _publish
+
+    task_ids = {task_id for task_id, _, _, _ in fresh_links}
+    tasks_by_id = {
+        t.id: t for t in db.execute(select(Task).where(Task.id.in_(task_ids))).scalars().all()
+    }
+    for task_id, link, internal_thread_id, gmail_thread_id in fresh_links:
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            continue
+        actions_engine.fire_rules_for_link(
+            db, user_id=user_id, task=task, link=link,
+            thread_id=internal_thread_id, gmail_thread_id=gmail_thread_id,
+            publish=_publish,
+        )
 
 
 def fetch_history_records(
@@ -357,10 +413,15 @@ def partial_sync_inbox(
 
     triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
     internal_ids = []
+    # Phase 5 (actions, spec 006 §3): freshly-attached links this sync round,
+    # collected for thread_linked rule firing right after the commit below.
+    fresh_links: list[tuple[str, TaskThreadLink, str, str]] = []
     for p, (b, task_hits) in zip(parsed_list, triage_results):
         internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         internal_ids.append(internal_id)
-        _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+        link_result = _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+        for task_id, link in link_result.fresh:
+            fresh_links.append((task_id, link, internal_id, p.gmail_thread_id))
 
         # Heal is_archived from the fetched thread's own label state. The
         # flag-record loop above (labelsAdded/labelsRemoved INBOX) runs BEFORE
@@ -387,6 +448,8 @@ def partial_sync_inbox(
     if new_history_id:
         inbox_repo.update_user_history_id(db, user_id=user.id, history_id=str(new_history_id))
     db.commit()
+    if fresh_links:
+        _fire_link_rules(db, user_id=user.id, fresh_links=fresh_links)
     log.info(
         "partial_sync_inbox: user=%s done, %d threads upserted",
         user.id, len(all_ids),
@@ -458,10 +521,15 @@ def full_sync_inbox(db: Session, *, user: User) -> tuple[list[str], list[str]]:
 
     triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
     internal_ids = []
+    # Phase 5 (actions, spec 006 §3): freshly-attached links this sync round,
+    # collected for thread_linked rule firing right after the commit below.
+    fresh_links: list[tuple[str, TaskThreadLink, str, str]] = []
     for p, (b, task_hits) in zip(parsed_list, triage_results):
         internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         internal_ids.append(internal_id)
-        _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+        link_result = _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+        for task_id, link in link_result.fresh:
+            fresh_links.append((task_id, link, internal_id, p.gmail_thread_id))
 
     # content_ids: snapshot before the reconcile step below appends
     # reconcile-archived ids — those never went through a fetch/upsert this
@@ -541,6 +609,8 @@ def full_sync_inbox(db: Session, *, user: User) -> tuple[list[str], list[str]]:
     if max_history_id:
         inbox_repo.update_user_history_id(db, user_id=user.id, history_id=str(max_history_id))
     db.commit()
+    if fresh_links:
+        _fire_link_rules(db, user_id=user.id, fresh_links=fresh_links)
     log.info(
         "full_sync_inbox: user=%s done, %d threads touched, max_history_id=%d",
         user.id, len(internal_ids), max_history_id,
@@ -591,10 +661,18 @@ def extend_inbox_history(
     triage_results = _triage_batch(db, user_id=user.id, parsed_list=parsed_list)
     internal_ids = []
     new_link_ids = []
+    # Phase 5 (actions, spec 006 §3): freshly-attached links this call,
+    # collected for thread_linked rule firing right after the commit below.
+    fresh_links: list[tuple[str, TaskThreadLink, str, str]] = []
     for p, (b, task_hits) in zip(parsed_list, triage_results):
         internal_id = _upsert_thread_with_messages(db, user_id=user.id, parsed=p, bucket_id=b)
         internal_ids.append(internal_id)
-        if _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits):
+        link_result = _write_task_links(db, user_id=user.id, thread_id=internal_id, tasks=task_hits)
+        if link_result.wrote:
             new_link_ids.append(internal_id)
+        for task_id, link in link_result.fresh:
+            fresh_links.append((task_id, link, internal_id, p.gmail_thread_id))
     db.commit()
+    if fresh_links:
+        _fire_link_rules(db, user_id=user.id, fresh_links=fresh_links)
     return internal_ids, len(stubs) == 200, new_link_ids

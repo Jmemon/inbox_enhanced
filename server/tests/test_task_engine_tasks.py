@@ -29,6 +29,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from app.actions import repo as actions_repo
 from app.config import get_settings
 from app.db.models import Base, InboxMessage, InboxThread, User
 from app.llm import client as llm_client
@@ -191,6 +192,40 @@ def test_process_task_updates_end_to_end_applies_event_updates_board_and_publish
     assert user_id == USER_ID
     assert event == "task_updated"
     assert payload == {"task_id": task_id, "version": 2, "pending_count": 0}
+
+
+def test_process_task_updates_fires_entity_entered_stage_rule(session_factory, fake_redis, monkeypatch):
+    """Phase 5 (actions, spec 006 Task 3): an event process_task_updates
+    just applied fires a matching entity_entered_stage rule, AFTER the
+    per-pair commit — same hook as api/tasks.py's approve_event."""
+    _seed_user_thread_message(session_factory)
+    task_id = _seed_tracker(session_factory)
+    _attach(session_factory, task_id=task_id, thread_id=THREAD_ID)
+    db = session_factory()
+    actions_repo.create_rule(
+        db, task_id=task_id, trigger="entity_entered_stage", trigger_params={"stage": "in_progress"},
+        action_type="archive_thread", action_params=None, mode="propose",
+    )
+    db.commit()
+    db.close()
+    captured = _capture_publish(monkeypatch)
+
+    settings = get_settings()
+    high_confidence = min(100, settings.task_apply_confidence + 10)
+    monkeypatch.setattr(
+        llm_client, "call_messages",
+        _fake_call_messages(_extraction_response(confidence=high_confidence)),
+    )
+
+    task_engine_tasks.process_task_updates.apply(args=[USER_ID, [THREAD_ID]])
+
+    db2 = session_factory()
+    pending = actions_repo.list_pending_actions_for_user(db2, user_id=USER_ID)
+    assert len(pending) == 1
+    action, _ = pending[0]
+    assert action.status == "proposed"
+    assert action.gmail_thread_id == GMAIL_THREAD_ID
+    assert ("action_updated", {"task_id": task_id}) in [(e, p) for _, e, p in captured]
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +735,50 @@ def test_backfill_task_links_matches_and_extracts_ascending_final_state_reflects
 
     events = task_repo.list_events(db, task_id=task_id, status="applied")
     assert len(events) == 2  # both applied -- plain attribute field, no stage-ordering guard
+
+
+def test_backfill_task_tracker_fires_thread_linked_and_entity_entered_stage_rules(
+    session_factory, fake_redis, monkeypatch,
+):
+    """Phase 5 (actions, spec 006 Task 3): backfill's tracker branch fires
+    BOTH kinds of rule for one and the same thread -- thread_linked, right
+    after the triage batch's own upsert_link commit, and
+    entity_entered_stage, right after the extraction phase's own commit for
+    the event it applies."""
+    _seed_user(session_factory)
+    task_id = _seed_tracker(session_factory)  # default singleton schema, name "Job tracker"
+    db = session_factory()
+    actions_repo.create_rule(
+        db, task_id=task_id, trigger="thread_linked", trigger_params=None,
+        action_type="archive_thread", action_params=None, mode="propose",
+    )
+    actions_repo.create_rule(
+        db, task_id=task_id, trigger="entity_entered_stage", trigger_params={"stage": "in_progress"},
+        action_type="label_thread", action_params={"label": "Tracked"}, mode="propose",
+    )
+    db.commit()
+    db.close()
+
+    _seed_backfill_thread(
+        session_factory, thread_id="bf1", gmail_thread_id="gbf1", message_gmail_id="m1",
+        body_text="MARKER-1 your application has moved to in_progress review.",
+        last_activity_at=1000,
+    )
+    fake = _backfill_llm_fake(
+        tracker_name="Job tracker",
+        marker_confidences={"MARKER-1": 90},
+        marker_extractions={"MARKER-1": _extraction_response(confidence=90, message_id="m1")},
+    )
+    monkeypatch.setattr(llm_client, "call_messages", fake)
+
+    task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None])
+
+    db2 = session_factory()
+    pending = actions_repo.list_pending_actions_for_user(db2, user_id=USER_ID)
+    assert len(pending) == 2
+    by_type = {a.action_type: a for a, _ in pending}
+    assert by_type["archive_thread"].source_link_id is not None
+    assert by_type["label_thread"].source_event_id is not None
 
 
 def test_backfill_task_publishes_progress_every_interval_and_terminal_done(

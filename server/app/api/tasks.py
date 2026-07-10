@@ -31,6 +31,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.actions import engine as actions_engine
+from app.actions import repo as actions_repo
 from app.api.inbox import _serialize_thread
 from app.db.models import InboxThread, User
 from app.db.session import get_db
@@ -526,7 +528,7 @@ def attach_thread(task_id: str, body: _AttachThreadBody, user: User = Depends(ge
     if thread is None:
         raise HTTPException(404, "not found")
 
-    task_repo.upsert_link(
+    link_upsert = task_repo.upsert_link(
         db, task_id=task.id, thread_id=thread.id, user_id=user.id,
         origin="user", state="attached",
     )
@@ -548,6 +550,16 @@ def attach_thread(task_id: str, body: _AttachThreadBody, user: User = Depends(ge
     # threads panel silently misses the new attachment).
     task_repo.bump_version(db, task=task)
     db.commit()
+    if link_upsert.newly_attached:
+        # Phase 5 (actions, spec 006 §3): a manual attach is a fresh
+        # thread_linked firing event, exactly like an automatic sync-time
+        # link — fire AFTER the commit above so a firing failure can never
+        # roll back the attach itself.
+        actions_engine.fire_rules_for_link(
+            db, user_id=user.id, task=task, link=link_upsert.link,
+            thread_id=thread.id, gmail_thread_id=thread.gmail_id,
+            publish=tasks._publish,
+        )
     # Extract this one pair immediately rather than waiting for the next
     # sync-triggered process_task_updates run (see workers/task_engine_tasks
     # .extract_for_thread's docstring — this is exactly the entrypoint it
@@ -572,10 +584,17 @@ def detach_thread(task_id: str, thread_id: str, add_example: bool = Query(defaul
     if thread is None:
         raise HTTPException(404, "not found")
 
-    task_repo.upsert_link(
+    link_upsert = task_repo.upsert_link(
         db, task_id=task.id, thread_id=thread.id, user_id=user.id,
         origin="user", state="detached",
     )
+    if link_upsert.link is not None:
+        # Phase 5 (actions, spec 006 §3/§6 invariant 7): detaching a thread
+        # auto-rejects any still-'proposed' action whose evidence was THIS
+        # link (a thread_linked rule fire) — same transaction as the route's
+        # own commit below, so a still-open review can never later be
+        # approved against a thread the task no longer tracks.
+        actions_repo.reject_proposed_for_source(db, source_link_id=link_upsert.link.id)
     if add_example:
         # spec §4.6 learning loop (Task 2): an explicit detach is a
         # near-miss signal — the thread looked relevant enough to have been
@@ -607,6 +626,12 @@ def detach_thread(task_id: str, thread_id: str, add_example: bool = Query(defaul
         event.status = "reverted"
         if event.entity_id:
             touched_entity_ids.add(event.entity_id)
+        # Phase 5 (actions, spec 006 §3/§6 invariant 7): this event's own
+        # revert (as a side effect of detaching the thread it came from)
+        # auto-rejects any still-'proposed' action it was the evidence for
+        # — the same invariant revert_event below enforces for an explicit
+        # single-event revert.
+        actions_repo.reject_proposed_for_source(db, source_event_id=event.id)
     # Same autoflush=False caveat as revert_event above — refold_entity's
     # SELECT must see every status flip made in the loop just above.
     db.flush()
@@ -673,6 +698,20 @@ def approve_event(task_id: str, event_id: str, user: User = Depends(get_current_
     event.created_at = datetime.now(timezone.utc)
     task_repo.apply_event(db, task=task, entity=entity, event=event)
     db.commit()
+    # Phase 5 (actions, spec 006 §3): approving a pending event is the API
+    # equivalent of extraction applying one directly — fire entity_entered_
+    # stage rules AFTER the commit above. Always thread-bearing in practice
+    # (only extraction ever creates pending_review events, and those always
+    # carry thread_id), but guarded the same defensive way as
+    # edit_entity_state below rather than assuming it.
+    if event.thread_id:
+        thread_row = inbox_repo.get_thread(db, user_id=user.id, thread_id=event.thread_id)
+        if thread_row is not None:
+            actions_engine.fire_rules_for_event(
+                db, user_id=user.id, task=task, event=event,
+                thread_id=event.thread_id, gmail_thread_id=thread_row.gmail_id,
+                publish=tasks._publish,
+            )
     _publish_task_updated(db, user_id=user.id, task=task)
     return _serialize_event(event)
 
@@ -716,6 +755,10 @@ def revert_event(task_id: str, event_id: str, user: User = Depends(get_current_u
     entity = _require_event_entity(db, task=task, event=event)
 
     event.status = "reverted"
+    # Phase 5 (actions, spec 006 §3/§6 invariant 7): reverting a source event
+    # auto-rejects any still-'proposed' action it was the evidence for —
+    # same transaction as this route's own commit below.
+    actions_repo.reject_proposed_for_source(db, source_event_id=event.id)
     # refold_entity re-SELECTs this task's applied events; sessions here run
     # with autoflush=False (see task_engine/repo.py's module docstring), so
     # the status flip above must be flushed before that query runs or it
@@ -773,6 +816,21 @@ def edit_entity_state(task_id: str, entity_id: str, body: _StateEditBody,
     )
     task_repo.apply_event(db, task=task, entity=entity, event=event)
     db.commit()
+    # Phase 5 (actions, spec 006 §3): a manual state edit's append_event call
+    # above passes no thread_id/message_id (it's a direct user edit, not
+    # extracted from an email) — an entity_entered_stage rule needs a
+    # concrete thread to act on (archive/label/draft-reply), so there is
+    # structurally nothing for it to fire against here. This guard documents
+    # that as a deliberate no-op rather than a missed hook (exhaustive grep
+    # of apply_event( call sites turns up this route too).
+    if event.thread_id:
+        thread_row = inbox_repo.get_thread(db, user_id=user.id, thread_id=event.thread_id)
+        if thread_row is not None:
+            actions_engine.fire_rules_for_event(
+                db, user_id=user.id, task=task, event=event,
+                thread_id=event.thread_id, gmail_thread_id=thread_row.gmail_id,
+                publish=tasks._publish,
+            )
     _publish_task_updated(db, user_id=user.id, task=task)
     return _serialize_entity(entity)
 
