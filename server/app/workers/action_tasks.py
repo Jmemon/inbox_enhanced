@@ -1,10 +1,11 @@
 """Phase 5 (actions, spec 006 §3) execution worker: `execute_action(user_id,
 action_id)` — the Celery entrypoint a mode='auto' rule fire enqueues (via
 app.actions.engine.fire_rules_for_link/fire_rules_for_event), and
-`execute_action_inner` — the shared synchronous seam a future approve route
-(rules CRUD API) calls directly (no Celery round-trip) so a user clicking
-"approve" on a mode='propose' action gets the result inline, through the
-exact same dispatch code this module's own Celery task uses.
+`execute_action_inner` — the shared synchronous seam the approve route
+(`POST /api/actions/{action_id}/approve`, app/api/actions.py) calls directly
+(no Celery round-trip) so a user clicking "approve" on a mode='propose'
+action gets the result inline, through the exact same dispatch code this
+module's own Celery task uses.
 
 Kept as its own module (not folded into workers/action_tasks living inside
 task_engine_tasks.py or actions/engine.py) so it can import app.gmail.client
@@ -191,11 +192,11 @@ def _record_action_failure(*, user_id: str, action_id: str, error: str) -> None:
 @celery_app.task(name="app.workers.action_tasks.execute_action")
 def execute_action(user_id: str, action_id: str) -> None:
     """Celery entrypoint — ONLY ever enqueued by app.actions.engine's
-    mode='auto' dispatch (fire_rules_for_event/fire_rules_for_link). A
-    future approve route (rules CRUD API) calls execute_action_inner
-    directly instead, bypassing this task entirely, since approving a
-    mode='propose' action is a synchronous user action, not something to
-    round-trip through Celery.
+    mode='auto' dispatch (fire_rules_for_event/fire_rules_for_link). The
+    approve route (`POST /api/actions/{action_id}/approve`, app/api/actions.py)
+    calls execute_action_inner directly instead, bypassing this task entirely,
+    since approving a mode='propose' action is a synchronous user action, not
+    something to round-trip through Celery.
     """
     from app.workers.tasks import _publish
 
