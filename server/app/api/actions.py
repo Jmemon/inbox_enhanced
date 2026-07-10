@@ -371,14 +371,25 @@ def undo_action(action_id: str, user: User = Depends(get_current_user),
         raise HTTPException(409, "action cannot be undone")
 
     result = action.result or {}
+
+    # Derive inverse lists and validate they exist before touching Gmail.
+    if action.action_type == "archive_thread":
+        removed_label_ids = result.get("removed_label_ids")
+        if not removed_label_ids:
+            raise HTTPException(409, "action result is missing undo data")
+    else:  # label_thread
+        added_label_ids = result.get("added_label_ids")
+        if not added_label_ids:
+            raise HTTPException(409, "action result is missing undo data")
+
     try:
         if action.action_type == "archive_thread":
             gmail_client.modify_thread_labels(
-                db, user, action.gmail_thread_id, add=result.get("removed_label_ids") or [],
+                db, user, action.gmail_thread_id, add=removed_label_ids,
             )
         else:  # label_thread
             gmail_client.modify_thread_labels(
-                db, user, action.gmail_thread_id, remove=result.get("added_label_ids") or [],
+                db, user, action.gmail_thread_id, remove=added_label_ids,
             )
     except gmail_client.MissingScopesError as exc:
         raise HTTPException(409, str(exc))

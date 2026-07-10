@@ -429,6 +429,71 @@ def test_patch_rule_other_user_404(authed):
     assert r.status_code == 404
 
 
+def test_patch_rule_draft_reply_cannot_auto_via_mode_override_422(authed):
+    """draft_reply+propose rule cannot be patched to mode=auto."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_rule(
+        TS, task_id, action_type="draft_reply",
+        action_params={"instructions": "write something"}, mode="propose"
+    )
+
+    r = c.patch(f"/api/tasks/{task_id}/rules/{rule_id}", json={"mode": "auto"})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "draft_reply cannot auto-run"
+
+    # Rule row must be unchanged
+    db = TS()
+    rule = actions_repo.get_owned_rule(db, user_id="u1", rule_id=rule_id)
+    assert rule.mode == "propose"
+    db.close()
+
+
+def test_patch_rule_draft_reply_cannot_auto_via_type_override_422(authed):
+    """archive_thread+auto rule cannot be patched to draft_reply (mode omitted,
+    falls back to auto) → 422."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_rule(TS, task_id, action_type="archive_thread", mode="auto")
+
+    r = c.patch(f"/api/tasks/{task_id}/rules/{rule_id}", json={
+        "action_type": "draft_reply",
+        "action_params": {"instructions": "write something"},
+        # mode omitted: falls back to existing mode='auto'
+    })
+    assert r.status_code == 422
+    assert r.json()["detail"] == "draft_reply cannot auto-run"
+
+    # Rule row must be unchanged
+    db = TS()
+    rule = actions_repo.get_owned_rule(db, user_id="u1", rule_id=rule_id)
+    assert rule.action_type == "archive_thread"
+    assert rule.mode == "auto"
+    db.close()
+
+
+def test_patch_rule_label_thread_system_label_conflict_via_override_422(authed):
+    """label_thread rule cannot be patched to use a system label."""
+    c, TS = authed
+    task_id = _mk_task(TS)
+    rule_id = _seed_rule(
+        TS, task_id, action_type="label_thread",
+        action_params={"label": "MyLabel"}
+    )
+
+    r = c.patch(f"/api/tasks/{task_id}/rules/{rule_id}", json={
+        "action_params": {"label": "spam"},  # system label
+    })
+    assert r.status_code == 422
+    assert r.json()["detail"] == "label name conflicts with a Gmail system label"
+
+    # Rule row must be unchanged
+    db = TS()
+    rule = actions_repo.get_owned_rule(db, user_id="u1", rule_id=rule_id)
+    assert rule.action_params["label"] == "MyLabel"
+    db.close()
+
+
 def test_delete_rule_soft_deletes_bumps_version_and_publishes(authed, monkeypatch):
     c, TS = authed
     captured = _capture_publish(monkeypatch)
@@ -737,3 +802,77 @@ def test_undo_other_user_404(authed):
     )
     r = c.post(f"/api/actions/{action_id}/undo")
     assert r.status_code == 404
+
+
+def test_undo_archive_thread_with_null_result_409(authed, monkeypatch):
+    """archive_thread undo with result=None must fail loudly, not silently
+    succeed with an empty label list."""
+    c, TS = authed
+    _grant_scopes(TS)
+    task_id = _mk_task(TS)
+    rule_id = _seed_rule(TS, task_id)
+    link_id = _seed_link_row(TS, task_id)
+    action_id = _seed_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id, action_type="archive_thread",
+        gmail_thread_id="gmail-thread-bad-result-1",
+        status="executed", result=None,  # malformed: should have removed_label_ids
+    )
+
+    r = c.post(f"/api/actions/{action_id}/undo")
+    assert r.status_code == 409
+    assert r.json()["detail"] == "action result is missing undo data"
+
+    # Action status must remain 'executed', not flipped to 'undone'
+    db = TS()
+    action = actions_repo.get_owned_action(db, user_id="u1", action_id=action_id)
+    assert action.status == "executed"
+    db.close()
+
+
+def test_undo_archive_thread_with_missing_removed_label_ids_409(authed):
+    """archive_thread undo with result missing removed_label_ids key must
+    fail loudly."""
+    c, TS = authed
+    _grant_scopes(TS)
+    task_id = _mk_task(TS)
+    rule_id = _seed_rule(TS, task_id)
+    link_id = _seed_link_row(TS, task_id)
+    action_id = _seed_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id, action_type="archive_thread",
+        gmail_thread_id="gmail-thread-bad-result-2",
+        status="executed", result={"some_other_key": "value"},
+    )
+
+    r = c.post(f"/api/actions/{action_id}/undo")
+    assert r.status_code == 409
+    assert r.json()["detail"] == "action result is missing undo data"
+
+    # Action status must remain 'executed'
+    db = TS()
+    action = actions_repo.get_owned_action(db, user_id="u1", action_id=action_id)
+    assert action.status == "executed"
+    db.close()
+
+
+def test_undo_label_thread_with_null_result_409(authed):
+    """label_thread undo with result=None must fail loudly."""
+    c, TS = authed
+    _grant_scopes(TS)
+    task_id = _mk_task(TS)
+    rule_id = _seed_rule(TS, task_id, action_type="label_thread", action_params={"label": "Won"})
+    link_id = _seed_link_row(TS, task_id)
+    action_id = _seed_action(
+        TS, task_id, rule_id=rule_id, source_link_id=link_id, action_type="label_thread",
+        action_params={"label": "Won"}, gmail_thread_id="gmail-thread-bad-result-3",
+        status="executed", result=None,  # malformed: should have added_label_ids
+    )
+
+    r = c.post(f"/api/actions/{action_id}/undo")
+    assert r.status_code == 409
+    assert r.json()["detail"] == "action result is missing undo data"
+
+    # Action status must remain 'executed'
+    db = TS()
+    action = actions_repo.get_owned_action(db, user_id="u1", action_id=action_id)
+    assert action.status == "executed"
+    db.close()
