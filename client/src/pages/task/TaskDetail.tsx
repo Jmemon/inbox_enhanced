@@ -10,6 +10,7 @@ import {
 import { EntityDrawer } from './EntityDrawer'
 import { PipelineBoard } from './PipelineBoard'
 import { ReviewFeed } from './ReviewFeed'
+import { RulesSection } from './RulesSection'
 import { ThreadsPanel } from './ThreadsPanel'
 
 // Mirrors InboxList's BucketPill inline-style pattern (and AppShell's
@@ -311,6 +312,11 @@ export default function TaskDetail() {
         onDetach={handleDetach}
         onAttach={handleAttach}
       />
+
+      {/* Rules (Phase 5, spec 006) — tracker-kind only: rules fire off
+          entity/link events, which buckets never generate (no state_schema,
+          no task_thread_links writes) — see actions.py's create_rule guard. */}
+      {detail.kind === 'tracker' && <RulesSection taskId={taskId} schema={schema} />}
     </main>
   )
 }

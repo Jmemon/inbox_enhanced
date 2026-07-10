@@ -212,14 +212,66 @@ export type TaskEvent = {
   thread_id: string | null; message_id: string | null; gmail_message_id: string | null
   entity_id: string | null; created_at: string
 }
-// Cross-task feed item: a TaskEvent plus the fields /api/reviews and
-// /api/activity add so the HUD can route back to the owning task without a
-// second fetch (see server/app/api/tasks.py's _serialize_feed_event).
-export type FeedItem = TaskEvent & {
+// --- Action rules & actions (Phase 5, spec 006) ---
+// Mirrors server/app/api/actions.py's `_serialize_rule`/`_serialize_action`
+// field-for-field; the vocab types mirror that module's `_TRIGGERS`/
+// `_ACTION_TYPES`/`_MODES` sets.
+export type RuleTrigger = 'entity_entered_stage' | 'thread_linked'
+export type RuleActionType = 'archive_thread' | 'label_thread' | 'draft_reply'
+export type RuleMode = 'propose' | 'auto'
+export type ActionStatus = 'proposed' | 'executed' | 'rejected' | 'undone' | 'failed'
+
+// trigger_params/action_params are a plain dict server-side (`dict | None`,
+// shape depends on the sibling trigger/action_type field) — an all-optional
+// object round-trips every combination the server actually validates (stage
+// for entity_entered_stage; label for label_thread; instructions for
+// draft_reply) without a discriminated union TS can't key off a sibling
+// field for automatically.
+export type RuleTriggerParams = { stage?: string } | null
+export type RuleActionParams = { label?: string; instructions?: string } | null
+
+export type ActionRule = {
+  id: string; task_id: string
+  trigger: RuleTrigger; trigger_params: RuleTriggerParams
+  action_type: RuleActionType; action_params: RuleActionParams
+  mode: RuleMode; is_deleted: boolean; created_at: string
+}
+
+export type TaskAction = {
+  id: string; task_id: string; rule_id: string
+  source_event_id: string | null; source_link_id: string | null
+  thread_id: string | null; gmail_thread_id: string
+  action_type: RuleActionType; action_params: RuleActionParams
+  status: ActionStatus; result: Record<string, unknown> | null; error: string | null
+  created_at: string; executed_at: string | null
+}
+
+// Cross-task feed item: a discriminated union on `type` — either an
+// underlying TaskEvent (existing shape, additive `type: 'event'`) or a
+// TaskAction-derived summary card (Phase 5, additive `type: 'action'`).
+// Every consumer must narrow on `type` before touching event-only fields
+// (field/old_value/entity_display_name/…) or action-only fields
+// (action_id/rule_summary/thread_subject/…) — mirrors server/app/api/
+// tasks.py's `_serialize_feed_event`/`_serialize_feed_action`.
+export type EventFeedItem = TaskEvent & {
+  type: 'event'
   task_id: string
   task_name: string
   entity_display_name: string | null
 }
+export type ActionFeedItem = {
+  type: 'action'
+  action_id: string
+  task_id: string
+  task_name: string
+  action_type: RuleActionType
+  action_params: RuleActionParams
+  status: ActionStatus
+  rule_summary: string
+  thread_subject: string | null
+  created_at: string
+}
+export type FeedItem = EventFeedItem | ActionFeedItem
 // --- Task calls ---
 
 // Helper to extract actionable error detail from API responses (e.g., pydantic 422 validators).
@@ -383,6 +435,84 @@ export async function mergeEntity(id: string, entityId: string, intoEntityId: st
   if (r.status !== 204) {
     await throwWithDetail(r, `merge entity: ${r.status}`)
   }
+}
+
+// --- Action rules & actions calls (Phase 5, spec 006) ---
+// Mirrors server/app/api/actions.py's routes; tracker-kind tasks only
+// (422 on a bucket, see that module's create_rule).
+
+export async function createRule(taskId: string, body: {
+  trigger: RuleTrigger; trigger_params?: RuleTriggerParams; action_type: RuleActionType;
+  action_params?: RuleActionParams; mode: RuleMode;
+}): Promise<ActionRule> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/rules`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  if (!r.ok) {
+    await throwWithDetail(r, `create rule: ${r.status}`)
+  }
+  return r.json()
+}
+
+export function listRules(taskId: string): Promise<{ rules: ActionRule[] }> {
+  return getJSON<{ rules: ActionRule[] }>(`/api/tasks/${encodeURIComponent(taskId)}/rules`)
+}
+
+export async function patchRule(taskId: string, ruleId: string, body: {
+  trigger?: RuleTrigger; trigger_params?: RuleTriggerParams; action_type?: RuleActionType;
+  action_params?: RuleActionParams; mode?: RuleMode;
+}): Promise<ActionRule> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/rules/${encodeURIComponent(ruleId)}`, {
+    method: 'PATCH', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  if (!r.ok) {
+    await throwWithDetail(r, `update rule: ${r.status}`)
+  }
+  return r.json()
+}
+
+// Soft delete, idempotent server-side — 204 either way.
+export async function deleteRule(taskId: string, ruleId: string): Promise<void> {
+  const r = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/rules/${encodeURIComponent(ruleId)}`, {
+    method: 'DELETE', credentials: 'same-origin',
+  })
+  if (r.status !== 204) throw new Error(`delete rule: ${r.status}`)
+}
+
+// approve/reject/undo all 200 with the serialized TaskAction body (see
+// server/app/api/actions.py) — every 409 (wrong status, reverted/detached
+// source, missing scopes) carries a meaningful `detail` string worth
+// surfacing verbatim, same idiom as createTask's 422s.
+export async function approveAction(actionId: string): Promise<TaskAction> {
+  const r = await fetch(`/api/actions/${encodeURIComponent(actionId)}/approve`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (!r.ok) {
+    await throwWithDetail(r, `approve action: ${r.status}`)
+  }
+  return r.json()
+}
+
+export async function rejectAction(actionId: string): Promise<TaskAction> {
+  const r = await fetch(`/api/actions/${encodeURIComponent(actionId)}/reject`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (!r.ok) {
+    await throwWithDetail(r, `reject action: ${r.status}`)
+  }
+  return r.json()
+}
+
+export async function undoAction(actionId: string): Promise<TaskAction> {
+  const r = await fetch(`/api/actions/${encodeURIComponent(actionId)}/undo`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (!r.ok) {
+    await throwWithDetail(r, `undo action: ${r.status}`)
+  }
+  return r.json()
 }
 
 // --- Job types + calls (Phase 4.5, spec 005) ---
