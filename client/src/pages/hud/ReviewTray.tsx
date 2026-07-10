@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { approveEvent, getReviews, rejectEvent, type EventFeedItem, type FeedItem } from '../../lib/api'
+import {
+  approveAction, approveEvent, getReviews, rejectAction, rejectEvent,
+  type ActionFeedItem, type EventFeedItem, type FeedItem,
+} from '../../lib/api'
+import { subscribeSse } from '../../lib/sse'
 import { useTasksStore } from '../../state/TasksProvider'
 import { pendingReasonCopy } from '../task/pendingReasons'
+import { ActionCard } from '../../actions/ActionCard'
 
 const BUSY_TIMEOUT_MS = 10_000
 
@@ -38,23 +43,25 @@ function EvidenceQuote({ quote }: { quote: string }) {
 
 // Aggregated cross-task review tray for the HUD. Self-owned data: fetches
 // getReviews() itself rather than reading from TasksProvider, since the
-// unified feed (every pending_review event across all of the user's tasks)
-// has no other consumer. Approve/reject write through the same
-// approveEvent/rejectEvent calls TaskDetail uses (they're keyed on task_id,
-// which every FeedItem carries) and then just refetch this tray directly —
-// TasksProvider's own SSE convergence (task_updated) is what keeps the
-// HUD's task cards/badges in sync, so this component never touches that
-// store's state.
+// unified feed (every pending_review event AND proposed action across all of
+// the user's tasks) has no other consumer. Approve/reject write through the
+// same approveEvent/rejectEvent calls TaskDetail uses (they're keyed on
+// task_id, which every FeedItem carries) and approveAction/rejectAction
+// (keyed on action_id alone) for action cards (Phase 5 Task 6), then just
+// refetch this tray directly — TasksProvider's own SSE convergence
+// (task_updated) is what keeps the HUD's task cards/badges in sync, so this
+// component never touches that store's state.
 export function ReviewTray() {
   const { tasks } = useTasksStore()
   // getReviews() returns the full merged FeedItem union (events + proposed
-  // actions, Phase 5) — this component still only renders event cards (T6
-  // adds action cards to the tray), so every pending action card is filtered
-  // out here rather than left for the render loop to trip over union fields
-  // it doesn't have (action items carry no `field`/`entity_display_name`/…).
+  // actions, Phase 5), already sorted newest-first server-side
+  // (_merge_feed_items) — `items` is rendered directly in that order below,
+  // narrowing per-item on `type` rather than splitting into two separately-
+  // ordered lists. `actions` is still split out here for the busy-clearing
+  // effect, which needs to know which action ids are still 'proposed'.
   const [items, setItems] = useState<FeedItem[]>([])
-  const events = useMemo(
-    () => items.filter((i): i is EventFeedItem => i.type === 'event'),
+  const actions = useMemo(
+    () => items.filter((i): i is ActionFeedItem => i.type === 'action'),
     [items],
   )
 
@@ -95,6 +102,19 @@ export function ReviewTray() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [totalPending])
 
+  // Action-settlement signal: approving/rejecting an action publishes
+  // `action_updated` directly (app/api/actions.py), NOT through
+  // _publish_task_updated — it doesn't change task.version or
+  // pending_reviews the way an event does, so totalPending above never
+  // fires for a proposed action being approved/rejected from elsewhere
+  // (another tab, or this task's own TaskActionsPanel). This is a pure nudge
+  // (task_id only, no row), same idiom as JobsProvider's job_updated handler.
+  useEffect(() => {
+    return subscribeSse((e) => {
+      if (e.event === 'action_updated') void refetch()
+    })
+  }, [refetch])
+
   // Per-item "action in flight" state, keyed by event id — same rationale
   // and shape as ReviewFeed's busy tracking: a clicked id stays busy until
   // the next `items` snapshot (from a refetch) no longer contains it, with a
@@ -105,6 +125,7 @@ export function ReviewTray() {
   const busyTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
   useEffect(() => {
+    const events = items.filter((i): i is EventFeedItem => i.type === 'event')
     const stillPending = new Set(events.map((i) => i.id))
     setBusy((prev) => {
       let changed = false
@@ -123,10 +144,40 @@ export function ReviewTray() {
       }
       return changed ? next : prev
     })
-    // Keyed on `events` identity (a fresh array only on an actual refetch) —
+    // Keyed on `items` identity (a fresh array only on an actual refetch) —
     // see ReviewFeed's identical comment on its own [events]-keyed effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events])
+  }, [items])
+
+  // Same idiom as `busy` above, for action cards — a separate Set/timer map
+  // keyed by action_id rather than folding into `busy` (event ids and
+  // action ids never collide in practice, but keeping the two concerns
+  // separate mirrors ReviewFeed/ReviewTray's existing per-surface busy
+  // tracking rather than inventing a merged one).
+  const [actionBusy, setActionBusy] = useState<Set<string>>(new Set())
+  const actionBusyTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+
+  useEffect(() => {
+    const stillPending = new Set(actions.map((a) => a.action_id))
+    setActionBusy((prev) => {
+      let changed = false
+      const next = new Set<string>()
+      for (const id of prev) {
+        if (stillPending.has(id)) {
+          next.add(id)
+        } else {
+          const timer = actionBusyTimersRef.current.get(id)
+          if (timer) {
+            clearTimeout(timer)
+            actionBusyTimersRef.current.delete(id)
+          }
+          changed = true
+        }
+      }
+      return changed ? next : prev
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actions])
 
   // On unmount, clear all pending busy timeouts.
   useEffect(() => {
@@ -135,6 +186,10 @@ export function ReviewTray() {
         clearTimeout(timer)
       }
       busyTimersRef.current.clear()
+      for (const timer of actionBusyTimersRef.current.values()) {
+        clearTimeout(timer)
+      }
+      actionBusyTimersRef.current.clear()
     }
   }, [])
 
@@ -151,6 +206,19 @@ export function ReviewTray() {
     busyTimersRef.current.set(id, timer)
   }
 
+  const markActionBusy = (id: string) => {
+    setActionBusy((prev) => new Set(prev).add(id))
+    const timer = setTimeout(() => {
+      setActionBusy((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next.size === prev.size ? prev : next
+      })
+      actionBusyTimersRef.current.delete(id)
+    }, BUSY_TIMEOUT_MS)
+    actionBusyTimersRef.current.set(id, timer)
+  }
+
   const handleApprove = (item: EventFeedItem) => {
     markBusy(item.id)
     void approveEvent(item.task_id, item.id)
@@ -165,7 +233,41 @@ export function ReviewTray() {
       .catch((e) => console.error('[ReviewTray] reject failed', e))
   }
 
-  if (events.length === 0) {
+  // Approving an action 200s even when the write itself failed (e.g. missing
+  // Gmail scopes) — the action's own `status` field is the only signal for
+  // that, per api/actions.py's approve_action docstring. Since a failed
+  // action is no longer 'proposed', a plain refetch would just make its card
+  // vanish with no explanation; per spec this card must instead surface the
+  // error and stay visible, so a failed outcome is stashed in
+  // `failedOverrides` (keyed by action_id) and rendered from there once the
+  // real fetch has dropped it. There is no retry for a failed action (spec
+  // §7), so the override has no expiry — it lives for this component's
+  // mount, same as any other terminal state shown here.
+  const [failedOverrides, setFailedOverrides] = useState<Map<string, { item: ActionFeedItem; error: string }>>(new Map())
+
+  const handleApproveAction = (item: ActionFeedItem) => {
+    markActionBusy(item.action_id)
+    void approveAction(item.action_id)
+      .then((result) => {
+        if (result.status === 'failed') {
+          setFailedOverrides((prev) => new Map(prev).set(item.action_id, { item, error: result.error ?? 'action failed' }))
+        }
+        return refetch()
+      })
+      .catch((e) => console.error('[ReviewTray] approve action failed', e))
+  }
+
+  const handleRejectAction = (item: ActionFeedItem) => {
+    markActionBusy(item.action_id)
+    void rejectAction(item.action_id)
+      .then(() => refetch())
+      .catch((e) => console.error('[ReviewTray] reject action failed', e))
+  }
+
+  const failedOverrideList = useMemo(() => Array.from(failedOverrides.values()), [failedOverrides])
+  const totalCount = items.length + failedOverrideList.length
+
+  if (totalCount === 0) {
     return (
       <section>
         <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Review</h2>
@@ -176,9 +278,22 @@ export function ReviewTray() {
 
   return (
     <section>
-      <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Needs review ({events.length})</h2>
+      <h2 style={{ fontSize: 14, margin: '0 0 8px' }}>Needs review ({totalCount})</h2>
       <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 8 }}>
-        {events.map((item) => {
+        {items.map((item) => {
+          if (item.type === 'action') {
+            return (
+              <ActionCard
+                key={item.action_id}
+                item={item}
+                busy={actionBusy.has(item.action_id)}
+                errorText={null}
+                onApprove={() => handleApproveAction(item)}
+                onReject={() => handleRejectAction(item)}
+                showTaskLink
+              />
+            )
+          }
           const isBusy = busy.has(item.id)
           const reason = pendingReasonCopy(item)
           return (
@@ -213,6 +328,17 @@ export function ReviewTray() {
             </li>
           )
         })}
+        {failedOverrideList.map(({ item, error }) => (
+          <ActionCard
+            key={`failed-${item.action_id}`}
+            item={item}
+            busy={false}
+            errorText={error}
+            onApprove={() => {}}
+            onReject={() => {}}
+            showTaskLink
+          />
+        ))}
       </ul>
     </section>
   )

@@ -11,6 +11,7 @@ import { EntityDrawer } from './EntityDrawer'
 import { PipelineBoard } from './PipelineBoard'
 import { ReviewFeed } from './ReviewFeed'
 import { RulesSection } from './RulesSection'
+import { TaskActionsPanel } from './TaskActionsPanel'
 import { ThreadsPanel } from './ThreadsPanel'
 
 // Mirrors InboxList's BucketPill inline-style pattern (and AppShell's
@@ -296,13 +297,20 @@ export default function TaskDetail() {
             allEntities={entities}
           />
         )}
-        <ReviewFeed
-          events={events}
-          entitiesById={entitiesById}
-          onApprove={handleApprove}
-          onReject={handleReject}
-          onRevert={handleRevert}
-        />
+        {/* ReviewFeed's props are locked to the TaskEvent contract (Task 6
+            brief) — TaskActionsPanel is a separate, self-owned-fetch sibling
+            rather than a widened union, stacked in the same grid column so
+            the two review surfaces read as one column on this page. */}
+        <div style={{ display: 'grid', gap: 16, alignContent: 'start' }}>
+          <ReviewFeed
+            events={events}
+            entitiesById={entitiesById}
+            onApprove={handleApprove}
+            onReject={handleReject}
+            onRevert={handleRevert}
+          />
+          <TaskActionsPanel taskId={taskId} />
+        </div>
       </div>
 
       <ThreadsPanel
