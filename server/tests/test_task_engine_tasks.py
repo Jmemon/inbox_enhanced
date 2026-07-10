@@ -1298,3 +1298,285 @@ def test_backfill_task_missing_job_row_is_a_defensive_noop(session_factory, fake
     task_engine_tasks.backfill_task.apply(args=[USER_ID, task_id, None, "no-such-job"])
 
     assert all(e != "job_updated" for _, e, _ in captured)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4.5 Task 4: retriage_deleted_bucket -- re-triages a deleted bucket's
+# orphaned threads (still pointing at the now-deleted bucket_id) against the
+# remaining active bucket set, driven entirely by a 'delete_retriage' job
+# row (unlike backfill_task, job_id here is never optional -- api/tasks.py's
+# delete_task route always creates the job before enqueuing this worker).
+# Reuses _seed_user/_seed_bucket_task/_seed_backfill_thread/
+# _fake_triage_capturing verbatim from the bucket-backfill section above.
+# ---------------------------------------------------------------------------
+
+
+def _seed_delete_retriage_job(session_factory, *, user_id=USER_ID, task_id, total=0) -> str:
+    db = session_factory()
+    job = jobs_repo.create_job(db, user_id=user_id, kind="delete_retriage", goal="reclassify after deleting X")
+    job.task_id = task_id
+    job.total = total
+    db.commit()
+    job_id = job.id
+    db.close()
+    return job_id
+
+
+def test_retriage_deleted_bucket_writes_live_pick_and_resolves_no_fit_to_null(
+    session_factory, fake_redis, monkeypatch,
+):
+    """The two-outcome pick rule: a thread that genuinely fits a live bucket
+    gets written to it; a thread with no better fit -- classify.triage()'s
+    no-fit fallback returns the stability hint it was given, which for every
+    orphan here IS the deleted bucket's own id -- must resolve to NULL
+    (unclassified), never silently stay pointing at the dead id."""
+    _seed_user(session_factory)
+    live_bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    deleted_bucket_id = _seed_bucket_task(session_factory, name="Old Newsletters")
+    db = session_factory()
+    task_repo.soft_delete_task(db, task=db.get(task_repo.Task, deleted_bucket_id))
+    db.commit()
+    db.close()
+
+    _seed_backfill_thread(
+        session_factory, thread_id="bkX", gmail_thread_id="gbkX", message_gmail_id="mX",
+        body_text="MARKER-X receipt.", last_activity_at=2000,
+    )
+    _seed_backfill_thread(
+        session_factory, thread_id="bkY", gmail_thread_id="gbkY", message_gmail_id="mY",
+        body_text="MARKER-Y no fit at all.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkX").bucket_id = deleted_bucket_id
+    db.get(InboxThread, "bkY").bucket_id = deleted_bucket_id
+    db.commit()
+    db.close()
+
+    # Capture bucket ids (not the ORM objects themselves) at call time --
+    # this run's own commits (per-batch progress + terminal done) expire the
+    # session's loaded Task rows, so holding onto the objects across
+    # `apply()` and reading `.id` afterward would hit a DetachedInstanceError.
+    calls: list = []
+
+    def _fake(threads, buckets, trackers, current_bucket_ids, *, user_id=None, task_id=None):
+        calls.append({"bucket_ids": {b.id for b in buckets}, "trackers": list(trackers)})
+        out = []
+        for parsed, cur in zip(threads, current_bucket_ids):
+            combined = " ".join(m.body_text for m in parsed.messages)
+            pick = cur
+            if "MARKER-X" in combined:
+                pick = live_bucket_id
+            out.append((pick, []))
+        return out
+
+    monkeypatch.setattr("app.llm.classify.triage", _fake)
+    job_id = _seed_delete_retriage_job(session_factory, task_id=deleted_bucket_id, total=2)
+
+    task_engine_tasks.retriage_deleted_bucket.apply(args=[USER_ID, job_id, deleted_bucket_id])
+
+    db2 = session_factory()
+    assert db2.get(InboxThread, "bkX").bucket_id == live_bucket_id
+    assert db2.get(InboxThread, "bkY").bucket_id is None  # no-fit -> unclassified, not the dead id
+
+    job = jobs_repo.get_owned_job(db2, user_id=USER_ID, job_id=job_id)
+    assert job.stage == "done"
+    assert job.scanned == 2
+    assert job.matched == 1  # only bkX landed in a real bucket
+    assert job.total == 2
+
+    # The deleted bucket is excluded from the set triage() is run against
+    # (its is_deleted flag), automatically, with no special-case filtering.
+    all_bucket_ids = {bid for call in calls for bid in call["bucket_ids"]}
+    assert live_bucket_id in all_bucket_ids
+    assert deleted_bucket_id not in all_bucket_ids
+    assert all(call["trackers"] == [] for call in calls)
+
+
+def test_retriage_deleted_bucket_publishes_threads_updated_then_job_updated_no_task_updated(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    live_bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    deleted_bucket_id = "deleted-bucket-1"
+    _seed_backfill_thread(
+        session_factory, thread_id="bkZ", gmail_thread_id="gbkZ", message_gmail_id="mZ",
+        body_text="MARKER-Z receipt.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkZ").bucket_id = deleted_bucket_id
+    db.commit()
+    db.close()
+
+    fake = _fake_triage_capturing([], picks_by_marker={"MARKER-Z": live_bucket_id})
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+    captured = _capture_publish(monkeypatch)
+    job_id = _seed_delete_retriage_job(session_factory, task_id=deleted_bucket_id, total=1)
+
+    task_engine_tasks.retriage_deleted_bucket.apply(args=[USER_ID, job_id, deleted_bucket_id])
+
+    events = [(e, p) for _, e, p in captured]
+    # One progress write for the single batch, the threads_updated nudge, then
+    # the terminal done write -- no task_updated (a deleted bucket has no
+    # task-engine board/event state, same as a live bucket backfill).
+    assert events == [
+        ("job_updated", {"job_id": job_id}),
+        ("threads_updated", {"thread_ids": ["bkZ"]}),
+        ("job_updated", {"job_id": job_id}),
+    ]
+    assert all(e != "task_updated" for e, _ in events)
+
+
+def test_retriage_deleted_bucket_skips_stale_write_when_thread_moves_during_triage(
+    session_factory, fake_redis, monkeypatch,
+):
+    """Same race the bucket-backfill guard test covers: a concurrent poll
+    (its own session, holding sync_lock) reclassifies this thread against
+    fresh content and commits a different bucket_id WHILE this worker's own
+    classify.triage() call is still in flight -- after the thread's bucket_id
+    was already read as the stability hint, but before this worker writes its
+    own (now stale-content) pick. The concurrent write must win."""
+    _seed_user(session_factory)
+    deleted_bucket_id = "deleted-bucket-2"
+    _seed_backfill_thread(
+        session_factory, thread_id="bkStale", gmail_thread_id="gbkStale", message_gmail_id="mStale",
+        body_text="MARKER-STALE receipt.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkStale").bucket_id = deleted_bucket_id
+    db.commit()
+    db.close()
+
+    captured_session: dict = {}
+
+    def _spy_session_local():
+        s = session_factory()
+        captured_session["db"] = s
+        return s
+    monkeypatch.setattr(task_engine_tasks, "SessionLocal", _spy_session_local)
+
+    def _fake_triage_with_concurrent_write(threads, buckets, trackers, current_bucket_ids, *, user_id=None, task_id=None):
+        captured_session["db"].execute(
+            text("UPDATE inbox_threads SET bucket_id = :b WHERE id = :tid"),
+            {"b": "fresher-bucket", "tid": "bkStale"},
+        )
+        return [("stale-pick-bucket", [])]
+    monkeypatch.setattr("app.llm.classify.triage", _fake_triage_with_concurrent_write)
+    captured = _capture_publish(monkeypatch)
+    job_id = _seed_delete_retriage_job(session_factory, task_id=deleted_bucket_id, total=1)
+
+    task_engine_tasks.retriage_deleted_bucket.apply(args=[USER_ID, job_id, deleted_bucket_id])
+
+    db2 = session_factory()
+    assert db2.get(InboxThread, "bkStale").bucket_id == "fresher-bucket"
+
+    updated_ids = [
+        tid for _, e, p in captured if e == "threads_updated" for tid in p["thread_ids"]
+    ]
+    assert "bkStale" not in updated_ids
+
+
+def test_retriage_deleted_bucket_never_writes_links_events_or_extracts(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    live_bucket_id = _seed_bucket_task(session_factory, name="Receipts")
+    deleted_bucket_id = "deleted-bucket-3"
+    _seed_backfill_thread(
+        session_factory, thread_id="bkNoLink", gmail_thread_id="gbkNoLink", message_gmail_id="mNoLink",
+        body_text="MARKER-NL receipt.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkNoLink").bucket_id = deleted_bucket_id
+    db.commit()
+    db.close()
+
+    fake = _fake_triage_capturing([], picks_by_marker={"MARKER-NL": live_bucket_id})
+    monkeypatch.setattr("app.llm.classify.triage", fake)
+
+    def _extract_should_not_run(*args, **kwargs):
+        raise AssertionError("extract_for_pair must never run for delete re-triage")
+    monkeypatch.setattr(task_engine_tasks, "extract_for_pair", _extract_should_not_run)
+
+    job_id = _seed_delete_retriage_job(session_factory, task_id=deleted_bucket_id, total=1)
+    task_engine_tasks.retriage_deleted_bucket.apply(args=[USER_ID, job_id, deleted_bucket_id])
+
+    db2 = session_factory()
+    assert db2.get(InboxThread, "bkNoLink").bucket_id == live_bucket_id  # the reclassify itself still happened
+    assert task_repo.list_attached_thread_ids(db2, task_id=deleted_bucket_id) == set()
+    assert task_repo.list_events(db2, task_id=deleted_bucket_id) == []
+
+
+def test_retriage_deleted_bucket_exception_marks_job_failed_with_error_and_reraises(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    deleted_bucket_id = "deleted-bucket-4"
+    monkeypatch.setattr(task_engine_tasks, "BACKFILL_TRIAGE_BATCH", 1)
+
+    _seed_backfill_thread(
+        session_factory, thread_id="bkOK2", gmail_thread_id="gOK2", message_gmail_id="mOK2",
+        body_text="MARKER-OK2 first, succeeds.", last_activity_at=2000,
+    )
+    _seed_backfill_thread(
+        session_factory, thread_id="bkBoom2", gmail_thread_id="gBoom2", message_gmail_id="mBoom2",
+        body_text="MARKER-BOOM2 second, blows up.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkOK2").bucket_id = deleted_bucket_id
+    db.get(InboxThread, "bkBoom2").bucket_id = deleted_bucket_id
+    db.commit()
+    db.close()
+
+    call_count = 0
+
+    def _fake_triage_then_boom(threads, buckets, trackers, current_bucket_ids, *, user_id=None, task_id=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return [(cur, []) for cur in current_bucket_ids]  # first batch: no-op (stays unresolved-null)
+        raise RuntimeError("triage blew up on delete-retriage batch 2")
+
+    monkeypatch.setattr("app.llm.classify.triage", _fake_triage_then_boom)
+    captured = _capture_publish(monkeypatch)
+    job_id = _seed_delete_retriage_job(session_factory, task_id=deleted_bucket_id, total=2)
+
+    with pytest.raises(RuntimeError, match="triage blew up on delete-retriage batch 2"):
+        task_engine_tasks.retriage_deleted_bucket.apply(args=[USER_ID, job_id, deleted_bucket_id])
+
+    db2 = session_factory()
+    job = jobs_repo.get_owned_job(db2, user_id=USER_ID, job_id=job_id)
+    assert job.stage == "failed"
+    assert "triage blew up on delete-retriage batch 2" in job.error
+    assert job.scanned == 1  # first (successful) batch's progress survives
+    assert job.total == 2
+
+    job_updates = [p for _, e, p in captured if e == "job_updated"]
+    assert job_updates[-1] == {"job_id": job_id}
+    assert len(job_updates) == 2  # batch-1 progress + the failure write
+
+
+def test_retriage_deleted_bucket_missing_job_row_is_a_defensive_noop(
+    session_factory, fake_redis, monkeypatch,
+):
+    _seed_user(session_factory)
+    deleted_bucket_id = "deleted-bucket-5"
+    _seed_backfill_thread(
+        session_factory, thread_id="bkGhost", gmail_thread_id="gGhost", message_gmail_id="mGhost",
+        body_text="MARKER-GHOST orphan.", last_activity_at=1000,
+    )
+    db = session_factory()
+    db.get(InboxThread, "bkGhost").bucket_id = deleted_bucket_id
+    db.commit()
+    db.close()
+
+    def _triage_should_not_run(*args, **kwargs):
+        raise AssertionError("triage must never run when the job row is missing")
+    monkeypatch.setattr("app.llm.classify.triage", _triage_should_not_run)
+    captured = _capture_publish(monkeypatch)
+
+    # Must complete without raising even though "no-such-job" doesn't exist.
+    task_engine_tasks.retriage_deleted_bucket.apply(args=[USER_ID, "no-such-job", deleted_bucket_id])
+
+    assert captured == []
+    db2 = session_factory()
+    assert db2.get(InboxThread, "bkGhost").bucket_id == deleted_bucket_id  # untouched
