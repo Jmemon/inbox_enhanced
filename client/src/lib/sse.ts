@@ -10,9 +10,14 @@ export type PreviewExample = {
 export type SseDataEvent =
   | { event: 'threads_updated'; thread_ids: string[] }
   | { event: 'extend_complete'; thread_ids: string[]; more: boolean }
-  | { event: 'task_draft_ready'; draft_id: string }
   | { event: 'task_updated'; task_id: string; version: number; pending_count: number }
   | { event: 'task_backfill_progress'; task_id: string; scanned: number; matched: number; done: boolean }
+  // Phase 4.5 Task 3: replaces `task_draft_ready` — a pure nudge (never a
+  // row, per this module's own convention) telling JobsProvider to refetch
+  // GET /api/jobs. Published after every job-row commit (stage changes and
+  // progress ticks), so it covers both the goal->draft->backfill creation
+  // flow and delete-retriage jobs.
+  | { event: 'job_updated'; job_id: string }
 
 export type SseConnEvent = { event: '_open' } | { event: '_error' }
 export type SseEvent = SseDataEvent | SseConnEvent

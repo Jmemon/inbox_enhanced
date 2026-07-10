@@ -220,47 +220,7 @@ export type FeedItem = TaskEvent & {
   task_name: string
   entity_display_name: string | null
 }
-export type TaskDraftProposal = { name: string; description: string; state_schema: TaskStateSchema; keyword_probes: string[] }
-export type TaskDraftPoll =
-  | { status: 'pending' } | { status: 'gone' }
-  | { status: 'ready'; proposal: TaskDraftProposal; positives: PreviewExample[]; near_misses: PreviewExample[] }
-
 // --- Task calls ---
-
-export async function postTaskDraft(goal: string): Promise<{ draft_id: string }> {
-  const r = await fetch('/api/tasks/draft', {
-    method: 'POST', credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ goal }),
-  })
-  if (r.status !== 202) throw new Error(`task draft: ${r.status}`)
-  return r.json()
-}
-
-// Polling fallback for the SSE-pushed task_draft_ready event — same
-// 200/202/404 mapping as getBucketDraftPreview (GET /api/tasks/draft/{id}
-// can also 403 "not your draft" like its bucket counterpart; that falls
-// through to the generic throw below, same as getBucketDraftPreview does).
-export async function getTaskDraft(draftId: string): Promise<TaskDraftPoll> {
-  const url = `/api/tasks/draft/${encodeURIComponent(draftId)}`
-  const t0 = performance.now()
-  const r = await fetch(url, { credentials: 'same-origin' })
-  const ms = Math.round(performance.now() - t0)
-  if (r.status === 202) {
-    console.log('[api] poll', url, '→ pending', ms, 'ms')
-    return { status: 'pending' }
-  }
-  if (r.status === 200) {
-    const body = (await r.json()) as TaskDraftPoll
-    console.log('[api] poll', url, '→ ready in', ms, 'ms')
-    return body
-  }
-  if (r.status === 404) {
-    console.warn('[api] poll', url, '→ 404 (gone) in', ms, 'ms')
-    return { status: 'gone' }
-  }
-  console.error('[api] poll', url, '→', r.status, ms, 'ms')
-  throw new Error(`task draft poll: ${r.status}`)
-}
 
 // Helper to extract actionable error detail from API responses (e.g., pydantic 422 validators).
 // If the response JSON contains a string `detail` field, use it; otherwise fall back to the
@@ -423,4 +383,105 @@ export async function mergeEntity(id: string, entityId: string, intoEntityId: st
   if (r.status !== 204) {
     await throwWithDetail(r, `merge entity: ${r.status}`)
   }
+}
+
+// --- Job types + calls (Phase 4.5, spec 005) ---
+// Mirrors server/app/api/jobs.py's `_serialize_job` field-for-field. Jobs
+// are the persisted, pollable replacement for the old fire-and-forget
+// `task_draft_ready` popup (postTaskDraft/getTaskDraft above, deleted) — see
+// state/JobsProvider.tsx for the store that owns fetching/polling these.
+
+// `payload` is written by the propose worker for 'creation' jobs only and is
+// NESTED (proposal fields separate from the confirmed examples) — NOT a
+// flat merge of TaskDraftProposal + examples, and there is deliberately no
+// `criteria` key. 'delete_retriage' jobs never set it (stays null).
+export type JobPayload = {
+  proposal: { name: string; description: string; state_schema: TaskStateSchema | null; keyword_probes: string[] }
+  positives: PreviewExample[]
+  near_misses: PreviewExample[]
+}
+
+export type Job = {
+  id: string
+  kind: 'creation' | 'delete_retriage'
+  // null for 'delete_retriage' jobs (task_kind is a 'creation'-only column).
+  task_kind: 'tracker' | 'bucket' | null
+  // Superset of both kind's stage machines (spec §1.2): 'creation' moves
+  // proposing -> draft_ready -> backfilling -> done|failed; 'delete_retriage'
+  // moves running -> done|failed. The literal string 'dismissed' never
+  // appears here — dismissal is recorded only via `dismissed_at` below.
+  stage: 'proposing' | 'draft_ready' | 'backfilling' | 'running' | 'done' | 'failed'
+  needs_user: boolean
+  payload: JobPayload | null
+  task_id: string | null
+  goal: string
+  scanned: number
+  matched: number
+  total: number
+  error: string | null
+  created_at: string
+  updated_at: string
+  dismissed_at: string | null
+}
+
+// POST /api/jobs 202s with the newly created (stage='proposing') job row —
+// starts the goal->draft flow the propose worker fills in asynchronously.
+export async function createJob(goal: string, taskKind: 'tracker' | 'bucket'): Promise<Job> {
+  const r = await fetch('/api/jobs', {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ goal, task_kind: taskKind }),
+  })
+  if (r.status !== 202) {
+    await throwWithDetail(r, `create job: ${r.status}`)
+  }
+  const body = (await r.json()) as { job: Job }
+  return body.job
+}
+
+// active=true (the default, matching the server's own `active: int = 1`
+// default) is the panel's normal view; pass false for every non-dismissed
+// job regardless of age.
+export function getJobs(active = true): Promise<Job[]> {
+  const qs = active ? '' : '?active=0'
+  return getJSON<{ jobs: Job[] }>(`/api/jobs${qs}`).then(r => r.jobs)
+}
+
+export function getJob(id: string): Promise<Job> {
+  return getJSON<{ job: Job }>(`/api/jobs/${encodeURIComponent(id)}`).then(r => r.job)
+}
+
+// Mirrors server's `_ConfirmJobBody` — every `_CreateTaskBody` field except
+// `kind` (fixed at POST /api/jobs time as the job's own `task_kind`) and
+// `goal` (already stored on the job row; the review step doesn't retype it).
+export type ConfirmJobBody = {
+  name: string
+  description: string
+  state_schema: TaskStateSchema | null
+  keyword_probes: string[]
+  confirmed_positives: BucketExampleIn[]
+  confirmed_negatives: BucketExampleIn[]
+}
+
+// Only legal from stage='draft_ready' (409 otherwise, surfaced via
+// throwWithDetail same as createTask's 422s). 200s with both the newly
+// created task (full detail body) and the job's own post-confirm row
+// (task_id set, stage='backfilling').
+export async function confirmJob(id: string, body: ConfirmJobBody): Promise<{ task: TaskDetail; job: Job }> {
+  const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/confirm`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  if (!r.ok) {
+    await throwWithDetail(r, `confirm job: ${r.status}`)
+  }
+  return r.json()
+}
+
+// Idempotent — a second dismiss on an already-dismissed job still 204s.
+export async function dismissJob(id: string): Promise<void> {
+  const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/dismiss`, {
+    method: 'POST', credentials: 'same-origin',
+  })
+  if (r.status !== 204) throw new Error(`dismiss job: ${r.status}`)
 }
