@@ -103,7 +103,6 @@ export function AppShell() {
             {reviewJob && (
               <NewTaskWizard
                 reviewJob={reviewJob}
-                kind={reviewJob.task_kind ?? 'tracker'}
                 onClose={() => setReviewJob(null)}
               />
             )}

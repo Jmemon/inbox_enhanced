@@ -65,11 +65,13 @@ export function JobsProvider({ children }: { children: ReactNode }) {
       // without this diff every 15s tick would re-refresh the bucket list
       // for as long as the done job stays visible.
       const prevById = new Map(prevJobsRef.current.map(j => [j.id, j]))
+      let shouldRefreshBuckets = false
       for (const job of fetched) {
         if (job.kind !== 'creation' || job.task_kind !== 'bucket' || job.stage !== 'done') continue
         const prev = prevById.get(job.id)
-        if (!prev || prev.stage !== 'done') void refreshBuckets()
+        if (!prev || prev.stage !== 'done') shouldRefreshBuckets = true
       }
+      if (shouldRefreshBuckets) refreshBuckets().catch(e => console.error('[JobsProvider] bucket refresh failed', e))
       prevJobsRef.current = fetched
       setJobs(fetched)
     } catch (e) {

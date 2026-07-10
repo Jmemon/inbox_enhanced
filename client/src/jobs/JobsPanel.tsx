@@ -93,9 +93,6 @@ function JobActions({ job, onReview, onDismiss }: {
     if (job.stage === 'draft_ready') {
       return (
         <div style={actionsRowStyle}>
-          {/* Task 6 wires the real handler (opens the wizard's review step
-              seeded from job.payload) — undefined here is a harmless no-op
-              click for this task's build. */}
           <button onClick={() => onReview?.(job)} style={{ fontSize: 12 }}>Review</button>
         </div>
       )
