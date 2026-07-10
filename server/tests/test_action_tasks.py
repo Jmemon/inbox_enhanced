@@ -437,3 +437,45 @@ def test_execute_action_unexpected_exception_marks_failed_and_reraises(session_f
     assert action.status == "failed"
     assert action.error == "gmail blew up"
     assert (USER_ID, "action_updated", {"task_id": TASK_ID}) in captured
+
+
+# ---------------------------------------------------------------------------
+# draft_reply empty body guard
+# ---------------------------------------------------------------------------
+
+
+def test_execute_action_inner_draft_reply_empty_body_fails_without_creating_draft(session_factory, fake_redis, monkeypatch):
+    """Defensive: llm_client.call_messages returns "" on API errors instead of
+    raising, so an empty body would silently flow into create_draft, producing
+    a blank Gmail draft marked status='executed'. This test verifies the guard:
+    empty LLM response -> RuntimeError -> no create_draft call."""
+    _seed_user(session_factory, granted_scopes=_both_scopes())
+    _seed_task(session_factory, goal="Land the deal")
+    _seed_thread_and_message(session_factory)
+    ev_id = _seed_event(session_factory, evidence_quote="the deal closed")
+    action_id = _seed_action(
+        session_factory, action_type="draft_reply", action_params={"instructions": "thank them"},
+        source_event_id=ev_id,
+    )
+
+    async def _fake_empty_response(**kwargs):
+        # Simulate LLM API error: returns empty string instead of raising.
+        return ""
+
+    monkeypatch.setattr(llm_client, "call_messages", _fake_empty_response)
+
+    db = session_factory()
+    action = actions_repo.get_owned_action(db, user_id=USER_ID, action_id=action_id)
+    user = db.get(User, USER_ID)
+    published = []
+
+    gmail = MagicMock()
+    with patch("app.gmail.client.get_gmail_client", return_value=gmail):
+        with pytest.raises(RuntimeError, match="LLM returned an empty draft body"):
+            action_tasks.execute_action_inner(
+                db, user=user, action=action, publish=lambda *a: published.append(a),
+            )
+    db.close()
+
+    # Verify the draft was never created — the guard prevents a blank draft.
+    gmail.users().drafts().create.assert_not_called()

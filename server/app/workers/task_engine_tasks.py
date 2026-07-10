@@ -167,6 +167,10 @@ def process_task_updates(user_id: str, thread_ids: list[str]) -> None:
                 if not pairs:
                     continue
 
+                # Load rules once per task for the Phase 5 firing loop below,
+                # avoiding N+1 queries if this task's extraction applies multiple events.
+                task_rules = actions_engine.actions_repo.list_rules(db, task_id=task.id)
+
                 version_before = task.version
                 any_pending = False
                 for thread_id in pairs:
@@ -190,7 +194,7 @@ def process_task_updates(user_id: str, thread_ids: list[str]) -> None:
                                 actions_engine.fire_rules_for_event(
                                     db, user_id=user_id, task=task, event=event,
                                     thread_id=thread_id, gmail_thread_id=thread_row.gmail_id,
-                                    publish=_publish,
+                                    publish=_publish, rules=task_rules,
                                 )
 
                 if not any_pending and task.version == version_before:

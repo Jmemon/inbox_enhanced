@@ -203,7 +203,7 @@ def test_fire_rules_for_event_bucket_kind_task_is_defensive_no_op(db):
 def test_fire_rules_for_event_auto_draft_reply_asserts(db):
     """Belt + suspenders (spec §6 invariant 2): a draft_reply rule must never
     be mode='auto' — the rule-write API (T4) is the first line of defense;
-    this assert inside the engine's dispatch is the second, independent of
+    this guard inside the engine's dispatch is the second, independent of
     whatever validation a caller may or may not have applied."""
     _seed_user(db)
     task = _seed_task(db)
@@ -211,7 +211,7 @@ def test_fire_rules_for_event_auto_draft_reply_asserts(db):
     event = _applied_event(db, task=task)
     publish, _ = _capture_publish()
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(RuntimeError, match="draft_reply actions can never auto-execute"):
         actions_engine.fire_rules_for_event(
             db, user_id=USER_ID, task=task, event=event,
             thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID, publish=publish,

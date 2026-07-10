@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 def fire_rules_for_event(
     db: Session, *, user_id: str, task: Task, event: TaskEvent,
-    thread_id: str, gmail_thread_id: str, publish,
+    thread_id: str, gmail_thread_id: str, publish, rules=None,
 ) -> list[TaskAction]:
     """Evaluate + insert TaskActions for one just-applied TaskEvent, then
     dispatch each inserted action (mode='propose' -> the SSE nudge only;
@@ -51,10 +51,15 @@ def fire_rules_for_event(
     rules (spec §2's task_id FK is enforced tracker-only at the API layer),
     but this is defense-in-depth against a stray call: returns [] with no
     query at all for a non-tracker task.
+
+    `rules` (optional): when provided, skip the list_rules() query and use
+    these pre-loaded rules instead. Useful when firing multiple rules within
+    a batch loop to avoid N+1 queries per task.
     """
     if task.kind != "tracker":
         return []
-    rules = actions_repo.list_rules(db, task_id=task.id)
+    if rules is None:
+        rules = actions_repo.list_rules(db, task_id=task.id)
     if not rules:
         return []
     intents = evaluate_event(
@@ -65,17 +70,23 @@ def fire_rules_for_event(
 
 def fire_rules_for_link(
     db: Session, *, user_id: str, task: Task, link: TaskThreadLink,
-    thread_id: str, gmail_thread_id: str, publish,
+    thread_id: str, gmail_thread_id: str, publish, rules=None,
 ) -> list[TaskAction]:
     """Same contract as fire_rules_for_event, for a freshly-attached
     TaskThreadLink (thread_linked rules). Callers MUST only call this for a
     link whose upsert_link() call reported `newly_attached=True` — a
     confidence/origin refresh of an already-attached link, or a detach
     (state='detached'), must never refire (see task_engine.repo.upsert_link's
-    LinkUpsert contract for exactly what newly_attached means)."""
+    LinkUpsert contract for exactly what newly_attached means).
+
+    `rules` (optional): when provided, skip the list_rules() query and use
+    these pre-loaded rules instead. Useful when firing multiple rules within
+    a batch loop to avoid N+1 queries per task.
+    """
     if task.kind != "tracker":
         return []
-    rules = actions_repo.list_rules(db, task_id=task.id)
+    if rules is None:
+        rules = actions_repo.list_rules(db, task_id=task.id)
     if not rules:
         return []
     intents = evaluate_link(
@@ -116,10 +127,11 @@ def _insert_and_dispatch(
         publish(user_id, "action_updated", {"task_id": task.id})
         rule = rules_by_id.get(action.rule_id)
         if rule is not None and rule.mode == "auto":
-            assert action.action_type != "draft_reply", (
-                "draft_reply rules must never be mode='auto' -- rejected at rule-write "
-                "time; this assert is the engine-side line of defense (spec §6 invariant 2)"
-            )
+            # Explicit guard (not assert): draft_reply rules must never be mode='auto'.
+            # First line: rules CRUD API rejects writing such a rule. Second line:
+            # this dispatch engine. Third line: execute_action itself (spec §6 invariant 2).
+            if action.action_type == "draft_reply":
+                raise RuntimeError("draft_reply actions can never auto-execute (spec 006 invariant #2)")
             # Late import: workers/action_tasks.py imports app.workers.celery_app
             # (which itself imports and registers every task module via its
             # `include=[...]` list) -- keeping this import inside the function

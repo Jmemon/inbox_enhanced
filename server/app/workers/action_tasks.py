@@ -96,6 +96,12 @@ def _execute_draft_reply(db: Session, *, user: User, task: Task | None, action: 
             user=user_message, stage="action", user_id=user.id, task_id=action.task_id,
         )
     )
+    # Defensive: llm_client.call_messages returns "" on API/network errors instead of raising,
+    # so an empty body would flow silently into create_draft, producing a blank Gmail draft
+    # marked status='executed'. Fail loudly instead, routing through the existing
+    # unexpected-exception path (guarded rollback → fresh-session failed write → re-raise).
+    if not body_text.strip():
+        raise RuntimeError("draft_reply: LLM returned an empty draft body (see llm_calls for the underlying error)")
     return gmail_client.create_draft(db, user, action.gmail_thread_id, body_text)
 
 
