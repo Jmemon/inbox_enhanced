@@ -1,6 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (Boolean, String, Text, DateTime, ForeignKey, BigInteger,
-                        Integer, Float, JSON, UniqueConstraint)
+                        Integer, Float, JSON, UniqueConstraint, CheckConstraint,
+                        Index, text)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -19,6 +20,17 @@ class User(Base):
     gmail_access_token: Mapped[str | None] = mapped_column(Text)   # encrypted at rest
     gmail_access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     gmail_last_history_id: Mapped[str | None] = mapped_column(String(64))
+    # Phase 5 (actions, spec 006): the token response's actual `scope` string
+    # (space-separated), split into a list, written on EVERY OAuth callback —
+    # never assumed from the request. NULL (pre-migration accounts, or an
+    # account that hasn't re-consented since gmail.modify/gmail.compose were
+    # added to SCOPES) is treated as readonly-only by every Gmail-write
+    # preflight check. none_as_null=True for the same reason as Task.
+    # state_schema — a Python None must persist as SQL NULL, not the JSON
+    # scalar 'null'.
+    gmail_granted_scopes: Mapped[list | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     sessions: Mapped[list["UserSession"]] = relationship(back_populates="user")
@@ -250,3 +262,91 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # user dismissal
+
+
+class TaskActionRule(Base):
+    """Phase 5 (actions, spec 006): a user-configured rule on a tracker task.
+    Rules ARE the grants — default-deny by absence: no rule for a (task,
+    trigger) means that action can never fire, and each row carries its own
+    mode ('propose'|'auto') rather than a separate master on/off dial.
+    `trigger` fires deterministically off either an APPLIED task_event
+    ('entity_entered_stage', matched against trigger_params["stage"]) or a
+    freshly-created task_thread_link ('thread_linked', no trigger_params).
+    The LLM never decides an action happens; draft_reply's `action_params`
+    only supplies the instructions it writes from — see app/actions/rules.py
+    for the pure trigger-matching evaluator this table feeds."""
+    __tablename__ = "task_action_rules"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), nullable=False, index=True)
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False)  # 'entity_entered_stage' | 'thread_linked'
+    # {"stage": "..."} for entity_entered_stage; null for thread_linked.
+    trigger_params: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)  # 'archive_thread'|'label_thread'|'draft_reply'
+    # {"label": "..."} for label_thread; {"instructions": "..."} for
+    # draft_reply; null for archive_thread.
+    action_params: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
+    # 'propose' | 'auto' — the API rejects writing 'auto' for draft_reply, and
+    # execute_action refuses to auto-run draft_reply even if this column
+    # somehow says 'auto' (belt + suspenders, design §2/§6 invariant 2).
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TaskAction(Base):
+    """Phase 5 (actions, spec 006): the audit ledger of every action a
+    TaskActionRule has proposed or executed — the email -> evidence -> action
+    chain, FK-enforced end to end. Exactly one of source_event_id/
+    source_link_id is set (CHECK-enforced): entity_entered_stage fires carry
+    the applied TaskEvent that tripped them; thread_linked fires carry the
+    TaskThreadLink row itself, since a link's own origin/confidence IS its
+    evidence (links aren't task_events). action_type/action_params are copied
+    from the rule at creation time — a later rule edit never rewrites
+    history. Idempotent under event replay/refold and link re-upsert via the
+    two partial unique indexes below (mirrors task_events'
+    uq_task_event_msg_field precedent, migration 0007)."""
+    __tablename__ = "task_actions"
+    __table_args__ = (
+        CheckConstraint(
+            "(source_event_id IS NULL) != (source_link_id IS NULL)",
+            name="ck_task_actions_one_source",
+        ),
+        Index(
+            "uq_task_actions_rule_event", "rule_id", "source_event_id",
+            unique=True,
+            postgresql_where=text("source_event_id IS NOT NULL"),
+            sqlite_where=text("source_event_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_task_actions_rule_link", "rule_id", "source_link_id",
+            unique=True,
+            postgresql_where=text("source_link_id IS NOT NULL"),
+            sqlite_where=text("source_link_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id"), nullable=False, index=True)
+    rule_id: Mapped[str] = mapped_column(String(36), ForeignKey("task_action_rules.id"), nullable=False)
+    source_event_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("task_events.id"))
+    source_link_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("task_thread_links.id"))
+    thread_id: Mapped[str | None] = mapped_column(String(36))  # soft pointer to inbox_threads
+    gmail_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)  # denormalized — audit survives inbox churn
+    action_type: Mapped[str] = mapped_column(String(32), nullable=False)  # frozen copy of the rule's action_type
+    action_params: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )  # frozen copy of the rule's action_params
+    status: Mapped[str] = mapped_column(String(16), nullable=False)  # proposed|executed|rejected|undone|failed
+    # What actually changed, enough to undo: {"removed_label_ids": [...]},
+    # {"added_label_ids": [...]}, {"draft_id": "..."}.
+    result: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
+    )
+    error: Mapped[str | None] = mapped_column(Text)  # populated on status='failed' (incl. "needs permission")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
