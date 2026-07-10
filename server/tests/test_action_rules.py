@@ -37,8 +37,6 @@ class FakeEvent:
 @dataclass
 class FakeLink:
     id: str
-    thread_id: str
-    gmail_thread_id: str
 
 
 def _stage_rule(**overrides) -> FakeRule:
@@ -142,8 +140,8 @@ def test_asserts_event_must_be_applied(status):
 
 def test_matches_thread_linked_rule():
     rule = _link_rule()
-    link = FakeLink(id="link-1", thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
-    intents = evaluate_link(link, rules=[rule])
+    link = FakeLink(id="link-1")
+    intents = evaluate_link(link, rules=[rule], thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
     assert intents == [
         ActionIntent(
             rule_id="rule-2", action_type="label_thread", action_params={"label": "Tracked"},
@@ -155,24 +153,24 @@ def test_matches_thread_linked_rule():
 
 def test_no_match_for_entity_entered_stage_rule_against_a_link():
     rule = _stage_rule()
-    link = FakeLink(id="link-1", thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
-    assert evaluate_link(link, rules=[rule]) == []
+    link = FakeLink(id="link-1")
+    assert evaluate_link(link, rules=[rule], thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID) == []
 
 
 def test_skips_deleted_rule_for_link():
     rule = _link_rule(is_deleted=True)
-    link = FakeLink(id="link-1", thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
-    assert evaluate_link(link, rules=[rule]) == []
+    link = FakeLink(id="link-1")
+    assert evaluate_link(link, rules=[rule], thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID) == []
 
 
 def test_multiple_matching_rules_all_fire_for_link():
     rule_a = _link_rule(id="rule-a")
     rule_b = _link_rule(id="rule-b", action_type="draft_reply", action_params={"instructions": "say hi"})
-    link = FakeLink(id="link-1", thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
-    intents = evaluate_link(link, rules=[rule_a, rule_b])
+    link = FakeLink(id="link-1")
+    intents = evaluate_link(link, rules=[rule_a, rule_b], thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
     assert {i.rule_id for i in intents} == {"rule-a", "rule-b"}
 
 
 def test_empty_rules_list_yields_no_intents_for_link():
-    link = FakeLink(id="link-1", thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID)
-    assert evaluate_link(link, rules=[]) == []
+    link = FakeLink(id="link-1")
+    assert evaluate_link(link, rules=[], thread_id=THREAD_ID, gmail_thread_id=GMAIL_THREAD_ID) == []

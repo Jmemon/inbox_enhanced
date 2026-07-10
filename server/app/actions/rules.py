@@ -51,17 +51,13 @@ class EventLike(Protocol):
 
 @runtime_checkable
 class LinkLike(Protocol):
-    """Duck-typed shape this module reads off a link row. `gmail_thread_id`
-    is NOT a real TaskThreadLink column (the link only carries thread_id) —
-    the caller is responsible for handing evaluate_link an object that also
-    carries the linked thread's gmail_thread_id (resolved from InboxThread),
-    the same way evaluate_event's caller resolves and passes thread_id/
-    gmail_thread_id explicitly rather than expecting TaskEvent to carry
-    thread-level denormalization it doesn't have either."""
+    """Duck-typed shape this module reads off a link row. Only the single
+    attribute `id` is read from the link itself — thread_id and gmail_thread_id
+    are passed explicitly as kwargs, the same way evaluate_event's caller
+    resolves and passes them explicitly rather than expecting TaskEvent to
+    carry thread-level denormalization it doesn't have."""
 
     id: str
-    thread_id: str
-    gmail_thread_id: str
 
 
 @dataclass(frozen=True)
@@ -132,7 +128,13 @@ def evaluate_event(
     return intents
 
 
-def evaluate_link(link: LinkLike, *, rules: list[RuleLike]) -> list[ActionIntent]:
+def evaluate_link(
+    link: LinkLike,
+    *,
+    rules: list[RuleLike],
+    thread_id: str,
+    gmail_thread_id: str,
+) -> list[ActionIntent]:
     """Which of `rules` fire for this freshly-created link.
 
     Only ever call this for a genuinely NEW TaskThreadLink — an
@@ -141,6 +143,9 @@ def evaluate_link(link: LinkLike, *, rules: list[RuleLike]) -> list[ActionIntent
     new)"). Like evaluate_event's applied-only contract, that freshness
     check is the caller's responsibility; this module has no way to tell an
     insert from an update from the row alone.
+
+    Callers pass thread_id and gmail_thread_id explicitly (resolved from
+    InboxThread), mirroring evaluate_event's established pattern.
 
     A rule fires when it is not soft-deleted and its trigger is
     'thread_linked' — thread_linked rules carry no trigger_params to further
@@ -160,8 +165,8 @@ def evaluate_link(link: LinkLike, *, rules: list[RuleLike]) -> list[ActionIntent
                 action_params=rule.action_params,
                 source_event_id=None,
                 source_link_id=link.id,
-                thread_id=link.thread_id,
-                gmail_thread_id=link.gmail_thread_id,
+                thread_id=thread_id,
+                gmail_thread_id=gmail_thread_id,
             )
         )
     return intents

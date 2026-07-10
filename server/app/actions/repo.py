@@ -9,6 +9,7 @@ visible to the caller before commit.
 Ids are uuid.uuid4().hex; timestamps are datetime.now(timezone.utc).
 """
 
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -18,6 +19,8 @@ from sqlalchemy.orm import Session
 
 from app.actions.rules import ActionIntent
 from app.db.models import Task, TaskAction, TaskActionRule
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Rules
@@ -90,7 +93,10 @@ def update_rule(db: Session, *, rule: TaskActionRule, **fields) -> TaskActionRul
     """Apply field=value pairs onto an existing rule row in place (e.g.
     trigger_params=..., action_params=..., mode=...). Caller validates which
     fields are legal to change (e.g. the draft_reply-can't-auto-run rule) —
-    this helper is a plain setattr loop, no row-level policy of its own."""
+    this helper is a plain setattr loop, no row-level policy of its own.
+
+    WARNING: Do not pass structural fields (id, task_id) through **fields —
+    ownership scoping is enforced at lookup, not here."""
     for key, value in fields.items():
         setattr(rule, key, value)
     return rule
@@ -147,6 +153,10 @@ def insert_intent(
             db.add(row)
             db.flush()
     except IntegrityError:
+        log.info(
+            "actions: idempotency race backstop hit rule_id=%s source_event_id=%s source_link_id=%s",
+            intent.rule_id, intent.source_event_id, intent.source_link_id,
+        )
         return None
     return row
 
