@@ -133,6 +133,18 @@ export function RulesSection({ taskId, schema }: { taskId: string; schema: TaskS
 
   const handleSubmit = async () => {
     if (!form) return
+    // Product decision (P5 gate): warn before saving thread_linked + auto.
+    // Such a rule auto-actions EVERY thread this tracker links from now on --
+    // including every freshly-linked thread of a future backfill/re-backfill,
+    // which can mean hundreds of Gmail writes in one run.
+    if (
+      form.trigger === 'thread_linked' && form.mode === 'auto' &&
+      !window.confirm(
+        'Auto mode on "thread is linked" runs this action on EVERY thread the '
+        + 'tracker links from now on -- including all threads linked at once by '
+        + 'a future backfill. Save anyway?'
+      )
+    ) return
     setSubmitting(true)
     setFormError(null)
     try {

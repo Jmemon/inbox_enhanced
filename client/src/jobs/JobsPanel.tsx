@@ -99,9 +99,13 @@ function JobActions({ job, onReview, onDismiss }: {
     }
     if (job.stage === 'done') {
       if (job.task_kind === 'tracker' && job.task_id) {
+        // Done tracker cards carry BOTH the link and a dismiss: without the
+        // dismiss, a completed creation squats in the panel for the whole
+        // 7-day active window (P5 gate feedback).
         return (
           <div style={actionsRowStyle}>
             <Link to={`/tasks/${job.task_id}`} style={{ fontSize: 12 }}>Open task</Link>
+            <button onClick={onDismiss} style={{ fontSize: 12 }}>dismiss</button>
           </div>
         )
       }
