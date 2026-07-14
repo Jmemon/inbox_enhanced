@@ -264,3 +264,22 @@ def test_no_send_scope_or_send_path_exists():
     assert not any("send" in scope for scope in google_oauth.SCOPES)
     module_names = " ".join(dir(gmail_client)).lower()
     assert "send" not in module_names
+
+
+def test_credentials_builder_never_pins_scopes(monkeypatch):
+    """Regression (Phase 5 gate, sibling of test_refresh_never_requests_scopes):
+    _credentials must pass scopes=None. If googleapiclient auto-refreshes
+    mid-request, a pinned scope list would over-ask the refresh grant and
+    fail with invalid_scope for any token granted narrower than the current
+    SCOPES wish-list."""
+    from app.gmail import client as gmail_client
+
+    captured = {}
+
+    class _FakeCreds:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(gmail_client, "Credentials", _FakeCreds)
+    gmail_client._credentials("access-tok", "1//refresh-tok")
+    assert "scopes" in captured and captured["scopes"] is None

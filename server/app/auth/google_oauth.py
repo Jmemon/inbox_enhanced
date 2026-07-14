@@ -114,7 +114,14 @@ def _refresh(refresh_token: str) -> Credentials:
         token_uri="https://oauth2.googleapis.com/token",
         client_id=s.google_client_id,
         client_secret=s.google_client_secret,
-        scopes=SCOPES,
+        # scopes MUST stay None here: google-auth transmits this list in the
+        # refresh grant, and RFC 6749 §6 forbids a refresh from requesting
+        # MORE scope than the token was originally granted — pinning the
+        # current SCOPES wish-list broke every pre-Phase-5 refresh token with
+        # invalid_scope the moment SCOPES widened. None omits the scope param,
+        # which renews exactly the original grant. Grants only ever change
+        # through the consent flow, never through refresh.
+        scopes=None,
     )
     creds.refresh(GoogleAuthRequest())
     return creds

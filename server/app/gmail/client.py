@@ -62,7 +62,11 @@ def _credentials(access_token: str, refresh_token: str | None) -> Credentials:
         token_uri="https://oauth2.googleapis.com/token",
         client_id=s.google_client_id,
         client_secret=s.google_client_secret,
-        scopes=google_oauth.SCOPES,
+        # None, not SCOPES: if googleapiclient ever auto-refreshes mid-request,
+        # a pinned scope list would over-ask the refresh grant and fail with
+        # invalid_scope for any token granted narrower than the current
+        # wish-list (see google_oauth._refresh for the full rationale).
+        scopes=None,
     )
 
 

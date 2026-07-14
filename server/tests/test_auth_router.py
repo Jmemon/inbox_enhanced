@@ -193,3 +193,31 @@ def test_me_returns_401_without_session(client):
 def _extract_state(location: str) -> str:
     from urllib.parse import urlparse, parse_qs
     return parse_qs(urlparse(location).query)["state"][0]
+
+
+def test_refresh_never_requests_scopes(monkeypatch):
+    """Regression (Phase 5 gate): _refresh must construct Credentials with
+    scopes=None. google-auth sends a `scope` param on the refresh grant when
+    scopes is set, and Google rejects any refresh requesting scopes beyond
+    the token's original grant with invalid_scope — which bricked every
+    Gmail read for pre-Phase-5 accounts the moment SCOPES widened. Refresh
+    must always run under the token's original grant."""
+    from datetime import datetime, timezone
+
+    from app.auth import google_oauth
+
+    captured = {}
+
+    class _FakeCreds:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.token = "fresh-access"
+            self.expiry = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+        def refresh(self, request):  # noqa: ARG002 - signature parity
+            pass
+
+    monkeypatch.setattr(google_oauth, "Credentials", _FakeCreds)
+    out = google_oauth.refresh_access_token(refresh_token="1//old-grant")
+    assert "scopes" in captured and captured["scopes"] is None
+    assert out.access_token == "fresh-access"
