@@ -31,3 +31,4 @@ scripts/seed_demo.py
 
 # generated CI/CD task files (reference-check.sh output)
 cicd/tasks/
+.dev/
