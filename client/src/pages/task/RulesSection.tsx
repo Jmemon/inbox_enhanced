@@ -257,6 +257,15 @@ export function RulesSection({ taskId, schema }: { taskId: string; schema: TaskS
             )}
           </div>
 
+          {/* Rules only ever fire from email-evidenced transitions/links (an
+              action needs a concrete thread to act on), and only going
+              forward -- both halves surprised the P5 gate twice. */}
+          <div style={{ fontSize: 11, color: '#888' }}>
+            {form.trigger === 'entity_entered_stage'
+              ? 'Fires when a future email moves an entity into this stage. Dragging cards by hand never triggers actions, and existing entities already in the stage don\u2019t count.'
+              : 'Fires for threads linked from now on \u2014 not threads already linked.'}
+          </div>
+
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
             <label style={{ fontSize: 12, color: '#666' }}>then</label>
             <select
